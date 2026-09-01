@@ -47,6 +47,12 @@ vdpm vita2d freetype libpng libjpeg zlib
 ### 3. 编译打包
 
 ```bash
+./build.sh          # 一键：配置 + 编译 + 打包
+```
+
+等价于手动执行：
+
+```bash
 source env.sh
 cmake -S . -B build
 cmake --build build
@@ -86,6 +92,7 @@ cmake --build build
 ├── LICENSE                     # 随仓库分发
 ├── .gitignore                  # 随仓库分发
 ├── env.sh                      # 随仓库分发
+├── build.sh                    # 随仓库分发：一键构建脚本
 ├── src/                        # 随仓库分发：源码
 │   └── main.c
 ├── sce_sys/                    # 随仓库分发：LiveArea 素材
