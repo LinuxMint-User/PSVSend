@@ -1,0 +1,237 @@
+# PSVSend 设计文档
+
+> 面向 PS Vita 的 LocalSend 协议（v2）兼容客户端。本文件记录前后端架构、关键决策与开发路线。
+
+## 1. 项目目标
+
+- 在 PSV 上实现 LocalSend v2 兼容客户端，与局域网内其他 LocalSend 设备（手机 / PC）互相收发文件
+- 协议目标 **v2**（理由见 §3）：v1 已废弃；v3 的签名 / WebRTC / PIN 体系复杂，PSV 资源有限，且官方客户端同时兼容 v2/v3，v2 生态覆盖最广
+
+## 2. 总体架构（前后端分层）
+
+```
+┌─────────────────────────────────────┐
+│  前端层（UI）：vita2d 界面             │ 只负责展示与交互
+│  设备列表 / 文件浏览 / 弹窗 / 进度     │
+└───────────────┬─────────────────────┘
+                │ 调用 api.h 接口 + 后端回调事件
+┌───────────────┴─────────────────────┐
+│  后端层（协议核心）：                 │ 纯逻辑，不碰 UI
+│  UDP 发现 / HTTP 服务器 / HTTP 客户端 │
+│  会话管理                            │
+└───────────────┬─────────────────────┘
+                │ 系统 API 调用
+┌───────────────┴─────────────────────┐
+│  底层：SceNet / SceIo / SceLibJson /  │
+│        SceKernelThreadMgr（系统固件） │
+│  + vita2d / freetype / mbedtls（第三方）│
+└─────────────────────────────────────┘
+```
+
+- 底层能力（socket、文件 IO、JSON、线程、GPU）由 **PSV 固件系统库**提供真实实现；**vitaSDK** 提供头文件、stub 库（链接通道）与 newlib（标准 C 库）
+- 前后端通过 **api.h 契约**解耦：后端不关心按钮怎么画，前端不关心协议细节，可独立开发与验证
+
+## 3. 关键决策
+
+| 决策 | 结论 | 理由 |
+|------|------|------|
+| 协议版本 | **v2** | v1 废弃；v3 复杂（nonce 签名 / WebRTC），官方保持 v2 向后兼容，生态主流是 v2 |
+| 传输 | 明文 HTTP 优先，TLS 后置 | 协议本身支持 http 明文，互通无碍 |
+| TLS 方案 | **mbedtls**（已装 3.6.5） | PSV 系统 SceSsl 对 homebrew 不可用，自制软件标准做法是编译 mbedtls 进应用 |
+| HTTP/1.1 范围 | **子集**：POST、Content-Length、**chunked 解码**、multipart boundary、query string；响应后关闭连接 | 目标是"兼容 LocalSend"，非"完备 HTTP"。chunked 必须支持（官方 Dart 客户端可能使用）；解析器独立模块、防御式实现（全部读取设上限、不支持格式优雅拒绝 400） |
+| 内存约束 | 按 **256MB** 设计基准（实际预算 365MB 封顶） | 512MB 为**统一内存**（CPU/GPU 共享），系统保留约 147MB，应用可拿最大 365MB（工具箱可调 256/285/333/365） |
+| 文件处理 | **大文件永不整读入内存**，一律流式（收：边收边写盘；发：边读边发） | 内存红线 |
+| 传输分块 | 16~64KB 缓冲 | PSV socket / sceIoRead 的大块缓冲限制 |
+| 应用数据目录 | `ux0:data/psvsend/`（含 `downloads/` 接收目录），首次启动 `sceIoMkdir` 幂等创建 | 符合 PSV 惯例，homebrew 有写权限 |
+
+## 4. 后端设计
+
+### 4.1 模块划分（单向依赖，无环）
+
+```
+src/
+├── api.h          # 前后端契约：接口 + 回调
+├── net.c          # 网络初始化（加载 SCE_SYSMODULE_NET、sceNetInit、资源池）
+├── discovery.c    # UDP 发现：announce 发送 + 组播监听 + 设备表
+├── http_server.c  # HTTP 服务器：路由 + multipart 解析 + 流式写盘
+├── http_client.c  # HTTP 客户端：register / prepare / upload / cancel
+├── session.c      # 会话管理：状态机 + 文件清单 + 进度
+└── json_util.c    # JSON 生成/解析（封装 SceLibJson 或手写简单版）
+```
+
+### 4.2 核心数据结构
+
+```c
+// 设备表（发现线程维护，mutex 保护）
+typedef struct {
+    char ip[16]; int port;
+    char alias[64], fingerprint[64], protocol[8]; // http/https
+    uint32_t last_seen;      // 超时未更新移除（如 60s）
+} Device;
+
+// 会话（收发共用一套结构）
+typedef struct {
+    int  id;                 // sessionId
+    int  direction;          // INCOMING(收) / OUTGOING(发)
+    char peer_ip[16];
+    FileEntry files[];       // 每文件: fileId、token、name、size、已收字节、状态
+    int  state;              // AWAIT_CONFIRM → TRANSFERRING → DONE / CANCELLED
+} Session;
+```
+
+### 4.3 线程模型
+
+| 线程 | 职责 |
+|------|------|
+| UI 主线程 | 渲染 + 消费事件队列刷新界面 |
+| 发现线程 | UDP recvfrom 循环 + 定时发 announce |
+| HTTP 服务器线程 | accept 循环，**每连接一个工作线程**（LocalSend 并行传多文件） |
+| 定时器（可并入发现线程） | 设备超时清理、announce 周期触发 |
+
+共享数据（设备表、会话表）统一 mutex 保护。
+
+### 4.4 前后端契约（api.h）
+
+```c
+// 前端 → 后端
+void api_start(void);                        // 初始化网络 + 启动各线程
+const Device *api_device_list(int *count);   // 在线设备
+int  api_send_files(const char **paths, int n, const Device *target);
+int  api_accept_session(int session_id);
+int  api_reject_session(int session_id);
+int  api_cancel(int session_id);
+
+// 后端 → 前端（回调，前端注册）
+void on_devices_changed(void);               // 刷新设备列表
+void on_incoming_request(const Session *s);  // 弹确认框
+void on_progress(const Session *s);          // 进度
+void on_session_done(const Session *s);      // 完成 / 失败
+```
+
+### 4.5 HTTP 服务器要点
+
+- 路由：`/api/localsend/v2/register`、`prepare-upload`、`upload`、`cancel`、`info`
+- `prepare-upload` → 生成 sessionId，为每文件分配 fileId + token，返回 `{sessionId, files:[{id, token, fileName, size}]}`；同时向 UI 抛"待确认"事件
+- `upload?sessionId&fileId&token` → 校验会话与 token 匹配 → 流式写盘（先临时名，完成后重命名；同名加序号避免覆盖）
+- 安全底线：只收"prepare 过"的 fileId+token，否则 400；拒绝时回 401/403
+- 接收文件写入 `ux0:data/psvsend/downloads/`
+
+### 4.6 HTTP 客户端要点
+
+- 流程：register（可选）→ `prepare-upload` 拿 session → 逐文件 `POST upload` → cancel 清理
+- 按**接收端 announce 的 protocol / port 字段**决定 http/https 与端口——明文即可互通
+- 上传：16~64KB 分块读文件写 socket
+
+### 4.7 实现顺序与验证
+
+1. `net.c` 网络初始化（跑通不崩）
+2. `discovery.c` 发现 + 设备表 → **PSV 上能看到手机/电脑设备**
+3. `http_server.c` prepare-upload + upload 收文件 → **电脑 curl 模拟 LocalSend 对测**
+4. `session.c` 状态机 + 确认/取消
+5. `http_client.c` 发送 → **官方 LocalSend App 真机对测**
+
+## 5. 前端设计
+
+### 5.1 页面结构（960×544，掌机）
+
+| 页面 | 内容 | 交互 |
+|------|------|------|
+| 设备列表（主） | 在线设备（别名、类型） | 选中 → 发送流程 |
+| 文件浏览 | ux0: 目录树，多选文件 | 进入 / 勾选 |
+| 发送确认 | 目标设备 + 文件清单 + 总大小 | 确认 / 返回 |
+| 接收请求确认 | 来者名字/平台 + 文件数 + 预览（含取消态） | 接受 / 设置 / 拒绝；发送方取消 → 单个关闭 |
+| 接收设置 | 本次保存目录（只读默认）+ 逐文件改名(占位)/勾选跳过 | 方向键选行、确认勾选、返回继续 |
+| 传输进度 | 会话列表 + 进度条 | 取消 |
+| 设置 | 别名、确认键布局、端口、主题 | — |
+
+### 5.2 架构：事件驱动 + 状态机
+
+```
+主循环（每帧）:
+  poll 输入（按键/触摸） → 处理当前页交互
+  → 消费后端事件队列（设备变更/收件请求/进度）
+  → 渲染当前页 → 帧同步
+```
+
+- 后端回调**只塞事件队列**（EV_DEVICES_CHANGED / EV_INCOMING_REQUEST / EV_PROGRESS），主循环消费，线程安全不卡渲染
+- 页面为状态机：`enum Page` + 每页自己的选择状态
+
+### 5.3 双输入：按键 + 触摸统一模型
+
+- **输入抽象层**：页面只处理抽象动作 `UiAction`（CONFIRM / CANCEL / UP / DOWN / LEFT / RIGHT / BACK / MENU），不判断物理键
+- **按键路径**：十字键移动焦点，确认键触发焦点控件
+- **触摸路径**：坐标命中检测 → 触发控件动作
+- **控件统一**：`{ Rect bounds; UiAction action; void *target; }`，两种输入源最终走同一 action；可混用
+- **确认键布局可配置**：美式（X=确认，默认，港版/国行习惯）与日式（O=确认），存 config；触摸不受影响
+
+### 5.4 主题系统（theme.c）
+
+- 主题 = 一组颜色常量（bg / card / card_hl / text / text_dim / accent / accent_text / success / danger / warn / border），UI 绘制只引用主题变量，**运行时可切换，下帧生效**
+- 内置主题（先统一**深色基调**，不做深浅色切换）：
+  - **OLED**：纯黑 `#000000` 底 + 卡片 `#111111` + 白字高对比（PSV1000 OLED 最佳）
+  - **Yaru**：深灰底 + Ubuntu 橙 `#E95420` 主色 + 圆角扁平卡片（vita2d 矩形拼接画圆角，不依赖图片）
+  - **自定义**（后续实现）：色盘选主色 → **RGB↔HSV 推导整套**（背景=主色暗化、卡片=背景+10% 亮度、高亮=主色、文字按对比度取白/深），保证配色协调
+- 默认主题：Yaru 深色
+
+### 5.5 字体
+
+- 界面文字用系统 PVF 字体起步（免费随固件）
+- **中文文件名**：PVF 简体覆盖有限，需 freetype + 中文字体（开源字体打包进 VPK 或从 ux0 加载）——待定问题，倾向直接上 freetype
+
+### 5.6 文件组织
+
+```
+src/ui/
+├── ui.h          # 页面枚举、AppState
+├── ui_main.c     # 主循环：输入 → 事件 → 渲染
+├── theme.c       # 主题颜色表 + 切换
+├── widgets.c     # 列表、按钮、进度条、弹窗控件
+├── font.c        # 字体管理（PVF / freetype）
+└── pages/
+    ├── device_list.c   # 设备列表页
+    ├── file_browser.c  # 文件浏览页
+    ├── confirm.c       # 确认弹窗
+    ├── progress.c      # 进度页
+    └── settings.c      # 设置页
+```
+
+### 5.7 前端开发顺序（独立可测，不依赖后端）
+
+1. UI 框架：主循环 + 页面切换 + 控件基础 + **theme.c（OLED/Yaru）**
+2. 设备列表页（假数据）
+3. 文件浏览页（读 ux0 真目录）
+4. 确认弹窗 + 进度条
+5. 接后端事件队列，换真数据
+6. 设置页（含主题切换；自定义色盘后续）
+
+## 6. 配置与存储
+
+- `ux0:data/psvsend/config`（JSON）：alias、confirm_layout（0=美式 / 1=日式）、port、theme
+- `ux0:data/psvsend/downloads/`：接收文件
+- 首次启动 `sceIoMkdir` 幂等创建（已存在返回 0x80410011，忽略）
+
+## 7. 开发路线
+
+- **阶段 A（后端）**：net.c → discovery → http_server → session → http_client
+- **阶段 B（前端框架）**：主题 + 控件 + 页面切换 → 设备列表 → 文件浏览 → 弹窗/进度
+- **阶段 C（对接）**：前端接后端事件队列，真机联调
+- 每步有可验证里程碑（见 §4.7 / §5.7）
+
+## 8. 风险与注意
+
+- multipart 边界解析（上传 body 格式以协议文档为准）
+- 大文件流式写盘（内存红线）
+- 并发多文件上传（一个 session 多连接）
+- 网络异常处理：断连、超时、设备休眠、飞行模式恢复
+- 内存监控调试：`mallinfo()`（newlib 堆）+ `sceKernelGetFreeMemorySize()`（系统余量）——注意统一内存下显存块（sceKernelAllocMemBlock）不计入 mallinfo，需结合查看
+- 传输速度预期：PSV 802.11n 单天线，实测约 10~20MB/s
+
+## 9. 待定问题
+
+- [ ] 中文字体方案：PVF 直出 vs freetype + 中文字体包
+- [ ] 深浅色切换是否做（当前统一深色）
+- [ ] 自定义主题色盘的实现时机（先 OLED/Yaru，色盘后置）
+- [ ] HTTP 解析兼容清单最终确认（chunked 已定必做）
+- [ ] 接收设置页：文件重命名输入（接 PSV 系统键盘 SceIme，或自绘内置键盘；当前仅占位弹窗）
+- [ ] 接收设置页：本次保存目录选择（目录浏览/预设；需确认 ux0 目录权限；当前固定 `ux0:data/psvsend/`）
+- [ ] 接收页"验证"功能（LocalSend 的验证码/校验交互）当前不做，等真实协议接入后再定
