@@ -10,7 +10,8 @@
 - [x] LocalSend v2 发送链路：UDP 组播发现 / register / prepare-upload / upload
 - [x] 文件发送（PSV → 手机 / PC，HTTP 明文与 HTTPS 加密均支持）
 - [x] TLS 加密传输（mbedTLS 3.6.5，含 mTLS 客户端身份）
-- [ ] 文件接收（其他设备 → PSV，开发中）
+- [x] 文件接收（手机 / PC → PSV）：prepare-upload 弹确认 → upload 流式写盘，兼容无 Content-Length 的 chunked 上传
+- [x] 主动扫描：Vita 收不了 UDP 组播，改向局域网 /24 各 IP 主动 HTTP 探测补全设备表
 
 ## 构建
 
@@ -69,9 +70,18 @@ cmake --build build
 
 ## 使用
 
-1. 打开 PSVSend，等待 Wi-Fi 联网（状态指示变绿，设备列表出现局域网内的其他 LocalSend 设备）
+### 发送
+
+1. 打开 PSVSend，等待 Wi-Fi 联网（状态指示变绿）。对方设备会通过 UDP 组播 announce 自动出现在设备列表；若对方没出现，按 **△** 手动扫描整个网段补全
 2. 选中目标设备 → 进入文件浏览（ux0 目录树，可多选）→ 确认发送
 3. 对方接受后，传输页显示逐文件进度，可随时取消
+
+### 接收
+
+1. 对方（LocalSend App / 桌面客户端）向我们发送文件时，PSV 自动弹出接收确认页，显示来者、平台、文件清单与总大小
+2. 焦点默认在 **Accept**：确认后对方即可开传；**Setup** 进入接收设置，可逐文件取消勾选（未勾选的跳过，不出现在接受回执里）；**Reject** 拒绝（对方收到 403）
+3. 确认后进入接收进度页，显示逐文件进度与总进度，可随时取消
+4. 收到的文件存入 `ux0:data/psvsend/downloads/`，边收边写（`.part` 临时文件，收完改正式名）；与已有文件同名时自动在扩展名前加 `(k)` 序号，不覆盖。中途断流/校验失败会删除残 `.part`，下次启动也会清扫上次异常遗留的临时文件
 
 ### HTTPS / mTLS 说明
 
@@ -109,8 +119,10 @@ cmake --build build
 │   ├── api.c                   # 前后端契约：启动 / 网络巡检 / 设备快照
 │   ├── net.c                   # SceNet 网络初始化
 │   ├── discovery.c             # UDP 组播 announce / 监听 + 设备表
-│   ├── http.c                  # HTTP 服务器：处理对方 register / info（设备入表）
+│   ├── http.c                  # HTTP 服务器：register / info 入表 + prepare-upload / upload / cancel 接收路由
 │   ├── transfer.c              # 发送客户端：prepare-upload / upload（HTTP + HTTPS）
+│   ├── receive.c               # 接收会话：确认/拒绝、流式写盘 downloads/、断流清理
+│   ├── scan.c                  # 主动扫描：向 /24 网段逐 IP HTTP 探测补全设备表
 │   ├── identity.c / id_cert.inc / id_key.inc  # 内嵌设备身份证书（HTTPS mTLS）
 │   ├── config.c / json_util.c / dlog.c
 │   └── ui/                     # vita2d 界面（设备列表 / 文件浏览 / 进度）

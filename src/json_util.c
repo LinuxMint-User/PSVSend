@@ -221,6 +221,90 @@ bool json_get_bool(const char *doc, const char *key, bool *out)
     return false;
 }
 
+/* 顶层成员定位的导出版：直接返回值起点指针（见 json_util.h） */
+const char *json_get_val(const char *obj, const char *key)
+{
+    P v;
+    if (!obj || !key) return NULL;
+    if (!find_value(obj, key, &v)) return NULL;
+    skip_ws(&v);
+    return v.s;
+}
+
+/* ---------- 对象成员遍历 ---------- */
+
+/* 游标停在成员键之后、值之前；读键→值，并跳到下一成员起始处。
+ * 成功置 it->key / it->val；失败（对象结束）返回 false。 */
+static bool iter_read_member(JsonIter *it)
+{
+    P p = { it->p };
+    P q;
+    skip_ws(&p);
+    if (*p.s != '"') return false;      /* '}' 或格式损坏 */
+    q = p;
+    if (!read_string(&q, it->key, (int)sizeof it->key)) return false;
+    p = q;
+    skip_ws(&p);
+    if (*p.s != ':') return false;
+    p.s++;
+    skip_ws(&p);
+    it->val = p.s;                      /* 值起点 */
+    skip_value(&p);
+    it->p = p.s;                        /* 停在 ',' 或 '}' */
+    return true;
+}
+
+bool json_iter_first(const char *obj, JsonIter *it)
+{
+    P p;
+    if (!it || !obj) return false;
+    p.s = obj;
+    skip_ws(&p);
+    if (*p.s != '{') return false;
+    p.s++;
+    it->p = p.s;
+    return iter_read_member(it);
+}
+
+bool json_iter_next(JsonIter *it)
+{
+    P p;
+    if (!it) return false;
+    p.s = it->p;
+    skip_ws(&p);
+    if (*p.s == ',') p.s++;
+    else if (*p.s == '}') return false;
+    it->p = p.s;
+    return iter_read_member(it);
+}
+
+bool json_val_str(const char *val, char *out, int outsz)
+{
+    P v;
+    if (!val || !out || outsz <= 0) return false;
+    out[0] = 0;
+    v.s = val;
+    skip_ws(&v);
+    if (*v.s != '"') return false;
+    return read_string(&v, out, outsz);
+}
+
+bool json_val_int(const char *val, long long *out)
+{
+    char tmp[40];
+    int i = 0;
+    if (!val) return false;
+    while (*val == ' ' || *val == '\t' || *val == '\n' || *val == '\r') val++;
+    if (*val != '-' && (*val < '0' || *val > '9')) return false;
+    while (*val && i < (int)sizeof tmp - 1 &&
+           *val != ',' && *val != '}' && *val != ']')
+        tmp[i++] = *val++;
+    tmp[i] = 0;
+    if (i == 0) return false;
+    *out = strtoll(tmp, NULL, 10);
+    return true;
+}
+
 /* UTF-8 前导字节 → 序列长度（非法字节按 1 处理，原样透传） */
 static int utf8_len(unsigned char c)
 {

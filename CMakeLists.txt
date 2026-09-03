@@ -34,6 +34,8 @@ add_executable(${PROJECT_NAME}
     src/identity.c
     src/json_util.c
     src/net.c
+    src/receive.c
+    src/scan.c
     src/transfer.c
     src/ui/ui_main.c
     src/ui/pages.c

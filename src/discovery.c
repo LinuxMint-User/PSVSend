@@ -120,6 +120,16 @@ void discovery_peer_registered(const char *body, const char *src_ip)
     table_upsert(&dev);
 }
 
+/* 公开：扫描线程发现设备后入表（带自排除：指纹与自己的设备忽略） */
+void discovery_upsert_peer(const Device *dev)
+{
+    if (!dev || !dev->alias[0]) return;
+    if (g_cfg.fingerprint[0] && dev->fingerprint[0] &&
+        strcmp(dev->fingerprint, g_cfg.fingerprint) == 0)
+        return;                                /* 自己 */
+    table_upsert(dev);
+}
+
 /* ---------- 发送 ---------- */
 /* 组播地址解析（sceNetInetPton 失败时的兜底手写解析） */
 static bool ipv4_from_str(const char *str, unsigned int *netorder)
@@ -142,7 +152,7 @@ static void announce_payload(char *out, int n)
              "{\"alias\":\"%s\",\"version\":\"2.0\","
              "\"deviceModel\":\"PlayStation Vita\",\"deviceType\":\"mobile\","
              "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"http\","
-             "\"download\":false,\"announce\":true}",
+             "\"download\":true,\"announce\":true}",
              ae, fe, port > 0 ? port : DISC_PORT);
 }
 

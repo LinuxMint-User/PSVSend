@@ -77,6 +77,7 @@ void ui_run(void)
 
     while (!g_app.done) {
         api_tick();          /* announce 节奏（500ms 节流；sendto 只在主线程可靠） */
+        pages_tick();        /* 检测新到待决定的接收请求 → 弹接收确认页 */
 
         vita2d_start_drawing();
         vita2d_set_clear_color(theme->bg);

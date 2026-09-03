@@ -16,6 +16,7 @@
 #include "net.h"
 #include "http.h"
 #include "discovery.h"
+#include "receive.h"
 #include "api.h"
 #include "identity.h"
 #include "dlog.h"
@@ -124,6 +125,7 @@ void api_start(void)
     }
 
     http_set_register_cb(discovery_peer_registered);   /* 对方 register → 设备表 */
+    recv_init();                         /* 接收模块：建锁 + 清扫残留 *.part */
 
     r = net_start();
     dlog("watch: initial net_start -> %s", r == 0 ? "ok" : "fail");

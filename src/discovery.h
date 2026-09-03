@@ -22,6 +22,8 @@ int discovery_state(void);
 const char *discovery_fail_step(void);
 /* http 服务器回调：收到对方 register POST（body=对方 JSON, src_ip=来源 IP） */
 void discovery_peer_registered(const char *body, const char *src_ip);
+/* 扫描线程回调：主动探测到的设备直接入表（内部带自排除） */
+void discovery_upsert_peer(const Device *dev);
 
 void disc_tick_announce(void);          /* 看门狗每 500ms 调：内部按 5s 节奏发 announce */
 #endif

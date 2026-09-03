@@ -1,5 +1,6 @@
 /* 页面：设备列表 / 文件浏览 / 发送确认 / 接收确认 / 进度 / 设置
- * 数据：设备列表来自后端 UDP 发现（api.h 快照）；传输/接收请求仍是 mock 演示。
+ * 数据：设备列表来自后端 UDP 发现（api.h 快照）；发送走 xfer 真实传输；
+ * 接收请求/进度来自 receive 后端会话（receive.h 快照接口）。
  * 渲染函数每帧先绘制并注册可触摸区域（w_add），输入函数处理动作与命中。
  *
  * 列表采用"像素滚动"模型：内容像素偏移 scroll（0=从 LIST_TOP 开始），
@@ -17,6 +18,8 @@
 #include "../net.h"
 #include "../api.h"
 #include "../transfer.h"
+#include "../receive.h"
+#include "../scan.h"
 
 /* ---------- 布局常量 ---------- */
 #define LIST_TOP     76                 /* 列表可视区顶 */
@@ -26,12 +29,11 @@
 #define ROW_STRIDE   62
 #define WID_FILES_SEND 0x8001
 
-/* 传输页（mock）：文件列表区域与总进度布局 */
+/* 传输页：文件列表区域与总进度布局（发送/接收共用） */
 #define XF_TOP        68
 #define XF_BOTTOM     370      /* 文件列表可视区底（总进度条上方） */
 #define XF_VIEW_H     (XF_BOTTOM - XF_TOP)
 #define XF_ROW_H      58
-#define PROG_TOTAL_MS 6000     /* mock 总时长：约 6 秒走完 */
 
 static int dev_scroll = 0;        /* 列表内容像素偏移 */
 static int file_scroll = 0;
@@ -45,7 +47,8 @@ static int rs_press_scroll = 0;
 static bool rename_pop = false;   /* 改名占位弹窗（重命名功能 TODO） */
 static bool host_pop = false;     /* 设置页主机名改名的占位弹窗（文字输入 TODO） */
 
-/* 本次传输的文件列表（mock；将来换真实传输会话状态） */
+/* 进度页当前文件清单：发送时每帧由 xfer 快照覆盖；接收时会话快照，
+ * 会话还没建好的头几帧用这里的本地清单兜底 */
 static int    xf_count = 0;
 static char   xf_name[MAX_PICKED][128];
 static SceOff xf_size[MAX_PICKED];
@@ -57,21 +60,6 @@ static void start_send(void);
 static void start_recv(void);
 static void goto_devices(void);
 static void open_files(void);
-static void sim_recv_request(void);
-
-/* ---------- 接收请求（mock 样本） ---------- */
-static const struct {
-    const char *name;
-    SceOff      size;
-} sim_pool[] = {
-    { "monthly_report.pdf", 12LL * 1024 * 1024 + 344 * 1024 },
-    { "holiday_photos.zip", 480LL * 1024 * 1024 },
-    { "app_logs.txt",       512 * 1024 },
-    { "concert_songs.mp3",  8LL * 1024 * 1024 },
-    { "notes.md",           2 * 1024 },
-    { "backup.tar",         256LL * 1024 * 1024 },
-};
-#define SIM_POOL_COUNT ((int)(sizeof sim_pool / sizeof sim_pool[0]))
 
 /* 当前勾选接收的文件数 */
 static int recv_included(void)
@@ -80,42 +68,6 @@ static int recv_included(void)
     for (i = 0; i < g_app.inc_count && i < MAX_INF; i++)
         if (g_app.inc_files[i].inc) n++;
     return n;
-}
-
-/* 三角键：模拟"对方发来文件请求"。用当前选中的设备当发送方，
- * 文件从样本池里按设备错开取，数量 2..5，方便逐个测试。 */
-static void sim_recv_request(void)
-{
-    int cnt = 2 + g_app.dev_sel % 4;
-    int k;
-    if (cnt > MAX_INF) cnt = MAX_INF;
-    g_app.inc_count = cnt;
-    for (k = 0; k < cnt; k++) {
-        int src = (g_app.dev_sel + k * 2) % SIM_POOL_COUNT;
-        snprintf(g_app.inc_files[k].name, sizeof g_app.inc_files[k].name,
-                 "%s", sim_pool[src].name);
-        g_app.inc_files[k].rname[0] = 0;
-        g_app.inc_files[k].inc = true;
-        g_app.inc_files[k].size = sim_pool[src].size;
-    }
-    if (g_app.dev_count > 0) {
-        int s = g_app.dev_sel;
-        if (s < 0 || s >= g_app.dev_count) s = 0;
-        snprintf(g_app.recv_alias, sizeof g_app.recv_alias, "%s",
-                 g_app.dev_alias[s]);
-        snprintf(g_app.recv_type, sizeof g_app.recv_type, "%s",
-                 g_app.dev_kind[s][0] ? g_app.dev_kind[s] : "mobile");
-    } else {
-        /* 空网络也允许演示接收流程：用固定占位来者 */
-        snprintf(g_app.recv_alias, sizeof g_app.recv_alias, "%s", "Demo phone");
-        snprintf(g_app.recv_type, sizeof g_app.recv_type, "%s", "mobile");
-    }
-    strcpy(g_app.recv_dir, "ux0:data/psvsend/downloads/");
-    g_app.recv_cancel = false;
-    g_app.inc_sel = 0;
-    rs_scroll = 0;
-    recv_focus = 2;
-    g_app.page = PAGE_RECV_CONFIRM;
 }
 
 /* ---------- 布局/滚动小工具 ---------- */
@@ -269,15 +221,22 @@ void page_devices_render(void)
             w_text(28, LIST_TOP + 10, 1.15f, theme->text, "Wi-Fi link is down.");
         } else {
             w_text(28, LIST_TOP + 10, 1.15f, theme->text, "No devices found.");
-            w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim,
-                   "Open LocalSend on your phone/PC on the same network.");
+            if (scan_active()) {
+                char st[96];
+                snprintf(st, sizeof st, "Scanning... %d/%d hosts",
+                         scan_done(), scan_total() > 0 ? scan_total() : 254);
+                w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim, st);
+            } else {
+                w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim,
+                       "Press Triangle to scan this network.");
+            }
         }
     }
     HintSeg segs[6];
     int ns = 0;
     segs[ns].icon = HICON_DPAD;       segs[ns++].text = "Choose";
     segs[ns].icon = icon_confirm();   segs[ns++].text = "Send";
-    segs[ns].icon = HICON_TRIANGLE;   segs[ns++].text = "Sim receive";
+    segs[ns].icon = HICON_TRIANGLE;   segs[ns++].text = "Scan";
     segs[ns].icon = HICON_NONE;       segs[ns++].text = "SELECT Settings";
     w_page_footer_segs(segs, ns);
 }
@@ -306,11 +265,13 @@ void page_devices_input(const Input *in)
         g_app.dev_sel++;
         keep_sel_visible(&dev_scroll, count, g_app.dev_sel);
     }
+    if (in->alt) {
+        scan_trigger();          /* 三角键：手动扫一遍网段 */
+    }
     if (in->confirm) {
         g_app.dev_target = g_app.dev_sel;
         open_files();
     }
-    if (in->alt) sim_recv_request();   /* 三角键：模拟"对方发来文件请求" */
     if (in->menu) {
         g_app.set_sel = 0;
         g_app.page = PAGE_SETTINGS;
@@ -608,7 +569,19 @@ void page_send_confirm_input(const Input *in)
     if (in->back) g_app.page = PAGE_FILES;
 }
 
-/* ================= 接收请求确认（页面式：来者信息 + 三按钮焦点 + 发送方取消态） ================= */
+/* ================= 接收请求确认（真实：后端 PENDING 会话） ================= */
+static bool g_recv_expired = false;  /* 请求 120s 没人响应、已被后端作废 */
+static uint64_t g_recv_supp_ms = 0;  /* 决定后抑制重弹到：毫秒时间戳 */
+
+/* 拒绝当前请求并离开接收流程（后端回 403，发送方会看到拒绝） */
+static void recv_reject_close(void)
+{
+    recv_clear();                    /* PENDING → 唤醒 http 线程按拒绝处理 */
+    g_recv_supp_ms = (uint64_t)sceKernelGetSystemTimeWide() / 1000 + 2000;
+    rename_pop = false;
+    goto_devices();
+}
+
 static void recv_close(void)
 {
     rename_pop = false;
@@ -627,14 +600,15 @@ void page_recv_confirm_render(void)
     char line[256];
     Rect card = { 24, 80, SCR_W - 48, 320 };
 
-    if (g_app.recv_cancel) {
-        /* 发送方主动取消：提示 + 单个关闭按钮 */
+    /* 请求还在等 UI 决定吗？不在了（超时被后端作废）→ 只给关闭，不再给决定按钮 */
+    g_recv_expired = recv_pending_pull(NULL) == 0;
+    if (g_recv_expired) {
         w_rect(card, theme->card);
         w_text(48, 120, 1.5f, theme->text, "%s", g_app.recv_alias);
-        w_text(48, 172, 1.25f, theme->danger,
-               "The sender cancelled this request.");
+        w_text(48, 172, 1.25f, theme->text_dim,
+               "This request has expired.");
         w_text(48, 216, 1.0f, theme->text_dim,
-               "No files will be received.");
+               "No response was sent to the sender.");
         Rect close = { SCR_W / 2 - 100, 444, 200, 48 };
         w_add(2, close);
         w_button(close, "Close", true);
@@ -712,11 +686,10 @@ void page_recv_confirm_render(void)
                theme->text_dim, "Accept");
     }
 
-    HintSeg segs[8];
+    HintSeg segs[6];
     int ns = 0;
-    segs[ns].icon = HICON_SQUARE;     segs[ns++].text = "Sim cancel";
     segs[ns].icon = HICON_DPAD;       segs[ns++].text = "Switch";
-    segs[ns].icon = icon_confirm();   segs[ns++].text = "OK";
+    segs[ns].icon = icon_confirm();   segs[ns++].text = "Accept";
     segs[ns].icon = icon_back();      segs[ns++].text = "Reject";
     w_page_footer_segs(segs, ns);
 }
@@ -724,14 +697,7 @@ void page_recv_confirm_render(void)
 void page_recv_confirm_input(const Input *in)
 {
     if (in->drag_start || in->dragging) return;
-    if (in->square) {   /* 方块键：模拟发送方取消请求 */
-        if (!g_app.recv_cancel) {
-            g_app.recv_cancel = true;
-            recv_focus = 2;
-        }
-        return;
-    }
-    if (g_app.recv_cancel) {
+    if (g_recv_expired) {           /* 请求已过期：任意键/点击关闭 */
         if (in->tap || in->confirm || in->back) recv_close();
         return;
     }
@@ -748,7 +714,7 @@ void page_recv_confirm_input(const Input *in)
             g_app.page = PAGE_RECV_SETUP;
         } else if (id == 0) {
             recv_focus = 0;
-            recv_close();
+            recv_reject_close();
         }
         return;
     }
@@ -771,18 +737,28 @@ void page_recv_confirm_input(const Input *in)
             rename_pop = false;
             g_app.page = PAGE_RECV_SETUP;
         } else if (recv_focus == 0) {
-            recv_close();
+            recv_reject_close();
         }
         return;
     }
-    if (in->back) recv_close();
+    if (in->back) recv_reject_close();
 }
 
+/* 接受：把勾选集写回后端并请其建立会话（回执 200 后对方即可开传），
+ * 跳接收进度页。此时会话可能还没建好，进度页首帧用本地清单兜底。 */
 static void start_recv(void)
 {
+    bool inc[RECV_MAX_FILES];
     int i, n = 0;
     SceOff tot = 0;
-    for (i = 0; i < g_app.inc_count && i < MAX_INF; i++) {
+    if (recv_pending_pull(NULL) != 1) {   /* 已过期（竞态防护，正常不会到） */
+        recv_close();
+        return;
+    }
+    for (i = 0; i < g_app.inc_count && i < RECV_MAX_FILES; i++)
+        inc[i] = g_app.inc_files[i].inc;
+    recv_set_include(inc);
+    for (i = 0; i < g_app.inc_count && i < RECV_MAX_FILES; i++) {
         if (!g_app.inc_files[i].inc) continue;
         if (n >= MAX_PICKED) break;
         snprintf(xf_name[n], sizeof xf_name[0], "%s", g_app.inc_files[i].name);
@@ -790,10 +766,10 @@ static void start_recv(void)
         tot += g_app.inc_files[i].size;
         n++;
     }
-    if (n == 0) return;               /* 全部被跳过则不应开始 */
+    if (n == 0) { recv_reject_close(); return; }   /* 全被勾掉：当拒绝 */
     xf_count = n;
     xf_scroll = 0;
-    strcpy(g_app.prog_name, xf_name[0]);
+    g_app.prog_name[0] = 0;
     g_app.prog_size = tot;
     g_app.prog_dir = 1;
     g_app.prog_pct = 0;
@@ -804,6 +780,7 @@ static void start_recv(void)
     g_app.prog_running = true;
     g_app.prog_start = sceKernelGetSystemTimeWide();
     rename_pop = false;
+    recv_decide(true);               /* 唤醒后端：组会话、回 200 给发送方 */
     g_app.page = PAGE_PROGRESS;
 }
 
@@ -1021,7 +998,7 @@ void page_recv_setup_input(const Input *in)
     }
 }
 
-/* ================= 进度（模拟，LocalSend 式：文件列表 + 总进度 + 高级面板） ================= */
+/* ================= 进度（LocalSend 式：文件列表 + 总进度 + 高级面板） ================= */
 static void goto_devices(void)
 {
     w_clear_picked();
@@ -1029,15 +1006,6 @@ static void goto_devices(void)
     g_app.prog_running = false;
     g_app.dev_sel = g_app.dev_target;
     g_app.page = PAGE_DEVICES;
-}
-
-/* 取消传输：不退出页面，停在"已取消"态（按钮变 Done） */
-static void cancel_transfer(void)
-{
-    g_app.prog_running = false;
-    g_app.prog_cancel = true;
-    g_app.prog_done = false;
-    g_app.prog_ms = (int)((sceKernelGetSystemTimeWide() - g_app.prog_start) / 1000);
 }
 
 void page_progress_render(void)
@@ -1083,34 +1051,65 @@ void page_progress_render(void)
         }
         for (i = 0; i < xf_count; i++) total += xf_size[i];
     } else {
-        /* 接收路径（模拟演示）：按时间推进 */
-        if (g_app.prog_running) {
-            uint64_t now = sceKernelGetSystemTimeWide();
-            g_app.prog_ms = (int)((now - g_app.prog_start) / 1000);
-            int pct = (int)((uint64_t)g_app.prog_ms * 100 / PROG_TOTAL_MS);
-            if (pct >= 100) {
-                pct = 100;
-                g_app.prog_done = true;
-                g_app.prog_running = false;
-            }
-            g_app.prog_pct = pct;
-        }
-        for (i = 0; i < xf_count; i++) total += xf_size[i];
-        {
-            SceOff rem = total * (SceOff)g_app.prog_pct / 100;
+        /* 接收路径（真实）：每帧从 receive 模块拷会话快照；会话还没建好
+         * （Accept 刚点、http 线程未醒的几帧）用 start_recv 捕获的清单兜底。 */
+        RecvStatus rs;
+        memset(&rs, 0, sizeof rs);
+        bool has = recv_status_pull(&rs) == 1;
+        if (has) {
+            xf_count = rs.count > MAX_PICKED ? MAX_PICKED : rs.count;
             for (i = 0; i < xf_count; i++) {
-                if (xf_size[i] == 0) { done[i] = 0; continue; }  /* 空文件视为瞬间完成 */
-                if (rem >= xf_size[i])      { done[i] = xf_size[i]; rem -= xf_size[i]; }
-                else if (rem > 0)           { done[i] = rem; rem = 0; }
-                else                         done[i] = 0;
+                snprintf(xf_name[i], sizeof xf_name[0], "%s",
+                         rs.name[i][0] ? rs.name[i] : "?");
+                xf_size[i] = rs.size[i];
+                done[i] = rs.got[i] < rs.size[i] ? rs.got[i] : rs.size[i];
+                if (xf_size[i] == 0 || done[i] >= xf_size[i]) fin++;
+            }
+            active = rs.cur;                       /* 正在收的文件（-1=无） */
+            total = rs.total;
+            if (rs.state == RECV_ST_READY || rs.state == RECV_ST_RECEIVING)
+                g_app.prog_ms =
+                    (int)((sceKernelGetSystemTimeWide() - rs.start_us) / 1000);
+            g_app.prog_pct = rs.total > 0
+                ? (int)(rs.got_total * 100 / rs.total)
+                : (rs.state == RECV_ST_DONE ? 100 : 0);
+            if (g_app.prog_pct > 100) g_app.prog_pct = 100;
+            g_app.prog_running = rs.state == RECV_ST_READY ||
+                                 rs.state == RECV_ST_RECEIVING;
+            g_app.prog_done = rs.state == RECV_ST_DONE;
+            g_app.prog_cancel = rs.state == RECV_ST_CANCEL;
+            fail_state = rs.state == RECV_ST_FAIL ||
+                         rs.state == RECV_ST_TIMEOUT;
+            if (fail_state) {
+                msg = rs.err[0] ? rs.err : "Receive failed";
+                msg_col = theme->danger;
+            } else if (rs.state == RECV_ST_CANCEL) {
+                msg = rs.err[0] ? rs.err : "Cancelled";
+            } else if (rs.state == RECV_ST_READY) {
+                msg = "Waiting for sender to start...";
+            } else if (rs.state == RECV_ST_RECEIVING) {
+                msg = "Receiving...";
+            }
+        } else {
+            /* 首帧兜底：按已接受的清单画 0%，马上会被真实会话快照取代。
+             * Accept 后 http 线程应在几十 ms 内建好会话；若过了 2s 还没会话、
+             * 且请求也不再 PENDING（说明后端已把决定处理掉但没建成会话，
+             * 如请求恰好在决定前过期）→ 不能卡在进度页，给个失败态可退出。 */
+            for (i = 0; i < xf_count; i++) {
+                done[i] = 0;
+                total += xf_size[i];
+                if (xf_size[i] == 0) fin++;
+            }
+            msg = "Waiting for sender to start...";
+            if (recv_pending_pull(NULL) == 0 &&
+                (uint64_t)sceKernelGetSystemTimeWide() - g_app.prog_start >
+                    2000000ULL) {
+                g_app.prog_running = false;
+                g_app.prog_cancel = true;
+                msg = "Session was not created (request expired).";
+                msg_col = theme->danger;
             }
         }
-        for (i = 0; i < xf_count; i++)
-            if (xf_size[i] == 0 || done[i] >= xf_size[i]) fin++;
-        active = xf_count - 1;
-        for (i = 0; i < xf_count; i++)
-            if (xf_size[i] > 0 && done[i] < xf_size[i]) { active = i; break; }
-        if (active < 0) active = xf_count - 1;
     }
     if (active < 0 && xf_count > 0) active = xf_count - 1;
 
@@ -1210,6 +1209,13 @@ void page_progress_render(void)
     }
 }
 
+/* 离开进度页：接收方向先清场（终态/取消后让后端回空闲，不然一直占着会话） */
+static void progress_leave(void)
+{
+    if (g_app.prog_dir == 1) recv_clear();
+    goto_devices();
+}
+
 void page_progress_input(const Input *in)
 {
     /* 文件列表滚动（拖动跟手 / 方向键逐行） */
@@ -1236,9 +1242,9 @@ void page_progress_input(const Input *in)
         if (id == 1) {   /* 主按钮：传输中取消，否则退出 */
             if (g_app.prog_running) {
                 if (g_app.prog_dir == 0) xfer_cancel();
-                else cancel_transfer();
+                else recv_abort();
             } else {
-                goto_devices();
+                progress_leave();
             }
         } else if (id == 0) {
             g_app.prog_info = !g_app.prog_info;
@@ -1248,9 +1254,9 @@ void page_progress_input(const Input *in)
     if (in->confirm || in->back) {
         if (g_app.prog_running) {
             if (g_app.prog_dir == 0) xfer_cancel();
-            else cancel_transfer();
+            else recv_abort();
         } else {
-            goto_devices();
+            progress_leave();
         }
         return;
     }
@@ -1353,4 +1359,51 @@ void page_settings_input(const Input *in)
         else settings_change(g_app.set_sel, in->left ? -1 : 1);
     }
     if (in->back) g_app.page = PAGE_DEVICES;
+}
+
+/* ================= 新接收请求自动弹窗 ================= */
+/* 把"待决定请求"快照复制到 UI 工作副本并进入接收确认页 */
+static void open_recv_request(const RecvPending *rp)
+{
+    int i, n = rp->count;
+    if (n > RECV_MAX_FILES) n = RECV_MAX_FILES;
+    if (n > MAX_INF) n = MAX_INF;
+    snprintf(g_app.recv_alias, sizeof g_app.recv_alias, "%s", rp->peer_alias);
+    snprintf(g_app.recv_type, sizeof g_app.recv_type, "%s",
+             rp->peer_type[0] ? rp->peer_type : "unknown");
+    g_app.inc_count = n;
+    for (i = 0; i < n; i++) {
+        snprintf(g_app.inc_files[i].name, sizeof g_app.inc_files[i].name,
+                 "%s", rp->files[i].name);
+        g_app.inc_files[i].rname[0] = 0;
+        g_app.inc_files[i].inc = true;      /* 默认全收，Setup 里可取消勾选 */
+        g_app.inc_files[i].size = rp->files[i].size;
+    }
+    snprintf(g_app.recv_dir, sizeof g_app.recv_dir, "%s", PSVSEND_DL_DIR);
+    g_app.inc_sel = 0;
+    rs_scroll = 0;
+    rename_pop = false;
+    recv_focus = 2;
+    g_app.page = PAGE_RECV_CONFIRM;
+}
+
+/* 每帧由 ui_main 调用：出现"待决定接收请求"且当前页面可打断时自动弹确认页。
+ * 用户拒绝/接受后 g_recv_supp_ms 置 2s 抑制窗，防对端立刻重试又弹回；
+ * 接收流程页/传输中本身不打断（switch 的 default）。 */
+void pages_tick(void)
+{
+    RecvPending rp;
+    uint64_t now_ms = (uint64_t)sceKernelGetSystemTimeWide() / 1000;
+    if (now_ms < g_recv_supp_ms) return;     /* 决定后的抑制窗内不弹 */
+    if (recv_pending_pull(&rp) != 1) return; /* 无"待决定"请求 */
+    switch (g_app.page) {
+    case PAGE_DEVICES:
+    case PAGE_FILES:
+    case PAGE_SEND_CONFIRM:
+    case PAGE_SETTINGS:
+        break;
+    default:
+        return;                              /* 接收流程/传输中不打断 */
+    }
+    open_recv_request(&rp);
 }

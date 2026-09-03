@@ -149,6 +149,8 @@ void ui_input_poll(Input *in);
 
 /* ---------- 初始化（pages.c） ---------- */
 void pages_init(void);
+/* 每帧主循环调用：发现新的"待决定接收请求"时自动弹接收确认页 */
+void pages_tick(void);
 
 /* ---------- UI 模块入口（ui_main.c） ---------- */
 void ui_run(void);
