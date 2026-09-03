@@ -5,6 +5,7 @@
 #include <psp2/kernel/processmgr.h>
 #include "ui.h"
 #include "theme.h"
+#include "../api.h"
 
 App g_app;
 vita2d_pvf *g_font;
@@ -75,6 +76,8 @@ void ui_run(void)
     pages_init();
 
     while (!g_app.done) {
+        api_tick();          /* 网络巡检 + announce（500ms 节流，跑在主循环） */
+
         vita2d_start_drawing();
         vita2d_set_clear_color(theme->bg);
         vita2d_clear_screen();

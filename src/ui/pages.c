@@ -1,5 +1,5 @@
 /* 页面：设备列表 / 文件浏览 / 发送确认 / 接收确认 / 进度 / 设置
- * 目前数据为 mock：设备是演示数据，传输是模拟进度。
+ * 数据：设备列表来自后端 UDP 发现（api.h 快照）；传输/接收请求仍是 mock 演示。
  * 渲染函数每帧先绘制并注册可触摸区域（w_add），输入函数处理动作与命中。
  *
  * 列表采用"像素滚动"模型：内容像素偏移 scroll（0=从 LIST_TOP 开始），
@@ -13,15 +13,9 @@
 #include <psp2/kernel/threadmgr/thread.h>
 #include "ui.h"
 #include "theme.h"
-
-/* ---------- mock 数据 ---------- */
-static const char *mock_alias[] = {
-    "OPPO A1", "Xiaomi Pad 6", "Windows-PC", "Pixel 7", "MacBook Air",
-};
-static const char *mock_type[] = {
-    "phone", "tablet", "desktop", "phone", "desktop",
-};
-#define MOCK_COUNT ((int)(sizeof mock_alias / sizeof mock_alias[0]))
+#include "../config.h"
+#include "../net.h"
+#include "../api.h"
 
 /* ---------- 布局常量 ---------- */
 #define LIST_TOP     76                 /* 列表可视区顶 */
@@ -48,6 +42,7 @@ static int recv_focus = 2;        /* 接收确认焦点：0=Reject 1=Setup 2=Acc
 static int rs_scroll = 0;         /* 接收设置页文件列表内容偏移 */
 static int rs_press_scroll = 0;
 static bool rename_pop = false;   /* 改名占位弹窗（重命名功能 TODO） */
+static bool host_pop = false;     /* 设置页主机名改名的占位弹窗（文字输入 TODO） */
 
 /* 本次传输的文件列表（mock；将来换真实传输会话状态） */
 static int    xf_count = 0;
@@ -102,13 +97,19 @@ static void sim_recv_request(void)
         g_app.inc_files[k].inc = true;
         g_app.inc_files[k].size = sim_pool[src].size;
     }
-    strncpy(g_app.recv_alias, g_app.dev_alias[g_app.dev_sel],
-            sizeof g_app.recv_alias - 1);
-    g_app.recv_alias[sizeof g_app.recv_alias - 1] = 0;
-    strncpy(g_app.recv_type, g_app.dev_type[g_app.dev_sel],
-            sizeof g_app.recv_type - 1);
-    g_app.recv_type[sizeof g_app.recv_type - 1] = 0;
-    strcpy(g_app.recv_dir, "ux0:data/psvsend/");
+    if (g_app.dev_count > 0) {
+        int s = g_app.dev_sel;
+        if (s < 0 || s >= g_app.dev_count) s = 0;
+        snprintf(g_app.recv_alias, sizeof g_app.recv_alias, "%s",
+                 g_app.dev_alias[s]);
+        snprintf(g_app.recv_type, sizeof g_app.recv_type, "%s",
+                 g_app.dev_kind[s][0] ? g_app.dev_kind[s] : "mobile");
+    } else {
+        /* 空网络也允许演示接收流程：用固定占位来者 */
+        snprintf(g_app.recv_alias, sizeof g_app.recv_alias, "%s", "Demo phone");
+        snprintf(g_app.recv_type, sizeof g_app.recv_type, "%s", "mobile");
+    }
+    strcpy(g_app.recv_dir, "ux0:data/psvsend/downloads/");
     g_app.recv_cancel = false;
     g_app.inc_sel = 0;
     rs_scroll = 0;
@@ -178,27 +179,58 @@ static void add_row_hit(int id, int top)
 void pages_init(void)
 {
     int i;
-    for (i = 0; i < MOCK_COUNT; i++) {
-        strncpy(g_app.dev_alias[i], mock_alias[i], sizeof g_app.dev_alias[0] - 1);
-        strncpy(g_app.dev_type[i], mock_type[i], sizeof g_app.dev_type[0] - 1);
-    }
-    g_app.dev_count = MOCK_COUNT;
+    config_init();                       /* 读配置：主题/键位布局/设备名等 */
+    if (g_cfg.theme_id < 0 || g_cfg.theme_id >= THEME_COUNT) g_cfg.theme_id = 0;
+    g_app.theme_id = g_cfg.theme_id;
+    g_app.confirm_layout = g_cfg.confirm_layout ? 1 : 0;
+    g_app.dev_count = 0;
     g_app.dev_sel = 0;
     g_app.dev_target = 0;
+    for (i = 0; i < MAX_DEVICES; i++) {
+        g_app.dev_alias[i][0] = 0;
+        g_app.dev_sub[i][0] = 0;
+        g_app.dev_kind[i][0] = 0;
+    }
     g_app.page = PAGE_DEVICES;
-    g_app.theme_id = 0;
-    g_app.confirm_layout = 0;
     g_app.prog_running = false;
     g_app.done = false;
     dev_scroll = 0;
     file_scroll = 0;
     theme_set(g_app.theme_id);
+    api_start();                         /* 网络底座：net + UDP 发现线程 */
 }
 
 /* ================= 设备列表 ================= */
+
+/* 每帧渲染前从后端发现表拷一份快照到 g_app（锁内拷贝，无竞态）。
+ * 设备增删/超时消失都由发现线程更新，这里只做显示用的镜像。 */
+static void dev_sync(void)
+{
+    Device tmp[API_MAX_DEVICES];
+    int n = api_device_snapshot(tmp, API_MAX_DEVICES);
+    int i;
+    if (n > MAX_DEVICES) n = MAX_DEVICES;
+    for (i = 0; i < n; i++) {
+        snprintf(g_app.dev_alias[i], sizeof g_app.dev_alias[0], "%s",
+                 tmp[i].alias[0] ? tmp[i].alias : tmp[i].ip);
+        if (tmp[i].model[0] && strlen(tmp[i].model) < 28)
+            snprintf(g_app.dev_sub[i], sizeof g_app.dev_sub[0], "%s", tmp[i].model);
+        else if (tmp[i].dtype[0])
+            snprintf(g_app.dev_sub[i], sizeof g_app.dev_sub[0], "%s", tmp[i].dtype);
+        else
+            g_app.dev_sub[i][0] = 0;
+        snprintf(g_app.dev_kind[i], sizeof g_app.dev_kind[0], "%s", tmp[i].dtype);
+    }
+    g_app.dev_count = n;
+    if (n == 0) g_app.dev_sel = 0;
+    else if (g_app.dev_sel >= n) g_app.dev_sel = n - 1;
+}
+
 void page_devices_render(void)
 {
-    int count = g_app.dev_count;
+    int count;
+    dev_sync();
+    count = g_app.dev_count;
     w_page_header("PSVSend");
     if (count > 0) {
         int i;
@@ -210,14 +242,26 @@ void page_devices_render(void)
             if (top >= LIST_BOTTOM) break;
             Rect r = { 24, top, SCR_W - 48, ROW_H };
             add_row_hit(i, top);
-            w_row(r, g_app.dev_alias[i], g_app.dev_type[i], i == g_app.dev_sel);
+            w_row(r, g_app.dev_alias[i], g_app.dev_sub[i], i == g_app.dev_sel);
         }
         vita2d_disable_clipping();
-    }
-    if (count * ROW_STRIDE + 24 <= LIST_VIEW_H) {
-        char foot[96];
-        snprintf(foot, sizeof foot, "%d device(s) - demo data", count);
-        w_text(28, LIST_TOP + count * ROW_STRIDE + 8, 1.0f, theme->text_dim, "%s", foot);
+    } else {
+        if (!api_network_ready()) {
+            const char *why = api_discovery_fail();
+            w_text(28, LIST_TOP + 10, 1.15f, theme->text, "Network not ready.");
+            if (why[0]) {
+                w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim, why);
+            } else {
+                w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim,
+                       "Waiting for Wi-Fi to come back up...");
+            }
+        } else if (!net_connected()) {
+            w_text(28, LIST_TOP + 10, 1.15f, theme->text, "Wi-Fi link is down.");
+        } else {
+            w_text(28, LIST_TOP + 10, 1.15f, theme->text, "No devices found.");
+            w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim,
+                   "Open LocalSend on your phone/PC on the same network.");
+        }
     }
     HintSeg segs[6];
     int ns = 0;
@@ -1143,27 +1187,35 @@ void page_progress_input(const Input *in)
 }
 
 /* ================= 设置 ================= */
+#define SET_ROWS 3            /* 0=主题 1=确认键 2=主机名(壳子) */
+
 void page_settings_render(void)
 {
+    char theme_v[64], layout_v[96];
+    const char *vals[SET_ROWS];
+    const char *labels[SET_ROWS];
+    int i;
+
     w_page_header("Settings");
-    char layout_v[64];
-    const char *vals[2];
-    vals[0] = theme_names[g_app.theme_id];
+    snprintf(theme_v, sizeof theme_v, "%s", theme_names[g_cfg.theme_id]);
     snprintf(layout_v, sizeof layout_v, "%s confirm / %s back (%s)",
              key_confirm(), key_back(),
              g_app.confirm_layout == 0 ? "US" : "JP");
+    labels[0] = "Theme";
+    labels[1] = "Confirm key";
+    labels[2] = "Hostname";
+    vals[0] = theme_v;
     vals[1] = layout_v;
-    const char *labels[2] = { "Theme", "Confirm key" };
-    int i;
-    for (i = 0; i < 2; i++) {
+    vals[2] = g_cfg.alias[0] ? g_cfg.alias : DEFAULT_ALIAS;
+    for (i = 0; i < SET_ROWS; i++) {
         Rect r = { 24, 100 + i * 78, SCR_W - 48, 62 };
         Rect rl = { r.x, r.y, r.w / 2, r.h };
         Rect rr = { r.x + r.w / 2, r.y, r.w - r.w / 2, r.h };
-        w_add(i * 2, rl);          /* 左半 = 上一个 */
-        w_add(i * 2 + 1, rr);      /* 右半 = 下一个 */
+        w_add(i * 2, rl);          /* 左半 = 上一个/编辑 */
+        w_add(i * 2 + 1, rr);      /* 右半 = 下一个/编辑 */
         w_row(r, labels[i], vals[i], i == g_app.set_sel);
     }
-    w_text(28, 100 + 2 * 78 + 10, 1.0f, theme->text_dim,
+    w_text(28, 100 + SET_ROWS * 78 + 10, 1.0f, theme->text_dim,
            "LEFT / tap left half: prev   RIGHT / tap right half: next");
     HintSeg segs[6];
     int ns = 0;
@@ -1171,35 +1223,63 @@ void page_settings_render(void)
     segs[ns].icon = icon_confirm();  segs[ns++].text = "Change";
     segs[ns].icon = icon_back();     segs[ns++].text = "Back";
     w_page_footer_segs(segs, ns);
+
+    /* 主机名编辑占位弹窗（文字输入方案未定，先壳子） */
+    if (host_pop) {
+        Rect card = w_modal_box(230);
+        w_text(card.x + 40, card.y + 28, 1.3f, theme->text, "Hostname");
+        w_text_clip(card.x + 40, card.y + 76, 1.0f, theme->text_dim,
+                    vals[2], card.w - 80);
+        w_text(card.x + 40, card.y + 124, 1.0f, theme->text_dim,
+               "This name is shown to other LocalSend devices.");
+        w_text(card.x + 40, card.y + 158, 1.0f, theme->text_dim,
+               "Editing needs text input - not available yet (TODO).");
+    }
 }
 
-/* 修改设置项：row=0 主题循环切换，row=1 键位布局翻转；dir=±1 */
+/* 修改设置项并落盘：row=0 主题循环切换，row=1 键位布局翻转；dir=±1 */
 static void settings_change(int row, int dir)
 {
     if (row == 0) {
         g_app.theme_id += dir;
         if (g_app.theme_id < 0) g_app.theme_id = THEME_COUNT - 1;
         if (g_app.theme_id >= THEME_COUNT) g_app.theme_id = 0;
+        g_cfg.theme_id = g_app.theme_id;
         theme_set(g_app.theme_id);
+        config_save();
     } else if (row == 1) {
         g_app.confirm_layout = g_app.confirm_layout ? 0 : 1;
+        g_cfg.confirm_layout = g_app.confirm_layout;
+        config_save();
     }
+    /* row=2 主机名：无文字输入，改不了（见占位弹窗） */
 }
 
 void page_settings_input(const Input *in)
 {
+    if (host_pop) {
+        /* 占位弹窗：任意键/点击关闭 */
+        if (in->tap || in->confirm || in->back || in->alt ||
+            in->up || in->down || in->left || in->right ||
+            in->drag_start || in->dragging)
+            host_pop = false;
+        return;
+    }
     if (in->drag_start || in->dragging) return;
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id >= 0) {
             g_app.set_sel = id / 2;
-            settings_change(g_app.set_sel, (id & 1) ? 1 : -1);
+            if (g_app.set_sel == 2) host_pop = true;   /* 主机名行：占位弹窗 */
+            else settings_change(g_app.set_sel, (id & 1) ? 1 : -1);
         }
         return;
     }
     if (in->up && g_app.set_sel > 0) g_app.set_sel--;
-    if (in->down && g_app.set_sel < 1) g_app.set_sel++;
-    if (in->left) settings_change(g_app.set_sel, -1);
-    if (in->right || in->confirm) settings_change(g_app.set_sel, 1);
+    if (in->down && g_app.set_sel < SET_ROWS - 1) g_app.set_sel++;
+    if (in->left || in->right || in->confirm) {
+        if (g_app.set_sel == 2) host_pop = true;
+        else settings_change(g_app.set_sel, in->left ? -1 : 1);
+    }
     if (in->back) g_app.page = PAGE_DEVICES;
 }

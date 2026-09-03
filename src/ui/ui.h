@@ -89,12 +89,13 @@ typedef struct {
     PageId page;
     int    sel;         /* 通用选中 */
 
-    /* 设备（mock） */
-    char   dev_alias[MAX_DEVICES][64];
-    char   dev_type[MAX_DEVICES][16];
+    /* 设备（发现快照：设备页渲染前从后端拷贝；下标当帧有效） */
+    char   dev_alias[MAX_DEVICES][64];  /* 别名（列表主文本） */
+    char   dev_sub[MAX_DEVICES][40];    /* 副文本：型号或平台类型 */
+    char   dev_kind[MAX_DEVICES][16];   /* 平台类型 mobile/desktop/...（接收页展示） */
     int    dev_count;
     int    dev_sel;
-    int    dev_target;  /* 发送流程选择的目标 */
+    int    dev_target;                  /* 发送流程选择的目标（快照下标） */
 
     /* 文件浏览 */
     char    cur_dir[512];

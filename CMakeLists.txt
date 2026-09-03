@@ -20,6 +20,13 @@ set(VITA_TITLE  "PSVSend")
 
 add_executable(${PROJECT_NAME}
     src/main.c
+    src/api.c
+    src/config.c
+    src/dlog.c
+    src/discovery.c
+    src/http.c
+    src/json_util.c
+    src/net.c
     src/ui/ui_main.c
     src/ui/pages.c
     src/ui/widgets.c
@@ -30,6 +37,7 @@ target_link_libraries(${PROJECT_NAME}
     vita2d freetype png jpeg z m
     SceAppMgr_stub SceCommonDialog_stub SceCtrl_stub SceDisplay_stub
     SceGxm_stub SceIofilemgr_stub SceKernelThreadMgr_stub
+    SceNet_stub SceNetCtl_stub
     ScePgf_stub ScePvf_stub SceSysmodule_stub SceTouch_stub
 )
 
