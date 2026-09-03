@@ -5,7 +5,9 @@
  *   2) 收到对方 HTTP POST /register 时把其信息记入设备表
  *      （discovery_peer_registered，由 http.c 调用）。
  * 由此双向互见完全不需要 bind 任何端口，绕开 53317 限制。
- * 线程：announce（周期组播/广播 announce + 清理过期设备）。 */
+ * 线程模型：announce 节奏由 UI 主循环调 api_tick() 驱动（Vita SceNet 的 UDP
+ * sendto 从非主线程调用会无限卡死，实测只在主循环上可靠）；http 服务器是独立
+ * 线程，收到的 register 经回调记入设备表。 */
 #include <string.h>
 #include <stdio.h>
 #include <psp2/net/net.h>
@@ -37,13 +39,6 @@ static int    g_tx_sock = -1;
 static volatile int g_run = 0;
 static int    g_state = 0;         /* 1 运行 / 0 未启动 / <0 启动失败码 */
 static char   g_efail[96] = "";    /* 最近一次启动失败定位 */
-
-static void efail(const char *step, int code)
-{
-    g_state = code;
-    snprintf(g_efail, sizeof g_efail, "%s 0x%08X", step, (unsigned)code);
-    dlog("disc: FAIL %s 0x%08X", step, (unsigned)code);
-}
 
 static uint64_t now_ms(void)
 {
@@ -208,11 +203,12 @@ static int send_announce_dnet(void)
     }
 }
 
-/* ---------- announce 发送（由 api 看门狗线程每 500ms 调一次） ---------- */
-/* 数到第 10 次（5 秒）发一轮组播/广播/定向广播。不另建线程。 */
+/* ---------- announce 发送（由 UI 主循环的 api_tick 每帧节流后调用） ---------- */
+/* 数到第 10 次（5 秒）发一轮组播/广播/定向广播。 */
 static int ann_ticks = 0;
 static bool ann_first = true;
 static int g_err = 1, b_err = 1, d_err = 1;
+static int disc_open_tx(void);
 
 void disc_tick_announce(void)
 {
@@ -225,6 +221,9 @@ void disc_tick_announce(void)
     }
     if (++ann_ticks < 10) return;
     ann_ticks = 0;
+
+    if (g_tx_sock < 0 && disc_open_tx() < 0)
+        return;                     /* 发送 socket 没建起来，下一轮再试 */
 
     {
         int g = send_announce_group();
@@ -241,29 +240,20 @@ void disc_tick_announce(void)
     }
 }
 
-/* ---------- 启动 ---------- */
-int discovery_start(void)
+/* ---------- 发送 socket ----------
+ * 真机坑：Vita SceNet 的 UDP sendto 从非主线程调用会无限卡死（无论 socket 归属），
+ * 只有 UI 主循环能稳定发。因此 announce 节奏由 UI 调 api_tick 驱动（见 api.c），
+ * 发送 socket 也在此路径上懒创建，保证"创建与使用都在主线程"。 */
+static int disc_open_tx(void)
 {
     int so_bcast = 1;
-    if (g_state > 0) return 0;
-
-    if (g_tx_sock >= 0) { sceNetSocketClose(g_tx_sock); g_tx_sock = -1; }
-    g_state = 0;
-    g_run = 0;
-
-    if (g_mtx < 0)  g_mtx  = sceKernelCreateMutex("psvsend_disc_tbl", 0, 1, NULL);
-    if (g_send_mtx < 0) g_send_mtx = sceKernelCreateMutex("psvsend_disc_snd", 0, 1, NULL);
-
-    /* 纯发送 socket：无需 bind，源端口系统分配 */
-    g_tx_sock = sceNetSocket("psvsend_disc_tx", SCE_NET_AF_INET,
-                             SCE_NET_SOCK_DGRAM, SCE_NET_IPPROTO_UDP);
-    if (g_tx_sock < 0) {
-        int ec = g_tx_sock;
-        g_tx_sock = -1;
-        efail("udp socket", ec);
-        return ec;
+    int sock = sceNetSocket("psvsend_disc_tx", SCE_NET_AF_INET,
+                            SCE_NET_SOCK_DGRAM, SCE_NET_IPPROTO_UDP);
+    if (sock < 0) {
+        dlog("disc: udp socket fail 0x%08X", (unsigned)sock);
+        return sock;
     }
-    sceNetSetsockopt(g_tx_sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_BROADCAST,
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_BROADCAST,
                      &so_bcast, sizeof so_bcast);
     /* 组播出口网卡 + TTL：不选网卡时部分协议栈默认不发/乱发组播 */
     {
@@ -275,13 +265,30 @@ int discovery_start(void)
             unsigned char ttl = 8;
             int r;
             mif.s_addr = ip4;
-            r = sceNetSetsockopt(g_tx_sock, SCE_NET_IPPROTO_IP,
+            r = sceNetSetsockopt(sock, SCE_NET_IPPROTO_IP,
                                  SCE_NET_IP_MULTICAST_IF, &mif, sizeof mif);
             dlog("disc: multicast if set -> %d", r);
-            sceNetSetsockopt(g_tx_sock, SCE_NET_IPPROTO_IP,
+            sceNetSetsockopt(sock, SCE_NET_IPPROTO_IP,
                              SCE_NET_IP_MULTICAST_TTL, &ttl, sizeof ttl);
         }
     }
+    g_tx_sock = sock;
+    return 0;
+}
+
+/* ---------- 启动 ---------- */
+int discovery_start(void)
+{
+    if (g_state > 0) return 0;
+
+    if (g_tx_sock >= 0) { sceNetSocketClose(g_tx_sock); g_tx_sock = -1; }
+    g_state = 0;
+    g_run = 0;
+
+    if (g_mtx < 0)  g_mtx  = sceKernelCreateMutex("psvsend_disc_tbl", 0, 1, NULL);
+    if (g_send_mtx < 0) g_send_mtx = sceKernelCreateMutex("psvsend_disc_snd", 0, 1, NULL);
+
+    /* 发送 socket 不在这里建——由 UI 主循环的 announce 节奏懒创建（线程亲缘，见上） */
 
     g_run = 1;
     g_state = 1;

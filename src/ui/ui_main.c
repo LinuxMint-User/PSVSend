@@ -76,7 +76,7 @@ void ui_run(void)
     pages_init();
 
     while (!g_app.done) {
-        api_tick();          /* 网络巡检 + announce（500ms 节流，跑在主循环） */
+        api_tick();          /* announce 节奏（500ms 节流；sendto 只在主线程可靠） */
 
         vita2d_start_drawing();
         vita2d_set_clear_color(theme->bg);

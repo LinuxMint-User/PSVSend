@@ -20,10 +20,13 @@ typedef struct {
     bool download;           /* 是否开了下载 API（能否主动收） */
 } Device;
 
-/* 启动后端：config_init + net_start + discovery_start（各模块内部幂等） */
+/* 启动后端：config_init + net_start + discovery_start（各模块内部幂等）。
+ * 后台线程自理：api_watch（500ms 巡检重试）+ http（收对方 register/info）。
+ * 注意：UDP announce 不能进后台线程（Vita sendto 只在主线程可靠），由 UI 每帧
+ * 调 api_tick() 节流驱动。 */
 void api_start(void);
 
-/* UI 主循环每帧调用：内部 500ms 节流做网络巡检 + 5s 节奏发 announce */
+/* UI 主循环每帧调用：500ms 节流喂 announce 节奏。必须跑在主线程。 */
 void api_tick(void);
 
 /* 拷贝设备快照到 out（最多 max 台），返回当前设备数（快照锁内完成） */
