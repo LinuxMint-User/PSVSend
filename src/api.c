@@ -17,6 +17,7 @@
 #include "http.h"
 #include "discovery.h"
 #include "api.h"
+#include "identity.h"
 #include "dlog.h"
 
 #define DISC_RETRY_MS 2000           /* 发现失败后的重试冷却 */
@@ -113,6 +114,14 @@ void api_start(void)
     config_init();                       /* 先建目录/读配置（dlog 目录依赖它） */
     dlog_init();
     dlog("== psvsend boot ==");
+    {
+        /* 版本标记 + 设备身份指纹：确认刷入的固件含 mTLS 客户端证书 */
+        char f[65];
+        if (identity_fingerprint(f) == 0)
+            dlog("api: build mtls, device id fp=%s", f);
+        else
+            dlog("api: build mtls, identity parse FAILED");
+    }
 
     http_set_register_cb(discovery_peer_registered);   /* 对方 register → 设备表 */
 

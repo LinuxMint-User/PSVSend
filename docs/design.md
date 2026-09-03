@@ -7,6 +7,12 @@
 - 在 PSV 上实现 LocalSend v2 兼容客户端，与局域网内其他 LocalSend 设备（手机 / PC）互相收发文件
 - 协议目标 **v2**（理由见 §3）：v1 已废弃；v3 的签名 / WebRTC / PIN 体系复杂，PSV 资源有限，且官方客户端同时兼容 v2/v3，v2 生态覆盖最广
 
+### 实现现状（2026-09）
+
+- **已落地（发送方向）**：UDP 组播发现 / register 入表 → UI 选设备、浏览 ux0 选文件 → `transfer.c` 按对方 announce 的 protocol 走 HTTP 明文或 HTTPS（mbedTLS 3.6.5、锁定 TLS1.2）执行 `prepare-upload` / `upload`，带进度回写与本地取消。HTTPS 连接自动出示内嵌设备身份证书（mTLS，应对 2026 官方 Rust 内核接收端强制客户端证书），并按对方指纹锁定其证书（详见 §3 决策表）。
+- **未落地**：接收方向（收件会话确认 UI / `downloads/` 写盘）与下文 §4/§5 的部分规划（如 session.c 拆分、multipart 收件、接收设置页）仍在路线中。
+- 本文按"目标架构"描述，部分命名与实际源码不同；现状与源码布局以 README「目录结构」为准。
+
 ## 2. 总体架构（前后端分层）
 
 ```
@@ -36,8 +42,10 @@
 | 决策 | 结论 | 理由 |
 |------|------|------|
 | 协议版本 | **v2** | v1 废弃；v3 复杂（nonce 签名 / WebRTC），官方保持 v2 向后兼容，生态主流是 v2 |
-| 传输 | 明文 HTTP 优先，TLS 后置 | 协议本身支持 http 明文，互通无碍 |
-| TLS 方案 | **mbedtls**（已装 3.6.5） | PSV 系统 SceSsl 对 homebrew 不可用，自制软件标准做法是编译 mbedtls 进应用 |
+| 传输 | HTTP 明文与 HTTPS 双支持，按对端 announce 的 protocol 自动选择 | 明文互通无碍；对端为 https 时必须加密 |
+| TLS 方案 | **mbedtls**（工具链自带 3.6.5），锁定 TLS1.2 | PSV 系统 SceSsl 对 homebrew 不可用；TLS1.3 的证书校验不走 per-cert 回调，指纹 pin 依赖 1.2 |
+| HTTPS 信任模型 | 对端证书按 announce 指纹 SHA-256 **pin**（VERIFY_OPTIONAL + 自管校验回调），不依赖 CA 链 | LAN 内无公开 PKI；协议本身即以 fingerprint 标识设备 |
+| mTLS 客户端身份 | 内置自签 RSA-2048 设备证书（`identity.c` + `id_cert.inc` / `id_key.inc`），对端强制客户端证书时自动出示 | 2026 官方 Rust 内核接收端对非浏览器发送方强制客户端证书，无证书即 `certificate_required` 握手失败 |
 | HTTP/1.1 范围 | **子集**：POST、Content-Length、**chunked 解码**、multipart boundary、query string；响应后关闭连接 | 目标是"兼容 LocalSend"，非"完备 HTTP"。chunked 必须支持（官方 Dart 客户端可能使用）；解析器独立模块、防御式实现（全部读取设上限、不支持格式优雅拒绝 400） |
 | 内存约束 | 按 **256MB** 设计基准（实际预算 365MB 封顶） | 512MB 为**统一内存**（CPU/GPU 共享），系统保留约 147MB，应用可拿最大 365MB（工具箱可调 256/285/333/365） |
 | 文件处理 | **大文件永不整读入内存**，一律流式（收：边收边写盘；发：边读边发） | 内存红线 |

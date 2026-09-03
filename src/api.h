@@ -15,7 +15,7 @@ typedef struct {
     char alias[64];          /* 设备名 */
     char model[64];          /* 设备型号（可空） */
     char dtype[16];          /* 平台类型 mobile/desktop/web/... */
-    char fingerprint[64];    /* 身份串（防自发现用） */
+    char fingerprint[96];    /* 身份串/HTTPS 证书 SHA-256（hex，防自发现 + TLS pin） */
     char protocol[8];        /* http / https */
     bool download;           /* 是否开了下载 API（能否主动收） */
 } Device;

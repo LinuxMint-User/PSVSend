@@ -16,6 +16,7 @@
 #include "../config.h"
 #include "../net.h"
 #include "../api.h"
+#include "../transfer.h"
 
 /* ---------- 布局常量 ---------- */
 #define LIST_TOP     76                 /* 列表可视区顶 */
@@ -190,6 +191,10 @@ void pages_init(void)
         g_app.dev_alias[i][0] = 0;
         g_app.dev_sub[i][0] = 0;
         g_app.dev_kind[i][0] = 0;
+        g_app.dev_ip[i][0] = 0;
+        g_app.dev_port[i] = 0;
+        g_app.dev_proto[i][0] = 0;
+        g_app.dev_fp[i][0] = 0;
     }
     g_app.page = PAGE_DEVICES;
     g_app.prog_running = false;
@@ -220,6 +225,11 @@ static void dev_sync(void)
         else
             g_app.dev_sub[i][0] = 0;
         snprintf(g_app.dev_kind[i], sizeof g_app.dev_kind[0], "%s", tmp[i].dtype);
+        snprintf(g_app.dev_ip[i], sizeof g_app.dev_ip[0], "%s", tmp[i].ip);
+        g_app.dev_port[i] = tmp[i].port;
+        snprintf(g_app.dev_proto[i], sizeof g_app.dev_proto[0], "%s",
+                 tmp[i].protocol[0] ? tmp[i].protocol : "http");
+        snprintf(g_app.dev_fp[i], sizeof g_app.dev_fp[0], "%s", tmp[i].fingerprint);
     }
     g_app.dev_count = n;
     if (n == 0) g_app.dev_sel = 0;
@@ -511,22 +521,19 @@ static void open_files(void)
     g_app.page = PAGE_FILES;
 }
 
+/* 发起真实发送：目标取自已同步的设备镜像（dev_target），文件取勾选列表。
+ * 发送在 xfer 后台线程执行；进度页每帧从 xfer 拷快照渲染。 */
 static void start_send(void)
 {
-    int i;
-    xf_count = g_app.picked_count;
-    for (i = 0; i < xf_count && i < MAX_PICKED; i++) {
-        snprintf(xf_name[i], sizeof xf_name[0], "%s", g_app.picked[i].name);
-        xf_size[i] = g_app.picked[i].size;
+    XferFile ff[XFER_MAX_FILES];
+    int i, n = 0;
+    if (g_app.picked_count <= 0) return;
+    for (i = 0; i < g_app.picked_count && n < XFER_MAX_FILES; i++) {
+        snprintf(ff[n].name, sizeof ff[n].name, "%s", g_app.picked[i].name);
+        snprintf(ff[n].path, sizeof ff[n].path, "%s", g_app.picked[i].path);
+        ff[n].size = g_app.picked[i].size;
+        n++;
     }
-    if (xf_count == 0) {                 /* 防御：无文件时给个占位 */
-        xf_count = 1;
-        strcpy(xf_name[0], "<no files>");
-        xf_size[0] = 0;
-    }
-    if (g_app.picked_count > 0)
-        strcpy(g_app.prog_name, g_app.picked[0].name);
-    g_app.prog_size = g_app.picked_total;
     g_app.prog_dir = 0;
     xf_scroll = 0;
     g_app.prog_pct = 0;
@@ -536,6 +543,18 @@ static void start_send(void)
     g_app.prog_ms = 0;
     g_app.prog_running = true;
     g_app.prog_start = sceKernelGetSystemTimeWide();
+    xf_count = n;
+    if (g_app.dev_target >= 0 && g_app.dev_target < g_app.dev_count &&
+        g_app.dev_ip[g_app.dev_target][0]) {
+        int t = g_app.dev_target;
+        xfer_start(g_app.dev_ip[t], g_app.dev_port[t],
+                   g_app.dev_proto[t], g_app.dev_fp[t], ff, n);
+    } else {
+        /* 目标失效（如设备刚离线）：xfer_start 会把失败原因写进快照，进度页显示 */
+        XferFile dummy;
+        memset(&dummy, 0, sizeof dummy);
+        xfer_start("", 0, "http", "", &dummy, 1);
+    }
     g_app.page = PAGE_PROGRESS;
 }
 
@@ -1024,38 +1043,76 @@ static void cancel_transfer(void)
 void page_progress_render(void)
 {
     int i;
-    /* 总进度（mock）：按时间推进 */
-    if (g_app.prog_running) {
-        uint64_t now = sceKernelGetSystemTimeWide();
-        g_app.prog_ms = (int)((now - g_app.prog_start) / 1000);
-        int pct = (int)((uint64_t)g_app.prog_ms * 100 / PROG_TOTAL_MS);
-        if (pct >= 100) {
-            pct = 100;
-            g_app.prog_done = true;
-            g_app.prog_running = false;
-        }
-        g_app.prog_pct = pct;
-    }
-
-    /* 由总进度推导每个文件的完成情况 */
     SceOff done[MAX_PICKED];
     SceOff total = 0;
-    int fin = 0, active = 0;
-    for (i = 0; i < xf_count; i++) total += xf_size[i];
-    {
-        SceOff rem = total * (SceOff)g_app.prog_pct / 100;
+    int fin = 0, active = -1;
+    bool fail_state = false;
+    XferInfo xv;
+    const char *msg = NULL;
+    uint32_t msg_col = theme->text_dim;
+
+    if (g_app.prog_dir == 0) {
+        /* 发送路径（真实）：从 xfer 模块拷快照映射到行显示数组 */
+        xfer_info(&xv);
+        xf_count = xv.count > MAX_PICKED ? MAX_PICKED : xv.count;
         for (i = 0; i < xf_count; i++) {
-            if (xf_size[i] == 0) { done[i] = 0; continue; }   /* 空文件视为瞬间完成 */
-            if (rem >= xf_size[i])      { done[i] = xf_size[i]; rem -= xf_size[i]; }
-            else if (rem > 0)           { done[i] = rem; rem = 0; }
-            else                         done[i] = 0;
+            snprintf(xf_name[i], sizeof xf_name[0], "%s",
+                     xv.f[i].name[0] ? xv.f[i].name : "?");
+            xf_size[i] = xv.f[i].size;
+            done[i] = xv.f[i].sent < xv.f[i].size ? xv.f[i].sent : xv.f[i].size;
+            if (xf_size[i] == 0 || done[i] >= xf_size[i]) fin++;
+            else if (active < 0) active = i;
         }
+        if (xv.active)
+            g_app.prog_ms = (int)((sceKernelGetSystemTimeWide() - xv.start_us) / 1000);
+        g_app.prog_pct = xv.total > 0
+            ? (int)(xv.total_sent * 100 / xv.total)
+            : (xv.finished && xv.ok ? 100 : 0);
+        if (g_app.prog_pct > 100) g_app.prog_pct = 100;
+        g_app.prog_running = xv.active;
+        g_app.prog_done = xv.finished && xv.ok;
+        g_app.prog_cancel = xv.cancelled;
+        fail_state = xv.finished && !xv.ok && !xv.cancelled;
+        if (fail_state) {
+            msg = xv.err[0] ? xv.err : "Transfer failed";
+            msg_col = theme->danger;
+        } else if (xv.active && xv.total_sent == 0 && xv.cur < 0) {
+            msg = xv.msg[0] ? xv.msg : "Waiting for receiver to accept...";
+        } else if (xv.active && xv.cur >= 0) {
+            msg = xv.msg[0] ? xv.msg : "Sending...";
+        }
+        for (i = 0; i < xf_count; i++) total += xf_size[i];
+    } else {
+        /* 接收路径（模拟演示）：按时间推进 */
+        if (g_app.prog_running) {
+            uint64_t now = sceKernelGetSystemTimeWide();
+            g_app.prog_ms = (int)((now - g_app.prog_start) / 1000);
+            int pct = (int)((uint64_t)g_app.prog_ms * 100 / PROG_TOTAL_MS);
+            if (pct >= 100) {
+                pct = 100;
+                g_app.prog_done = true;
+                g_app.prog_running = false;
+            }
+            g_app.prog_pct = pct;
+        }
+        for (i = 0; i < xf_count; i++) total += xf_size[i];
+        {
+            SceOff rem = total * (SceOff)g_app.prog_pct / 100;
+            for (i = 0; i < xf_count; i++) {
+                if (xf_size[i] == 0) { done[i] = 0; continue; }  /* 空文件视为瞬间完成 */
+                if (rem >= xf_size[i])      { done[i] = xf_size[i]; rem -= xf_size[i]; }
+                else if (rem > 0)           { done[i] = rem; rem = 0; }
+                else                         done[i] = 0;
+            }
+        }
+        for (i = 0; i < xf_count; i++)
+            if (xf_size[i] == 0 || done[i] >= xf_size[i]) fin++;
+        active = xf_count - 1;
+        for (i = 0; i < xf_count; i++)
+            if (xf_size[i] > 0 && done[i] < xf_size[i]) { active = i; break; }
+        if (active < 0) active = xf_count - 1;
     }
-    for (i = 0; i < xf_count; i++)
-        if (xf_size[i] == 0 || done[i] >= xf_size[i]) fin++;
-    active = xf_count - 1;
-    for (i = 0; i < xf_count; i++)
-        if (xf_size[i] > 0 && done[i] < xf_size[i]) { active = i; break; }
+    if (active < 0 && xf_count > 0) active = xf_count - 1;
 
     /* 列表可视区滚动夹紧 */
     {
@@ -1103,14 +1160,20 @@ void page_progress_render(void)
     char ov[48];
     snprintf(ov, sizeof ov, "Total   %d%%", g_app.prog_pct);
     w_text(40, 376, 1.15f, theme->text, "%s", ov);
-    if (g_app.prog_done || g_app.prog_cancel) {
-        const char *st = g_app.prog_done ? "Complete" : "Cancelled";
+    if (g_app.prog_done || g_app.prog_cancel || fail_state) {
+        const char *st = g_app.prog_done ? "Complete"
+                       : (g_app.prog_cancel ? "Cancelled" : "Failed");
         uint32_t sc = g_app.prog_done ? theme->success : theme->danger;
         int tw = 0, th = 0;
         w_text_w(1.15f, st, &tw, &th);
         w_text(920 - tw, 376, 1.15f, sc, "%s", st);
     }
     w_bar((Rect){ 40, 400, 880, 16 }, theme->card, theme->accent, g_app.prog_pct);
+
+    /* 状态行：失败原因 / 等待对方接受 / 正在发送 */
+    if (msg) {
+        w_text_clip(40, 418, 1.0f, msg_col, msg, 880);
+    }
 
     /* 高级面板：文件计数 / 耗时 / 速度（十进制 MB，1 MB = 1,000,000 B） */
     if (g_app.prog_info) {
@@ -1121,7 +1184,7 @@ void page_progress_render(void)
         snprintf(st, sizeof st, "Files %d/%d    Elapsed %d:%02d    Speed %.2f MB/s",
                  fin, xf_count, g_app.prog_ms / 60000,
                  (g_app.prog_ms / 1000) % 60, speed);
-        w_text(40, 436, 1.0f, theme->text_dim, "%s", st);
+        w_text(40, 456, 1.0f, theme->text_dim, "%s", st);
     }
 
     HintSeg segs[6];
@@ -1171,16 +1234,24 @@ void page_progress_input(const Input *in)
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id == 1) {   /* 主按钮：传输中取消，否则退出 */
-            if (g_app.prog_running) cancel_transfer();
-            else goto_devices();
+            if (g_app.prog_running) {
+                if (g_app.prog_dir == 0) xfer_cancel();
+                else cancel_transfer();
+            } else {
+                goto_devices();
+            }
         } else if (id == 0) {
             g_app.prog_info = !g_app.prog_info;
         }
         return;
     }
     if (in->confirm || in->back) {
-        if (g_app.prog_running) cancel_transfer();
-        else goto_devices();
+        if (g_app.prog_running) {
+            if (g_app.prog_dir == 0) xfer_cancel();
+            else cancel_transfer();
+        } else {
+            goto_devices();
+        }
         return;
     }
     if (in->alt) g_app.prog_info = !g_app.prog_info;

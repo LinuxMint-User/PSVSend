@@ -93,6 +93,10 @@ typedef struct {
     char   dev_alias[MAX_DEVICES][64];  /* 别名（列表主文本） */
     char   dev_sub[MAX_DEVICES][40];    /* 副文本：型号或平台类型 */
     char   dev_kind[MAX_DEVICES][16];   /* 平台类型 mobile/desktop/...（接收页展示） */
+    char   dev_ip[MAX_DEVICES][16];     /* 设备 IP（发送流程目标） */
+    int    dev_port[MAX_DEVICES];       /* 设备 HTTP 端口（发送流程目标） */
+    char   dev_proto[MAX_DEVICES][8];   /* 设备协议 http/https（是否走 TLS） */
+    char   dev_fp[MAX_DEVICES][96];     /* 设备指纹：https 时为证书 SHA-256（TLS pin） */
     int    dev_count;
     int    dev_sel;
     int    dev_target;                  /* 发送流程选择的目标（快照下标） */

@@ -7,9 +7,10 @@
 ## 当前状态
 
 - [x] VitaSDK 交叉编译环境 + vita2d 渲染骨架 + VPK 打包（含 LiveArea 素材）
-- [ ] LocalSend v2 协议核心（UDP 组播发现、HTTP prepare-upload / upload / cancel）
-- [ ] 文件发送 / 接收
-- [ ] TLS 加密传输
+- [x] LocalSend v2 发送链路：UDP 组播发现 / register / prepare-upload / upload
+- [x] 文件发送（PSV → 手机 / PC，HTTP 明文与 HTTPS 加密均支持）
+- [x] TLS 加密传输（mbedTLS 3.6.5，含 mTLS 客户端身份）
+- [ ] 文件接收（其他设备 → PSV，开发中）
 
 ## 构建
 
@@ -66,13 +67,23 @@ cmake --build build
 2. 使用 VitaShell 打开并安装
 3. 桌面出现 PSVSend 气泡
 
+## 使用
+
+1. 打开 PSVSend，等待 Wi-Fi 联网（状态指示变绿，设备列表出现局域网内的其他 LocalSend 设备）
+2. 选中目标设备 → 进入文件浏览（ux0 目录树，可多选）→ 确认发送
+3. 对方接受后，传输页显示逐文件进度，可随时取消
+
+### HTTPS / mTLS 说明
+
+发送端按对方 announce 的 `protocol` 自动选择明文 HTTP 或 HTTPS。2026 版官方 LocalSend（Rust 内核）对无浏览器会话的发送方强制要求**客户端证书**（mTLS），不出示证书直接握手失败（`certificate_required`）。为此 PSVSend 随固件内置一张设备身份证书（自签 RSA-2048，见 `src/id_cert.inc` / `src/id_key.inc`），HTTPS 连接自动出示；同时按对方 announce 的指纹（证书 SHA-256）锁定服务端证书，不依赖 CA 链。接收端只校验设备证书本身有效，无需信任本客户端。
+
 ## 目录结构
 
 **随仓库分发：**
 
 | 路径 | 说明 |
 |------|------|
-| `src/` | 源码 |
+| `src/` | 源码（含发送客户端与内嵌设备身份证书） |
 | `sce_sys/` | LiveArea 素材（图标 / 背景 / 启动图） |
 | `docs/localsend-protocol/` | LocalSend 协议参考文档 |
 
@@ -94,7 +105,15 @@ cmake --build build
 ├── env.sh                      # 随仓库分发
 ├── build.sh                    # 随仓库分发：一键构建脚本
 ├── src/                        # 随仓库分发：源码
-│   └── main.c
+│   ├── main.c                  # 入口
+│   ├── api.c                   # 前后端契约：启动 / 网络巡检 / 设备快照
+│   ├── net.c                   # SceNet 网络初始化
+│   ├── discovery.c             # UDP 组播 announce / 监听 + 设备表
+│   ├── http.c                  # HTTP 服务器：处理对方 register / info（设备入表）
+│   ├── transfer.c              # 发送客户端：prepare-upload / upload（HTTP + HTTPS）
+│   ├── identity.c / id_cert.inc / id_key.inc  # 内嵌设备身份证书（HTTPS mTLS）
+│   ├── config.c / json_util.c / dlog.c
+│   └── ui/                     # vita2d 界面（设备列表 / 文件浏览 / 进度）
 ├── sce_sys/                    # 随仓库分发：LiveArea 素材
 │   ├── icon0.png
 │   └── livearea/contents/

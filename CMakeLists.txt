@@ -15,6 +15,12 @@ project(psvsend VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# 给代码段(RX)末尾预留 SCE 元数据空间：vita-elf-create 要把模块/导入表塞在
+# 段0结尾与段1(RW)之间的空隙，代码大了会越界报 "segment 1 overlaps"。
+# 工具链自带 linker script 支持 __sce_headroom 符号（64KB 对齐前加空档），
+# 定义它把 RW 段整体后移 0x10000。
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--defsym=__sce_headroom=0x10000")
+
 set(VITA_TITLEID "PSVSEND01")
 set(VITA_TITLE  "PSVSend")
 
@@ -25,8 +31,10 @@ add_executable(${PROJECT_NAME}
     src/dlog.c
     src/discovery.c
     src/http.c
+    src/identity.c
     src/json_util.c
     src/net.c
+    src/transfer.c
     src/ui/ui_main.c
     src/ui/pages.c
     src/ui/widgets.c
@@ -34,6 +42,8 @@ add_executable(${PROJECT_NAME}
     src/ui/theme.c
 )
 target_link_libraries(${PROJECT_NAME}
+    mbedtls mbedx509 mbedcrypto
+    pthread
     vita2d freetype png jpeg z m
     SceAppMgr_stub SceCommonDialog_stub SceCtrl_stub SceDisplay_stub
     SceGxm_stub SceIofilemgr_stub SceKernelThreadMgr_stub
