@@ -81,7 +81,7 @@ void recv_clear(void);
 /* http 层收体轮询时查"用户是否请求中止"（无锁读 volatile；返回 1 后应尽快收尾） */
 bool recv_abort_pending(void);
 
-/* prepare-upload：解析清单 → PENDING 阻塞等 UI 决定（最多 120s）→ 填 resp 返回 HTTP
+/* prepare-upload：解析清单 → PENDING 阻塞等 UI 决定（最多 60s）→ 填 resp 返回 HTTP
  * 码（200=resp 为 JSON；403 拒绝/超时；400 坏体；409 已有活动会话） */
 int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz);
 

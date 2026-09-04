@@ -12,6 +12,7 @@
 - **已落地（发送方向）**：UDP 组播发现 / register 入表 → UI 选设备、浏览 ux0 选文件 → `transfer.c` 按对方 announce 的 protocol 走 HTTP 明文或 HTTPS（mbedTLS 3.6.5、锁定 TLS1.2）执行 `prepare-upload` / `upload`，带进度回写与本地取消。HTTPS 连接自动出示内嵌设备身份证书（mTLS，应对 2026 官方 Rust 内核接收端强制客户端证书），并按对方指纹锁定其证书（详见 §3 决策表）。
 - **已落地（接收方向）**：对方 prepare-upload → 自动弹接收确认页（Accept / Setup 逐文件勾选 / Reject）→ upload 由 http.c 提供流读回调、receive.c 边收边写 `ux0:data/psvsend/downloads/`（先 `.part` 收完改名，sha256 可选校验，断流/校验失败删残留，开机清扫遗留）。兼容对方无 Content-Length 的 **chunked 流式上传**（http.c 内嵌解码状态机）；多文件同会话逐 POST upload。取消/放弃/空闲超时等状态经快照接口给 UI 展示结束原因。announce 已声明 `download:true`。
 - **已落地（发现补充）**：Vita 收不了 UDP 组播、也绑不了 53317，设备表主要靠对方主动 register 与 `scan.c` 主动 HTTP 扫描（向 /24 各 IP 的 53317 POST register 拿 member info），UI 三角键手动触发。
+- 实现边界的完整清单（单会话 409、清单 32 文件/8KB、超时 60s/120s/30s 三档、接收仅明文 HTTP、单线程顺序处理连接、/24 扫描范围等）见 README「边界与已知限制」。
 - **未落地**：与 §4/§5 目标架构的规划差项（session.c 拆分、multipart 收件、接收设置页改名/选目录、中文字体等）仍在路线中。
 - 本文按"目标架构"描述，部分命名与实际源码不同（如目标 `http_server.c` / `http_client.c` 实际为 `http.c` / `transfer.c`）；现状与源码布局以 README「目录结构」为准。
 

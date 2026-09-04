@@ -335,7 +335,7 @@ bool recv_abort_pending(void)
     return g_abort != 0;
 }
 
-/* prepare-upload：解析 → 挂起等 UI（≤120s）→ 回 HTTP 码并填 resp（200 时 JSON） */
+/* prepare-upload：解析 → 挂起等 UI（≤60s）→ 回 HTTP 码并填 resp（200 时 JSON） */
 int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz)
 {
     const char *infov, *filesv, *p;

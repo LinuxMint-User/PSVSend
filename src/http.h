@@ -7,7 +7,7 @@
  *                                           我们的信息让对方把我们加进列表。
  *   GET  /api/localsend/v2/info          —— 返回我们的信息。
  *   POST /api/localsend/v2/prepare-upload —— 接收方向：文件清单（receive 模块
- *                                           挂起等 UI 决定，最长 120s）。
+ *                                           挂起等 UI 决定，最长 60s）。
  *   POST /api/localsend/v2/upload?...   —— 接收方向：流式收文件体，边收边写盘
  *                                           （绝不全量进内存）。
  *   POST /api/localsend/v2/cancel?...   —— 接收方向：发送方放弃会话。

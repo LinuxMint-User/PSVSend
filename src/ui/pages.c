@@ -570,7 +570,7 @@ void page_send_confirm_input(const Input *in)
 }
 
 /* ================= 接收请求确认（真实：后端 PENDING 会话） ================= */
-static bool g_recv_expired = false;  /* 请求 120s 没人响应、已被后端作废 */
+static bool g_recv_expired = false;  /* 请求 60s 没人响应、已被后端作废 */
 static uint64_t g_recv_supp_ms = 0;  /* 决定后抑制重弹到：毫秒时间戳 */
 
 /* 拒绝当前请求并离开接收流程（后端回 403，发送方会看到拒绝） */
