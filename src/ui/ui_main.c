@@ -9,12 +9,45 @@
 #include "../dlog.h"
 
 App g_app;
-/* 双字体：Latin（ASCII/Latin-1 等）用 Droid Sans，其余（CJK/全角）用
- * Droid Sans Fallback Full。两者都来自 AOSP（Apache-2.0），随 VPK 打包到
- * app0:/fonts/。绘制时 widgets.c 按字符分段路由到对应字体。 */
-vita2d_font *g_font_lat;
-vita2d_font *g_font_cjk;
 extern void pages_init(void);
+
+/* ---------- 字体（按像素字号分槽，懒加载） ----------
+ * libvita2d 的字体 atlas 按字形缓存、不分字号：同一字体对象若某字符
+ * 先以小字号光栅化，之后大字号绘制会直接放大那份小位图（draw_scale
+ * = size/缓存字号 > 1）。LINEAR 过滤会把 atlas 相邻槽的渗色随放大一起
+ * 放大 → 大字顶/底出现横线；且同词中部分字是原生光栅化、部分字是
+ * 放大/插值出来的，笔划粗细不一，视觉参差。对策：每个像素字号一个
+ * 独立字体对象（独立 atlas），draw_scale 恒为 1，全部原生光栅化。
+ * 首次用到某字号才 load；同字号 latin/cjk 各一份。 */
+#define FONT_PATHS_BASE "app0:/fonts/"
+#define FONT_LAT_FILE   FONT_PATHS_BASE "DroidSans.ttf"
+#define FONT_CJK_FILE   FONT_PATHS_BASE "DroidSansFallbackFull.ttf"
+#define MAX_FONT_SIZES 24
+static struct { int size; vita2d_font *lat; vita2d_font *cjk; } g_fs[MAX_FONT_SIZES];
+static int g_fs_n;
+
+/* 返回 size 像素字号的字体：cjk=0 拉丁、1 CJK；加载失败返回 NULL。
+ * 表满（UI 档位应远少于 MAX_FONT_SIZES）时回退 0 号槽。 */
+vita2d_font *font_get(int size, int cjk)
+{
+    int i;
+    for (i = 0; i < g_fs_n; i++)
+        if (g_fs[i].size == size)
+            return cjk ? g_fs[i].cjk : g_fs[i].lat;
+    if (g_fs_n < MAX_FONT_SIZES) {
+        vita2d_font *lat = vita2d_load_font_file(FONT_LAT_FILE);
+        vita2d_font *cj  = vita2d_load_font_file(FONT_CJK_FILE);
+        if (!lat || !cj)
+            dlog("font load failed size=%d lat=%p cjk=%p", size,
+                 (void *)lat, (void *)cj);
+        g_fs[g_fs_n].size = size;
+        g_fs[g_fs_n].lat  = lat;
+        g_fs[g_fs_n].cjk  = cj;
+        g_fs_n++;
+        return cjk ? cj : lat;
+    }
+    return cjk ? g_fs[0].cjk : g_fs[0].lat;
+}
 
 /* ---------- widget 命中表 ---------- */
 #define MAX_W 96
@@ -76,11 +109,6 @@ static void input_page(const Input *in)
 /* ---------- 主循环 ---------- */
 void ui_run(void)
 {
-    g_font_lat = vita2d_load_font_file("app0:/fonts/DroidSans.ttf");
-    g_font_cjk = vita2d_load_font_file("app0:/fonts/DroidSansFallbackFull.ttf");
-    if (!g_font_lat || !g_font_cjk)
-        dlog("font load failed: lat=%p cjk=%p", (void *)g_font_lat,
-             (void *)g_font_cjk);
     ui_input_init();           /* 开启触摸采样 */
     pages_init();
 

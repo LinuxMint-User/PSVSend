@@ -6,6 +6,11 @@
 #include <stdint.h>
 #include <psp2/types.h>
 
+/* 字体句柄不透明类型（完整定义在 vita2d.h；控件层只传递指针） */
+typedef struct vita2d_font vita2d_font;
+/* 取 size 像素字号的字体对象（ui_main.c 按字号分槽懒加载；cjk=0/1） */
+vita2d_font *font_get(int size, int cjk);
+
 #define SCR_W 960
 #define SCR_H 544
 

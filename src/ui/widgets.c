@@ -7,13 +7,12 @@
 #include "ui.h"
 #include "theme.h"
 
-extern vita2d_font *g_font_lat;   /* Droid Sans（拉丁）        */
-extern vita2d_font *g_font_cjk;   /* Droid Sans Fallback Full（CJK） */
-
 /* ---------- 文字 ----------
  * 字符路由：码点 <= 0xFF（ASCII / Latin-1）走拉丁字体，其余（CJK、
  * 全角符号、假名…）走 CJK 字体；同一字体的连续子串一次绘制，减少
  * 调用并保留 kerning。
+ * 字号：ui_main.c 的 font_get 为每个像素字号建独立字体对象，保证每个
+ * 字都按本字号原生光栅化（详见 ui_main.c 注释），draw_scale 恒为 1。
  * 尺寸语义（libvita2d freetype 后端，见 vita2d_font.c）：
  *  - `vita2d_font_draw_text` 的 y 是"基线"，size 是像素字号（em 盒高）；
  *  - w_text 的 y 保持"行首升部线"语义：基线 = y + FONT_ASC*size。
@@ -58,18 +57,19 @@ static const char *utf8_next_cp(const char *p, uint32_t *cp)
     return p + 1;
 }
 
-/* 对 p 指向的字符串做逐字符字体路由：每段是连续同字体子串，
- * f_out 返回该段字体。返回段长度（字节）。 */
-static int next_run(const char *p, vita2d_font **f_out)
+/* 对 p 指向的字符串做逐字符字体路由：每段是连续同字体域子串，
+ * cjk_out 返回该段字体域（1=CJK、0=拉丁；实际字体对象在绘制时按
+ * 当前字号经 font_get 取得）。返回段长度（字节）。 */
+static int next_run(const char *p, int *cjk_out)
 {
     uint32_t cp;
     const char *q = utf8_next_cp(p, &cp);
-    vita2d_font *f = (cp <= 0xFF) ? g_font_lat : g_font_cjk;
-    *f_out = f;
+    int cjk = (cp <= 0xFF) ? 0 : 1;
+    *cjk_out = cjk;
     while (*q) {
         uint32_t cp2;
         const char *r = utf8_next_cp(q, &cp2);
-        if (((cp2 <= 0xFF) ? g_font_lat : g_font_cjk) != f) break;
+        if (((cp2 <= 0xFF) ? 0 : 1) != cjk) break;
         q = r;
     }
     return (int)(q - p);
@@ -83,14 +83,14 @@ void w_text(float x, float y, float scale, uint32_t color, const char *fmt, ...)
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     if (!*buf) return;
-    if (!g_font_lat && !g_font_cjk) return;
     int size = font_px(scale);
     int base_y = (int)(y + FONT_ASC * size + 0.5f);
     int pen = (int)(x + 0.5f);
     const char *p = buf;
     while (*p) {
-        vita2d_font *f;
-        int n = next_run(p, &f);
+        int cjk;
+        int n = next_run(p, &cjk);
+        vita2d_font *f = font_get(size, cjk);
         if (f) {
             memcpy(seg, p, n);
             seg[n] = 0;
@@ -105,14 +105,14 @@ void w_text_w(float scale, const char *text, int *w, int *h)
     if (w) *w = 0;
     if (h) *h = 0;
     if (!text || !*text) return;
-    if (!g_font_lat && !g_font_cjk) return;
     int size = font_px(scale);
     char seg[512];
     int pen = 0;
     const char *p = text;
     while (*p) {
-        vita2d_font *f;
-        int n = next_run(p, &f);
+        int cjk;
+        int n = next_run(p, &cjk);
+        vita2d_font *f = font_get(size, cjk);
         if (f) {
             memcpy(seg, p, n);
             seg[n] = 0;
