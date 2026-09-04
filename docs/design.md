@@ -186,8 +186,19 @@ void on_session_done(const Session *s);      // 完成 / 失败
 
 ### 5.5 字体
 
-- 界面文字用系统 PVF 字体起步（免费随固件）
-- **中文文件名**：PVF 简体覆盖有限，需 freetype + 中文字体（开源字体打包进 VPK 或从 ux0 加载）——待定问题，倾向直接上 freetype
+现状：界面统一走默认系统 PVF（`vita2d_load_default_pvf`），简体中文字形覆盖有限，中文文件名/生僻字显示缺字方块（见 README「界面显示」边界）。
+
+**决策（2026-09）：freetype + 内嵌开源中文字体，替代 PVF 作主渲染路径。** 依据：
+
+- 基础设施已就绪：libvita2d 的 `vita2d_font` 即 freetype 封装（内部 `FT_Init_FreeType` / `FT_New_Memory_Face`），支持从文件/内存加载任意 TTF/OTF；CMakeLists 已链接 `freetype`
+- PVF 是固件内置字体（实为 otf/ttf 改名，位于 sa0 系统分区），覆盖范围固定且不可扩：即便用 `vita2d_load_system_pvf` 按语言组合注册（拉丁 + 简体中文），生僻字/非简体字符仍会缺字，只能算零体积过渡方案，不作为长期路线
+- 自带字库才能保证"对方发来任意中文名都能显示"
+
+落地要点：
+
+- 字体随 VPK 内嵌（`app0:`），由 CMakeLists 打包；选 **Apache-2.0 / OFL 许可**字库（DroidSansFallback 全量约 4~5MB，或 Noto Sans SC 按 GB2312 常用字子集化压到 ~1.5~2MB），避开 GPL（与项目 Apache-2.0 许可冲突）；后续可扩展"从 ux0 加载自定义字体"
+- **性能**：`vita2d_font_draw_text` 每帧把整串文字栅格化进一张 texture——静态标签无碍，但动态文本（设备名/文件名/进度）需做字符串级缓存：文本串不变就直接复用已栅格化的 texture，变化才重建
+- **API**：freetype 的 y 语义（顶线/基线）与 PVF 不同，`widgets.c` 的 `w_text` 封装内部适配即可，页面调用方不变
 
 ### 5.6 文件组织
 
@@ -239,7 +250,7 @@ src/ui/
 
 ## 9. 待定问题
 
-- [ ] 中文字体方案：PVF 直出 vs freetype + 中文字体包
+- [x] 中文字体方案：已定 **freetype + 内嵌开源字体**（决策与落地要点见 §5.5），待实现
 - [ ] 深浅色切换是否做（当前统一深色）
 - [ ] 自定义主题色盘的实现时机（先 OLED/Yaru，色盘后置）
 - [ ] HTTP 解析兼容清单最终确认（chunked 已定必做）
