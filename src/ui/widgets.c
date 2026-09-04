@@ -4,47 +4,96 @@
 #include <string.h>
 #include <math.h>
 #include <vita2d.h>
-#include <psp2/pvf.h>
 #include "ui.h"
 #include "theme.h"
 
-extern vita2d_pvf *g_font;
+extern vita2d_font *g_font_lat;   /* Droid Sans（拉丁）        */
+extern vita2d_font *g_font_cjk;   /* Droid Sans Fallback Full（CJK） */
 
-/* ---------- 文字 ---------- */
-/* vita2d_pvf_draw_text 的 y 是"基线"：字形从基线向上伸、少量向下垂。
- * 我们统一 w_text 的 y 语义为"文本行可视顶部（升部线）"，
- * 绘制时内部把基线放在 y + ascent*scale。
- * ascent 按 1/64 像素单位从默认字体字形信息里读一次（与 vita2d 内部换算同源），
- * 失败时兜底 8.0（10pt 字号典型升部）。 */
-static float font_ascent  = 8.0f;
-static bool  font_metric_ok = false;
+/* ---------- 文字 ----------
+ * 字符路由：码点 <= 0xFF（ASCII / Latin-1）走拉丁字体，其余（CJK、
+ * 全角符号、假名…）走 CJK 字体；同一字体的连续子串一次绘制，减少
+ * 调用并保留 kerning。
+ * 尺寸语义（libvita2d freetype 后端，见 vita2d_font.c）：
+ *  - vita2d_font_draw_text 的 y 是"基线"，size 是像素字号（em 盒高）；
+ *  - 字形标称升部 CJK ascender/upem ≈ 2136/2048 ≈ 1.043。w_text 的 y
+ *    保持"行首升部线"语义，故基线放在 y + round(1.043 * size)；
+ *  - scale→px：scale=1.0 → 20px（字盒全高 20*1.309≈26px，与列表行距
+ *    26px 吻合）。整体嫌大/小只调 FONT_PX。 */
+#define FONT_PX   20.0f
+#define FONT_ASC  1.043f
 
-static void ensure_font_metrics(void)
+static int font_px(float scale)
 {
-    if (font_metric_ok || !g_font) return;
-    font_metric_ok = true;
-    /* vita2d_pvf 内部布局：+4 为字体链表头节点，节点 +0 是 ScePvfFontId */
-    ScePvfFontId *node = *(ScePvfFontId **)((char *)g_font + 4);
-    if (!node) return;
-    ScePvfCharInfo ci;
-    if (scePvfGetCharInfo(node[0], 'A', &ci) >= 0) {
-        float asc = (float)(ci.glyphMetrics.ascender64 >> 6);
-        if (asc >= 2.0f && asc <= 60.0f) font_ascent = asc;
+    return (int)(scale * FONT_PX + 0.5f);
+}
+
+/* 从 UTF-8 串读一个码点，返回下一字符起点；非法/截断字节兜底按单字节。
+ * p[i] 必须检查非 0，避免越界读 buf 结尾。 */
+static const char *utf8_next_cp(const char *p, uint32_t *cp)
+{
+    unsigned char c = (unsigned char)p[0];
+    if (c < 0x80) { *cp = c; return p + 1; }
+    if ((c & 0xE0) == 0xC0 && p[1] &&
+        (p[1] & 0xC0) == 0x80) {
+        *cp = ((c & 0x1F) << 6) | (p[1] & 0x3F);
+        return p + 2;
     }
+    if ((c & 0xF0) == 0xE0 && p[1] && p[2] &&
+        (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+        *cp = ((c & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+        return p + 3;
+    }
+    if ((c & 0xF8) == 0xF0 && p[1] && p[2] && p[3] &&
+        (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 &&
+        (p[3] & 0xC0) == 0x80) {
+        *cp = ((c & 0x07) << 18) | ((p[1] & 0x3F) << 12) |
+              ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+        return p + 4;
+    }
+    *cp = c;
+    return p + 1;
+}
+
+/* 对 p 指向的字符串做逐字符字体路由：每段是连续同字体子串，
+ * f_out 返回该段字体。返回段长度（字节）。 */
+static int next_run(const char *p, vita2d_font **f_out)
+{
+    uint32_t cp;
+    const char *q = utf8_next_cp(p, &cp);
+    vita2d_font *f = (cp <= 0xFF) ? g_font_lat : g_font_cjk;
+    *f_out = f;
+    while (*q) {
+        uint32_t cp2;
+        const char *r = utf8_next_cp(q, &cp2);
+        if (((cp2 <= 0xFF) ? g_font_lat : g_font_cjk) != f) break;
+        q = r;
+    }
+    return (int)(q - p);
 }
 
 void w_text(float x, float y, float scale, uint32_t color, const char *fmt, ...)
 {
-    char buf[512];
+    char buf[512], seg[512];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
-    if (g_font) {
-        ensure_font_metrics();
-        vita2d_pvf_draw_text(g_font, (int)x,
-                             (int)(y + font_ascent * scale + 0.5f),
-                             color, scale, buf);
+    if (!*buf) return;
+    if (!g_font_lat && !g_font_cjk) return;
+    int size = font_px(scale);
+    int base_y = (int)(y + FONT_ASC * size + 0.5f);
+    int pen = (int)(x + 0.5f);
+    const char *p = buf;
+    while (*p) {
+        vita2d_font *f;
+        int n = next_run(p, &f);
+        if (f) {
+            memcpy(seg, p, n);
+            seg[n] = 0;
+            pen += vita2d_font_draw_text(f, pen, base_y, color, size, seg);
+        }
+        p += n;
     }
 }
 
@@ -52,8 +101,26 @@ void w_text_w(float scale, const char *text, int *w, int *h)
 {
     if (w) *w = 0;
     if (h) *h = 0;
-    if (g_font && text)
-        vita2d_pvf_text_dimensions(g_font, scale, text, w, h);
+    if (!text || !*text) return;
+    if (!g_font_lat && !g_font_cjk) return;
+    int size = font_px(scale);
+    char seg[512];
+    int pen = 0;
+    const char *p = text;
+    while (*p) {
+        vita2d_font *f;
+        int n = next_run(p, &f);
+        if (f) {
+            memcpy(seg, p, n);
+            seg[n] = 0;
+            int sw = 0;
+            vita2d_font_text_dimensions(f, size, seg, &sw, NULL);
+            pen += sw;
+        }
+        p += n;
+    }
+    if (w) *w = pen;
+    if (h) *h = size;   /* 行高 ≈ 字号 px */
 }
 
 static const char *utf8_skip(const char *p)

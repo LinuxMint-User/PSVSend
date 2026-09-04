@@ -186,19 +186,24 @@ void on_session_done(const Session *s);      // 完成 / 失败
 
 ### 5.5 字体
 
-现状：界面统一走默认系统 PVF（`vita2d_load_default_pvf`），简体中文字形覆盖有限，中文文件名/生僻字显示缺字方块（见 README「界面显示」边界）。
+**决策（2026-09）：freetype + 内嵌开源字体，替代 PVF 作主渲染路径。** 依据：
 
-**决策（2026-09）：freetype + 内嵌开源中文字体，替代 PVF 作主渲染路径。** 依据：
-
-- 基础设施已就绪：libvita2d 的 `vita2d_font` 即 freetype 封装（内部 `FT_Init_FreeType` / `FT_New_Memory_Face`），支持从文件/内存加载任意 TTF/OTF；CMakeLists 已链接 `freetype`
-- PVF 是固件内置字体（实为 otf/ttf 改名，位于 sa0 系统分区），覆盖范围固定且不可扩：即便用 `vita2d_load_system_pvf` 按语言组合注册（拉丁 + 简体中文），生僻字/非简体字符仍会缺字，只能算零体积过渡方案，不作为长期路线
+- libvita2d 的 `vita2d_font` 即 freetype 封装（内部 `FT_Init_FreeType` / `FT_New_Memory_Face`），支持从文件/内存加载任意 TTF/OTF
+- PVF 是固件内置字体（实为 otf/ttf 改名，位于 sa0 系统分区），覆盖范围固定且不可扩：即便用 `vita2d_load_system_pvf` 按语言组合注册（拉丁 + 简体中文），生僻字/非简体字符仍会缺字，只能算零体积过渡方案
 - 自带字库才能保证"对方发来任意中文名都能显示"
 
-落地要点：
+**实现（2026-09-04 落地）：** 双字体逐段路由，均为 AOSP 字库（Apache-2.0，与项目同许可）：
 
-- 字体随 VPK 内嵌（`app0:`），由 CMakeLists 打包；选 **Apache-2.0 / OFL 许可**字库（DroidSansFallback 全量约 4~5MB，或 Noto Sans SC 按 GB2312 常用字子集化压到 ~1.5~2MB），避开 GPL（与项目 Apache-2.0 许可冲突）；后续可扩展"从 ux0 加载自定义字体"
-- **性能**：`vita2d_font_draw_text` 每帧把整串文字栅格化进一张 texture——静态标签无碍，但动态文本（设备名/文件名/进度）需做字符串级缓存：文本串不变就直接复用已栅格化的 texture，变化才重建
-- **API**：freetype 的 y 语义（顶线/基线）与 PVF 不同，`widgets.c` 的 `w_text` 封装内部适配即可，页面调用方不变
+- `fonts/DroidSans.ttf`（拉丁）+ `fonts/DroidSansFallbackFull.ttf`（CJK/全角，28629 字形），CMakeLists 打进 VPK `app0:/fonts/`
+- 单字码点 ≤ `0xFF`（ASCII / Latin-1）走拉丁字体，其余走 CJK 字体；`widgets.c` 内按字符分成连续同字体段、整段一次绘制（保留 kerning、控制调用次数）
+- freetype 的 y 是**基线**、size 是像素字号；`w_text` 的 y 保持"行首升部线"语义，内部基线放在 `y + 1.043*size`（CJK ascender/upem ≈ 2136/2048）。字号换算 `scale=1.0 → 20px`（`FONT_PX`/`FONT_ASC` 常量集中在 `widgets.c`，整体缩放只改一处）
+- **性能事实**：libvita2d freetype 后端自带**字形级 atlas 缓存**（FTC_ImageCache + 共享 texture atlas），字形只栅格化一次、后续直接 blit——早期"需字符串级缓存"的担心不成立，无需自建缓存
+- 字库用纯 CJK fallback 单字体不够（无 ASCII），故拉丁/CJK 必须成对；字体本身无 GPL/许可冲突
+- 缺字行为：字符无字形时不渲染（atlas 添加失败即跳过），不会有方块/乱码占位
+
+**待真机校准：** 字号基准 20px@scale1 与升部比例 1.043 是静态估计，视觉偏差在真机微调 `FONT_PX`/`FONT_ASC`；`w_text_w` 返回行高 h=字号（近似）用于垂直居中，如需精确按字形度量再改。
+
+**后续扩展：** 可加"从 `ux0:` 加载自定义字体替换/追加"（当前固定内嵌两份）。
 
 ### 5.6 文件组织
 
@@ -250,7 +255,7 @@ src/ui/
 
 ## 9. 待定问题
 
-- [x] 中文字体方案：已定 **freetype + 内嵌开源字体**（决策与落地要点见 §5.5），待实现
+- [x] 中文字体：已落地（freetype 双字体 Droid Sans + Fallback，见 §5.5）；字号/升部视觉校准待真机微调
 - [ ] 深浅色切换是否做（当前统一深色）
 - [ ] 自定义主题色盘的实现时机（先 OLED/Yaru，色盘后置）
 - [ ] HTTP 解析兼容清单最终确认（chunked 已定必做）

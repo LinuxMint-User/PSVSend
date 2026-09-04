@@ -46,7 +46,7 @@ add_executable(${PROJECT_NAME}
 target_link_libraries(${PROJECT_NAME}
     mbedtls mbedx509 mbedcrypto
     pthread
-    vita2d freetype png jpeg z m
+    vita2d freetype bz2 png jpeg z m
     SceAppMgr_stub SceCommonDialog_stub SceCtrl_stub SceDisplay_stub
     SceGxm_stub SceIofilemgr_stub SceKernelThreadMgr_stub
     SceNet_stub SceNetCtl_stub
@@ -71,12 +71,16 @@ add_custom_command(OUTPUT ${_vpk}
           -a ${_pkgsce}/livearea/contents/bg.png=sce_sys/livearea/contents/bg.png
           -a ${_pkgsce}/livearea/contents/startup.png=sce_sys/livearea/contents/startup.png
           -a ${_pkgsce}/livearea/contents/template.xml=sce_sys/livearea/contents/template.xml
+          -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/DroidSans.ttf=fonts/DroidSans.ttf
+          -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/DroidSansFallbackFull.ttf=fonts/DroidSansFallbackFull.ttf
           ${_vpk}
   DEPENDS ${_elf}
           ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/icon0.png
           ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/bg.png
           ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/startup.png
           ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/template.xml
+          ${CMAKE_CURRENT_SOURCE_DIR}/fonts/DroidSans.ttf
+          ${CMAKE_CURRENT_SOURCE_DIR}/fonts/DroidSansFallbackFull.ttf
   COMMENT "Building vpk ${PROJECT_NAME}"
   VERBATIM
 )

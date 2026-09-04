@@ -6,9 +6,14 @@
 #include "ui.h"
 #include "theme.h"
 #include "../api.h"
+#include "../dlog.h"
 
 App g_app;
-vita2d_pvf *g_font;
+/* 双字体：Latin（ASCII/Latin-1 等）用 Droid Sans，其余（CJK/全角）用
+ * Droid Sans Fallback Full。两者都来自 AOSP（Apache-2.0），随 VPK 打包到
+ * app0:/fonts/。绘制时 widgets.c 按字符分段路由到对应字体。 */
+vita2d_font *g_font_lat;
+vita2d_font *g_font_cjk;
 extern void pages_init(void);
 
 /* ---------- widget 命中表 ---------- */
@@ -71,7 +76,11 @@ static void input_page(const Input *in)
 /* ---------- 主循环 ---------- */
 void ui_run(void)
 {
-    g_font = vita2d_load_default_pvf();
+    g_font_lat = vita2d_load_font_file("app0:/fonts/DroidSans.ttf");
+    g_font_cjk = vita2d_load_font_file("app0:/fonts/DroidSansFallbackFull.ttf");
+    if (!g_font_lat || !g_font_cjk)
+        dlog("font load failed: lat=%p cjk=%p", (void *)g_font_lat,
+             (void *)g_font_cjk);
     ui_input_init();           /* 开启触摸采样 */
     pages_init();
 

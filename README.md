@@ -118,7 +118,7 @@ cmake --build build
 
 ### 界面显示
 
-- **界面字体为系统 PVF**（`vita2d_load_default_pvf`），简体中文字形覆盖有限：文件名/文本里的生僻字、日韩等非简体字符可能显示为方块缺字，传输本身不受影响（中文字体方案见 [docs/design.md](docs/design.md) §5.5/§9）
+- **界面内嵌中文字体**（随 VPK 打包到 `app0:/fonts/`，源为 AOSP Droid Sans 与 Droid Sans Fallback Full，Apache-2.0）：ASCII/Latin 走 Droid Sans，CJK/全角走 Fallback，中英文正常显示；无字形的字符（emoji、个别生僻扩展区）直接不渲染，传输本身不受影响（渲染细节见 [docs/design.md](docs/design.md) §5.5/§9）
 
 ### 已知小问题
 
@@ -132,6 +132,7 @@ cmake --build build
 |------|------|
 | `src/` | 源码（含发送客户端与内嵌设备身份证书） |
 | `sce_sys/` | LiveArea 素材（图标 / 背景 / 启动图） |
+| `fonts/` | 界面内嵌字体：Droid Sans（拉丁）+ Droid Sans Fallback Full（CJK），均来自 AOSP（Apache-2.0），编译时打进 VPK `app0:/fonts/` |
 | `docs/localsend-protocol/` | LocalSend 协议参考文档 |
 
 **本地安装（不随仓库分发）：**
