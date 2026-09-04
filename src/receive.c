@@ -139,21 +139,29 @@ static void split_ext(const char *name, char *base, int bn, const char **ext)
     }
 }
 
-/* 生成唯一正式名路径 + 对应 .part 路径。已有同名则在扩展名前插 " (k)"。 */
+/* 生成唯一正式名路径 + 对应 .part 路径。同名冲突（磁盘上已存在，或本
+ * 会话 prev[0..prev_n) 已分配的 final）则在扩展名前插 " (k)"。
+ * prev 中 final 为空串的条目表示未落盘，跳过。 */
 static void alloc_paths(const char *raw, char *final, int fn,
-                        char *part, int pn)
+                        char *part, int pn,
+                        const RFile *prev, int prev_n)
 {
     char clean[192], base[192], cand[240];
     const char *ext;
     SceIoStat st;
-    int k = 0;
+    int k = 0, t;
     sanitize_name(raw, clean, sizeof clean);
     split_ext(clean, base, sizeof base, &ext);
     for (;;) {
         if (k == 0) snprintf(cand, sizeof cand, "%s%s", base, ext);
         else        snprintf(cand, sizeof cand, "%s (%d)%s", base, k, ext);
         snprintf(final, fn, PSVSEND_DL_DIR "/%s", cand);
-        if (sceIoGetstat(final, &st) < 0) break;   /* 不存在 → 可用 */
+        if (sceIoGetstat(final, &st) < 0) {         /* 磁盘上不存在 */
+            for (t = 0; t < prev_n; t++)            /* 本会话也没占用 */
+                if (prev[t].final[0] &&
+                    strcmp(final, prev[t].final) == 0) break;
+            if (t == prev_n) break;                 /* 真正可用 */
+        }
         if (++k > 999) {                            /* 兜底：保底名字 */
             snprintf(cand, sizeof cand, "file-%llx%s",
                      (unsigned long long)now_us(), ext);
@@ -438,7 +446,7 @@ int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz)
                 f->st = 1;                   /* 空文件无需收体，视为已完成 */
             } else {
                 alloc_paths(f->name, f->final, sizeof f->final,
-                            f->part, sizeof f->part);
+                            f->part, sizeof f->part, g_sess.f, m);
                 has_pending = 1;
             }
             tot += f->size;
