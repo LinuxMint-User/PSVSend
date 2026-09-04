@@ -15,13 +15,16 @@ extern vita2d_font *g_font_cjk;   /* Droid Sans Fallback Full（CJK） */
  * 全角符号、假名…）走 CJK 字体；同一字体的连续子串一次绘制，减少
  * 调用并保留 kerning。
  * 尺寸语义（libvita2d freetype 后端，见 vita2d_font.c）：
- *  - vita2d_font_draw_text 的 y 是"基线"，size 是像素字号（em 盒高）；
- *  - 字形标称升部 CJK ascender/upem ≈ 2136/2048 ≈ 1.043。w_text 的 y
- *    保持"行首升部线"语义，故基线放在 y + round(1.043 * size)；
- *  - scale→px：scale=1.0 → 20px（字盒全高 20*1.309≈26px，与列表行距
- *    26px 吻合）。整体嫌大/小只调 FONT_PX。 */
+ *  - `vita2d_font_draw_text` 的 y 是"基线"，size 是像素字号（em 盒高）；
+ *  - w_text 的 y 保持"行首升部线"语义：基线 = y + FONT_ASC*size。
+ *    FONT_ASC 取 CJK 满格字（中/文/日）字形顶比例 ≈ 0.81em（实测
+ *    glyf yMax/upem，非 1.043 的盒 ascender——盒顶在 em 上方留行距
+ *    空白，用它基线会被压得过低）。拉丁大写顶 ≈ 0.717em，同基线
+ *    下略低于中文顶 ~0.09em，视觉协调；
+ *  - scale→px：scale=1.0 → 20px（CJK 字形全高 ~0.91em + 少量下伸，
+ *    行距观感与列表 26px 吻合）。整体嫌大/小只调 FONT_PX。 */
 #define FONT_PX   20.0f
-#define FONT_ASC  1.043f
+#define FONT_ASC  0.81f
 
 static int font_px(float scale)
 {

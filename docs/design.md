@@ -196,7 +196,7 @@ void on_session_done(const Session *s);      // 完成 / 失败
 
 - `fonts/DroidSans.ttf`（拉丁）+ `fonts/DroidSansFallbackFull.ttf`（CJK/全角，28629 字形），CMakeLists 打进 VPK `app0:/fonts/`
 - 单字码点 ≤ `0xFF`（ASCII / Latin-1）走拉丁字体，其余走 CJK 字体；`widgets.c` 内按字符分成连续同字体段、整段一次绘制（保留 kerning、控制调用次数）
-- freetype 的 y 是**基线**、size 是像素字号；`w_text` 的 y 保持"行首升部线"语义，内部基线放在 `y + 1.043*size`（CJK ascender/upem ≈ 2136/2048）。字号换算 `scale=1.0 → 20px`（`FONT_PX`/`FONT_ASC` 常量集中在 `widgets.c`，整体缩放只改一处）
+- freetype 的 y 是**基线**、size 是像素字号；`w_text` 的 y 保持"行首升部线"语义，内部基线放在 `y + 0.81*size`（CJK 满格字形顶比例，实测 glyf yMax/upem；盒 ascender 1.043 含 em 上方行距空白，基线过高会整体偏下）。字号换算 `scale=1.0 → 20px`（`FONT_PX`/`FONT_ASC` 常量集中在 `widgets.c`，整体缩放只改一处）
 - **性能事实**：libvita2d freetype 后端自带**字形级 atlas 缓存**（FTC_ImageCache + 共享 texture atlas），字形只栅格化一次、后续直接 blit——早期"需字符串级缓存"的担心不成立，无需自建缓存
 - 字库用纯 CJK fallback 单字体不够（无 ASCII），故拉丁/CJK 必须成对；字体本身无 GPL/许可冲突
 - 缺字行为：字符无字形时不渲染（atlas 添加失败即跳过），不会有方块/乱码占位
@@ -255,7 +255,7 @@ src/ui/
 
 ## 9. 待定问题
 
-- [x] 中文字体：已落地（freetype 双字体 Droid Sans + Fallback，见 §5.5）；字号/升部视觉校准待真机微调
+- [x] 中文字体：已落地（freetype 双字体 Droid Sans + Fallback，见 §5.5）；升部按字形实测校准为 0.81，字号基准 20px 仍待真机确认
 - [ ] 深浅色切换是否做（当前统一深色）
 - [ ] 自定义主题色盘的实现时机（先 OLED/Yaru，色盘后置）
 - [ ] HTTP 解析兼容清单最终确认（chunked 已定必做）
