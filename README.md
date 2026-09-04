@@ -72,7 +72,7 @@ cmake --build build
 
 ### 发送
 
-1. 打开 PSVSend，等待 Wi-Fi 联网（状态指示变绿）。对方设备会通过 UDP 组播 announce 自动出现在设备列表；若对方没出现，按 **△** 手动扫描整个网段补全
+1. 打开 PSVSend，等待 Wi-Fi 联网（设备列表页不再显示未联网提示即已就绪，无独立状态灯）。对方在收到我们的 UDP announce 后会自动发 HTTP register，设备随即出现在列表；若对方没出现，按 **△** 手动扫描整个网段补全
 2. 选中目标设备 → 进入文件浏览（ux0 目录树，可多选）→ 确认发送
 3. 对方接受后，传输页显示逐文件进度，可随时取消
 
@@ -156,7 +156,7 @@ cmake --build build
 │   ├── main.c                  # 入口
 │   ├── api.c                   # 前后端契约：启动 / 网络巡检 / 设备快照
 │   ├── net.c                   # SceNet 网络初始化
-│   ├── discovery.c             # UDP 组播 announce / 监听 + 设备表
+│   ├── discovery.c             # UDP 组播 announce 发送 + 设备表维护（register 入表在 http.c）
 │   ├── http.c                  # HTTP 服务器：register / info 入表 + prepare-upload / upload / cancel 接收路由
 │   ├── transfer.c              # 发送客户端：prepare-upload / upload（HTTP + HTTPS）
 │   ├── receive.c               # 接收会话：确认/拒绝、流式写盘 downloads/、断流清理

@@ -13,7 +13,7 @@
 - **已落地（接收方向）**：对方 prepare-upload → 自动弹接收确认页（Accept / Setup 逐文件勾选 / Reject）→ upload 由 http.c 提供流读回调、receive.c 边收边写 `ux0:data/psvsend/downloads/`（先 `.part` 收完改名，sha256 可选校验，断流/校验失败删残留，开机清扫遗留）。兼容对方无 Content-Length 的 **chunked 流式上传**（http.c 内嵌解码状态机）；多文件同会话逐 POST upload。取消/放弃/空闲超时等状态经快照接口给 UI 展示结束原因。announce 已声明 `download:true`。
 - **已落地（发现补充）**：Vita 收不了 UDP 组播、也绑不了 53317，设备表主要靠对方主动 register 与 `scan.c` 主动 HTTP 扫描（向 /24 各 IP 的 53317 POST register 拿 member info），UI 三角键手动触发。
 - 实现边界的完整清单（单会话 409、清单 32 文件/8KB、超时 60s/120s/30s 三档、接收仅明文 HTTP、单线程顺序处理连接、/24 扫描范围等）见 README「边界与已知限制」。
-- **未落地**：与 §4/§5 目标架构的规划差项（session.c 拆分、multipart 收件、接收设置页改名/选目录、中文字体等）仍在路线中。
+- **未落地**：与 §4/§5 目标架构的规划差项（session.c 拆分、multipart 收件、接收设置页改名/选目录等）仍在路线中；中文字体已落地（见 §5.5），不再在列。
 - 本文按"目标架构"描述，部分命名与实际源码不同（如目标 `http_server.c` / `http_client.c` 实际为 `http.c` / `transfer.c`）；现状与源码布局以 README「目录结构」为准。
 
 ## 2. 总体架构（前后端分层）
@@ -197,11 +197,11 @@ void on_session_done(const Session *s);      // 完成 / 失败
 - `fonts/DroidSans.ttf`（拉丁）+ `fonts/DroidSansFallbackFull.ttf`（CJK/全角，28629 字形），CMakeLists 打进 VPK `app0:/fonts/`
 - 单字码点 ≤ `0xFF`（ASCII / Latin-1）走拉丁字体，其余走 CJK 字体；`widgets.c` 内按字符分成连续同字体段、整段一次绘制（保留 kerning、控制调用次数）
 - freetype 的 y 是**基线**、size 是像素字号；`w_text` 的 y 保持"行首升部线"语义，内部基线放在 `y + 0.81*size`（CJK 满格字形顶比例，实测 glyf yMax/upem；盒 ascender 1.043 含 em 上方行距空白，基线过高会整体偏下）。字号换算 `scale=1.0 → 20px`（`FONT_PX`/`FONT_ASC` 常量集中在 `widgets.c`，整体缩放只改一处）
-- **性能事实**：libvita2d freetype 后端自带**字形级 atlas 缓存**（FTC_ImageCache + 共享 texture atlas），字形只栅格化一次、后续直接 blit——早期"需字符串级缓存"的担心不成立，无需自建缓存
+- **性能事实 + 按字号分槽（2026-09-04 晚落地）**：libvita2d freetype 后端自带**字形级 atlas 缓存**（FTC_ImageCache + 共享 texture atlas），同一字体对象内字形只栅格化一次、后续直接 blit；但 atlas 缓存**不分字号**——同一字形先以小字号缓存、再以更大字号绘制时会把小位图整体放大（draw_scale≠1），槽位间渗色一并放大，表现为大字笔画不均、横向条纹。这是真机"大字横线/参差"的根因，故改为**按像素字号分槽**：`ui.h` 暴露 `font_get(size, cjk)`，`ui_main.c` 按字号懒加载独立字体对象（各自 atlas、draw_scale 恒为 1），对 `widgets.c` 绘制 API 透明。早期"需字符串级缓存"的顾虑依旧不成立
 - 字库用纯 CJK fallback 单字体不够（无 ASCII），故拉丁/CJK 必须成对；字体本身无 GPL/许可冲突
 - 缺字行为：字符无字形时不渲染（atlas 添加失败即跳过），不会有方块/乱码占位
 
-**待真机校准：** 字号基准 20px@scale1 与升部比例 1.043 是静态估计，视觉偏差在真机微调 `FONT_PX`/`FONT_ASC`；`w_text_w` 返回行高 h=字号（近似）用于垂直居中，如需精确按字形度量再改。
+**校准状态（2026-09-04 真机确认）：** 升部按字形实测为 `FONT_ASC=0.81`（盒 ascender 1.043 不用，理由见上），字号基准 `FONT_PX=20px@scale1`，配合按字号分槽绘制后大字/小字均显示正常；若个别场景仍需微调，改 `widgets.c` 里这两个常量即可。`w_text_w` 返回行高 h=字号（近似）用于垂直居中，如需精确按字形度量再改。
 
 **后续扩展：** 可加"从 `ux0:` 加载自定义字体替换/追加"（当前固定内嵌两份）。
 
@@ -209,17 +209,12 @@ void on_session_done(const Session *s);      // 完成 / 失败
 
 ```
 src/ui/
-├── ui.h          # 页面枚举、AppState
-├── ui_main.c     # 主循环：输入 → 事件 → 渲染
-├── theme.c       # 主题颜色表 + 切换
-├── widgets.c     # 列表、按钮、进度条、弹窗控件
-├── font.c        # 字体管理（PVF / freetype）
-└── pages/
-    ├── device_list.c   # 设备列表页
-    ├── file_browser.c  # 文件浏览页
-    ├── confirm.c       # 确认弹窗
-    ├── progress.c      # 进度页
-    └── settings.c      # 设置页
+├── ui.h          # 页面枚举、AppState、字体句柄 font_get(size,cjk)、Input 抽象
+├── ui_main.c     # 主循环：输入 → 事件 → 渲染 + 字体按字号分槽（font_get 实现）
+├── theme.c/.h    # 主题颜色表 + 切换（theme.h 定义 theme_t）
+├── widgets.c     # 文本/列表/按钮/进度条/弹窗控件（FONT_PX / FONT_ASC 常量）
+├── input.c       # 按键 + 触摸 → 抽象动作
+└── pages.c       # 各页面渲染与交互（设备列表/文件浏览/收发确认/进度/设置）
 ```
 
 ### 5.7 前端开发顺序（独立可测，不依赖后端）
@@ -255,11 +250,11 @@ src/ui/
 
 ## 9. 待定问题
 
-- [x] 中文字体：已落地（freetype 双字体 Droid Sans + Fallback，见 §5.5）；升部按字形实测校准为 0.81，字号基准 20px 仍待真机确认
+- [x] 中文字体：已落地（freetype 双字体 Droid Sans + Fallback，按字号分槽绘制，见 §5.5）；升部实测校准 0.81、字号基准 20px@scale1，2026-09-04 真机确认显示正常
 - [ ] 深浅色切换是否做（当前统一深色）
 - [ ] 自定义主题色盘的实现时机（先 OLED/Yaru，色盘后置）
 - [ ] HTTP 解析兼容清单最终确认（chunked 已定必做）
 - [ ] 接收设置页：文件重命名输入（接 PSV 系统键盘 SceIme，或自绘内置键盘；当前仅占位弹窗）
 - [ ] 接收设置页：本次保存目录选择（目录浏览/预设；需确认 ux0 目录权限；当前固定 `ux0:data/psvsend/`）
 - [ ] 接收页"验证"功能（LocalSend 的验证码/校验交互）当前不做，等真实协议接入后再定
-- [ ] 多文件接收中途取消的竞态：对方正在传第 N 个文件时本地取消，前 N-1 个完整文件保留，但第 N 个文件的收尾可能不完整（实测偶发破损，属取消时序小问题）
+- [x] 多文件接收中途取消的竞态：已修复（收满优先于取消判断）——正在传的文件若已收满则以「用户取消」收尾并保留完整，未收满才清理其残 `.part`；前 N-1 个完整文件始终保留（细节见 README「边界 / 接收」）
