@@ -586,6 +586,7 @@ int recv_http_upload(const char *query, const char *ip, SceOff total,
 
     for (;;) {
         int n, wr;
+        if (f->got >= f->size) break;  /* 先确认收满：完整数据绝不做取消清理 */
         lock();
         if (g_abort) aborted = true;
         unlock();
@@ -665,6 +666,12 @@ int recv_http_upload(const char *query, const char *ip, SceOff total,
             sess_terminal(RECV_ST_DONE, NULL);
             dlog("recv: session %s done (%d files, %lld B)", g_sess.session,
                  g_sess.n, (long long)g_sess.got_total);
+        } else if (g_abort) {
+            /* 本文件收满后才收到取消：当前文件已完整、保留；
+             * 其余未收的文件按取消收尾，会话终态 CANCEL。 */
+            cleanup_parts();
+            sess_terminal(RECV_ST_CANCEL, "用户取消");
+            dlog("recv: session %s cancelled (file done)", g_sess.session);
         } else {
             g_sess.busy = false;
             g_sess.state = RECV_ST_READY;    /* 还有文件没到，等下一个 upload */
