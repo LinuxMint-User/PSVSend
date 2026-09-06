@@ -46,7 +46,7 @@ jobs:
     outputs:
       ver: ${{ steps.ver.outputs.ver }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # 镜像通常已预装大部分常用库；vdpm install 幂等，缺的会自动补装
       - name: Install library deps
@@ -58,7 +58,7 @@ jobs:
           cmake --build build -j2
 
       - name: Upload VPK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: psvsend-vpk
           path: build/psvsend.vpk
@@ -83,7 +83,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: psvsend-vpk
       - name: Create draft release
