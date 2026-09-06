@@ -1,9 +1,8 @@
 # 自动构建 VPK，并以草稿形式创建 GitHub Release
 #
 # 触发方式与行为：
-#  1) 推 main 分支：仅构建验证（快速反馈，不建 Release）；
-#  2) 打 tag（git tag vX.Y.Z && git push origin vX.Y.Z）：构建 + 建草稿 Release；
-#  3) 手动（Actions 页 → Run workflow，版本号留空自动读 src/config.h）：
+#  1) 打 tag（git tag vX.Y.Z && git push origin vX.Y.Z）：构建 + 建草稿 Release；
+#  2) 手动（Actions 页 → Run workflow，版本号留空自动读 src/config.h）：
 #     构建 + 建草稿 Release。
 #
 # 产物：build/psvsend.vpk 上传为 Release 附件；Release 一律先建「草稿」，
@@ -30,8 +29,6 @@ on:
         required: false
         default: ''
   push:
-    branches:
-      - main        # 推 main：仅构建验证
     tags:
       - 'v*'        # 打 tag：构建 + 建草稿 Release
 
