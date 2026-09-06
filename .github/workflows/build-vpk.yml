@@ -1,9 +1,10 @@
-# 自动构建 VPK 并以草稿形式创建 GitHub Release
+# 自动构建 VPK，并以草稿形式创建 GitHub Release
 #
-# 触发方式：
-#  1) 手动：仓库 Actions 页 → Build VPK & Draft Release → Run workflow
-#     （版本号留空时自动读取 src/config.h 的 PSVSEND_APP_VERSION）
-#  2) 打 tag：git tag v2.0.0 && git push origin v2.0.0
+# 触发方式与行为：
+#  1) 推 main 分支：仅构建验证（快速反馈，不建 Release）；
+#  2) 打 tag（git tag vX.Y.Z && git push origin vX.Y.Z）：构建 + 建草稿 Release；
+#  3) 手动（Actions 页 → Run workflow，版本号留空自动读 src/config.h）：
+#     构建 + 建草稿 Release。
 #
 # 产物：build/psvsend.vpk 上传为 Release 附件；Release 一律先建「草稿」，
 # 经人工在 Releases 页核对/编辑后才对外发布。
@@ -29,8 +30,10 @@ on:
         required: false
         default: ''
   push:
+    branches:
+      - main        # 推 main：仅构建验证
     tags:
-      - 'v*'
+      - 'v*'        # 打 tag：构建 + 建草稿 Release
 
 permissions:
   contents: write        # 创建草稿 Release / tag
@@ -65,7 +68,7 @@ jobs:
         shell: bash
         run: |
           VER="${{ inputs.version }}"
-          if [ -z "$VER" ] && [ "${{ github.event_name }}" = "push" ]; then
+          if [ -z "$VER" ] && [ "${{ github.event_name }}" = "push" ] && [[ "$GITHUB_REF" == refs/tags/* ]]; then
             VER="${GITHUB_REF_NAME#v}"
           fi
           if [ -z "$VER" ]; then
@@ -75,6 +78,7 @@ jobs:
 
   release:
     needs: build
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest   # GitHub 官方 runner：自带 gh CLI，无第三方 node 依赖
     permissions:
       contents: write
