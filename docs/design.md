@@ -13,6 +13,8 @@
 - **已落地（接收方向）**：对方 prepare-upload → 自动弹接收确认页（Accept / Setup 逐文件勾选 / Reject）→ upload 由 http.c 提供流读回调、receive.c 边收边写 `ux0:data/psvsend/downloads/`（先 `.part` 收完改名，sha256 可选校验，断流/校验失败删残留，开机清扫遗留）。兼容对方无 Content-Length 的 **chunked 流式上传**（http.c 内嵌解码状态机）；多文件同会话逐 POST upload。取消/放弃/空闲超时等状态经快照接口给 UI 展示结束原因。announce 已声明 `download:true`。
 - **已落地（发现补充）**：Vita 收不了 UDP 组播、也绑不了 53317，设备表主要靠对方主动 register 与 `scan.c` 主动 HTTP 扫描（向 /24 各 IP 的 53317 POST register 拿 member info），UI 三角键手动触发。
 - 实现边界的完整清单（单会话 409、清单 32 文件/8KB、超时 60s/120s/30s 三档、接收仅明文 HTTP、单线程顺序处理连接、/24 扫描范围等）见 README「边界与已知限制」。
+- **已落地（稳定性，v2.0.0）**：修复待机唤醒 / Wi-Fi 断开恢复后卡「网络未就绪 / 没扫到设备」——watch 看门狗单线程低频轮询 netctl + 全互斥 `initCount=0` 语义修正（发现/扫描/收发/net 各互斥均改为无人先持锁），恢复后 UI 心跳自动续上；另曾用 6s 模拟断网窗口复现，现该调试开关已置 0（net.c `PSVSEND_SIM_DOWN_MS`，需要时 cmake 覆盖）。
+- **已落地（渲染稳定，v2.0.0）**：修复偶发 **GPU render crash**（先兆为界面「三角形空白撕裂」→ 系统判 render gpu crash 重启）。根因：主循环缺 `vita2d_wait_rendering_done()`，每帧 swap 后 GPU 队列无收敛点，渲染/显示队列超前回绕导致撕裂与驱动状态错乱；修复：每帧 swap 后等待渲染完成（ui_main.c）。字体对象另改为启动帧外预载（`font_preload_all`），堵住"渲染中途创建 GPU 纹理"的隐患（非本次根因，作加固保留）。
 - **未落地**：与 §4/§5 目标架构的规划差项（session.c 拆分、multipart 收件、接收设置页改名/选目录等）仍在路线中；中文字体已落地（见 §5.5），不再在列。
 - 本文按"目标架构"描述，部分命名与实际源码不同（如目标 `http_server.c` / `http_client.c` 实际为 `http.c` / `transfer.c`）；现状与源码布局以 README「目录结构」为准。
 
@@ -258,3 +260,4 @@ src/ui/
 - [ ] 接收设置页：本次保存目录选择（目录浏览/预设；需确认 ux0 目录权限；当前固定 `ux0:data/psvsend/`）
 - [ ] 接收页"验证"功能（LocalSend 的验证码/校验交互）当前不做，等真实协议接入后再定
 - [x] 多文件接收中途取消的竞态：已修复（收满优先于取消判断）——正在传的文件若已收满则以「用户取消」收尾并保留完整，未收满才清理其残 `.part`；前 N-1 个完整文件始终保留（细节见 README「边界 / 接收」）
+- [x] GPU render crash（界面撕裂后偶发崩溃）：已修复——根因为主循环缺 `vita2d_wait_rendering_done()`（GPU 队列无逐帧收敛点），2026-09 真机多轮复测通过（细节见 §1「实现现状」渲染稳定条目与 README「当前状态」）

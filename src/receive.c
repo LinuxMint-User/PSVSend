@@ -52,7 +52,8 @@ static struct {
     char alias[64];
     char type[24];
     char ip[16];
-    int  n;
+    int  n;                  /* 列入清单的文件数（≤ RECV_MAX_FILES） */
+    int  overflow;           /* 超上限被丢弃的可用文件数（确认页明示用） */
     struct { char fileid[160]; char name[192]; SceOff size; char sha256[65]; } f[RECV_MAX_FILES];
     bool inc[RECV_MAX_FILES];   /* UI 勾选（默认全选） */
 } g_pend;
@@ -259,7 +260,7 @@ void recv_init(void)
     char p[512];
     size_t sl = strlen(RECV_PART_SUFFIX);
     if (g_mtx < 0)
-        g_mtx = sceKernelCreateMutex("psvsend_recv", 0, 1, NULL);
+        g_mtx = sceKernelCreateMutex("psvsend_recv", 0, 0, NULL);
     if (g_mtx < 0) return;
     lock();
     g_phase = PH_NONE;
@@ -292,6 +293,7 @@ int recv_pending_pull(RecvPending *out)
         snprintf(out->peer_type,  sizeof out->peer_type,  "%s", g_pend.type);
         snprintf(out->peer_ip,    sizeof out->peer_ip,    "%s", g_pend.ip);
         out->count = g_pend.n;
+        out->overflow = g_pend.overflow;
         out->total = 0;
         for (i = 0; i < g_pend.n && i < RECV_MAX_FILES; i++) {
             snprintf(out->files[i].name, sizeof out->files[i].name, "%s",
@@ -373,23 +375,30 @@ int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz)
     if (!g_pend.alias[0]) snprintf(g_pend.alias, sizeof g_pend.alias, "%s", ip);
 
     n = 0;
+    g_pend.overflow = 0;
     if (json_iter_first(filesv, &it)) {
         do {
-            if (n >= RECV_MAX_FILES) break;   /* 超过上限：忽略多出来的文件，
-                                               * 回执只列前 RECV_MAX_FILES 个（协议允许只收子集） */
-            snprintf(g_pend.f[n].fileid, sizeof g_pend.f[n].fileid, "%s", it.key);
-            g_pend.f[n].name[0] = 0;
-            g_pend.f[n].size = 0;
-            g_pend.f[n].sha256[0] = 0;
+            char nm[192], sh[65];
+            nm[0] = sh[0] = 0;
             p = json_get_val(it.val, "fileName");
-            if (p) json_val_str(p, g_pend.f[n].name, sizeof g_pend.f[n].name);
+            if (p) json_val_str(p, nm, sizeof nm);
             p = json_get_val(it.val, "size");
-            if (p && json_val_int(p, &sz)) g_pend.f[n].size = (SceOff)sz;
+            sz = 0;
+            if (p) json_val_int(p, &sz);
             p = json_get_val(it.val, "sha256");
             if (p && json_val_str(p, tmp, sizeof tmp) && strlen(tmp) == 64)
-                snprintf(g_pend.f[n].sha256, sizeof g_pend.f[n].sha256, "%s", tmp);
-            if (!g_pend.f[n].name[0] || g_pend.f[n].size < 0)
-                continue;                    /* 条目不可用 → 跳过 */
+                snprintf(sh, sizeof sh, "%s", tmp);
+            if (!nm[0] || sz < 0)
+                continue;                    /* 条目不可用 → 跳过（不算超限） */
+            if (n >= RECV_MAX_FILES) {       /* 超过上限：丢弃并计数，确认页明示
+                                              * （协议允许只回执收下的子集） */
+                g_pend.overflow++;
+                continue;
+            }
+            snprintf(g_pend.f[n].fileid, sizeof g_pend.f[n].fileid, "%s", it.key);
+            snprintf(g_pend.f[n].name, sizeof g_pend.f[n].name, "%s", nm);
+            g_pend.f[n].size = (SceOff)sz;
+            snprintf(g_pend.f[n].sha256, sizeof g_pend.f[n].sha256, "%s", sh);
             g_pend.inc[n] = true;
             n++;
         } while (code == 200 && json_iter_next(&it));
@@ -407,6 +416,9 @@ int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz)
     g_pend_result = 0;
     g_phase = PH_PENDING;
     dlog("recv: prepare %d files from %s (%s)", n, g_pend.alias, g_pend.ip);
+    if (g_pend.overflow)
+        dlog("recv: %d more file(s) exceed the cap %d, will be dropped",
+             g_pend.overflow, RECV_MAX_FILES);
     unlock();
 
     /* 等 UI 决定：轮询（http 线程单线程，这里睡着期间不再接别的连接） */

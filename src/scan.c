@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <psp2/net/net.h>
 #include <psp2/kernel/threadmgr/thread.h>
+#include <psp2/kernel/threadmgr/mutex.h>
 #include <mbedtls/ssl.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
@@ -40,6 +41,8 @@ typedef struct {
     int fd;
     int tls;                 /* 1=走了 TLS 握手 */
     int  ssl_up;             /* mbedtls 上下文已初始化 */
+    char fp[96];             /* trust-first：本次连接 TLS 叶证书 SHA-256
+                              * （每连接私有：8 路并发探测互不覆盖） */
     mbedtls_ssl_context  ssl;
     mbedtls_ssl_config   conf;
     mbedtls_entropy_context ent;
@@ -49,13 +52,25 @@ typedef struct {
     mbedtls_pk_context   ownpk;
 } SConn;
 
+#define SCAN_WORKERS       8              /* 一轮并发探测线程数 */
+#define SCAN_KNOWN_MAX     64             /* 记住的上次在线主机数（下轮优先探） */
+#define SCAN_WORKER_STACK  0x14000        /* 每个 worker 栈：装得下 mbedtls 上下文 */
+
 static SceUID    g_thr = -1;
+static SceUID    g_lock = -1;   /* 保护游标/计数/已知表 */
 static volatile int g_up = 0;      /* 线程已建 */
 static volatile int g_active = 0;  /* 正在扫 */
 static volatile int g_need = 0;    /* 空闲后顺延一轮 */
 static volatile int g_done = 0;    /* 已探主机数 */
+static volatile int g_found = 0;   /* 本轮发现的设备数 */
 static int         g_total = 0;
-static char        g_peer_fp[96];  /* trust-first：最后一次 TLS 叶证书 SHA-256 */
+static int         g_known[SCAN_KNOWN_MAX];  /* 上次在线主机号（本 /24 内） */
+static int         g_known_n = 0;
+static int         g_round_found[SCAN_KNOWN_MAX];
+static int         g_round_found_n = 0;
+
+static void slock(void) { if (g_lock >= 0) sceKernelLockMutex(g_lock, 1, NULL); }
+static void sunlock(void) { if (g_lock >= 0) sceKernelUnlockMutex(g_lock, 1); }
 
 static uint64_t now_us(void)
 {
@@ -107,11 +122,13 @@ static int tls_recv_cb(void *ctx, unsigned char *buf, size_t len)
     return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
 }
 
-/* trust-first：不预知对端指纹，放行任意叶子证书并把其 SHA-256 记下 */
+/* trust-first：不预知对端指纹，放行任意叶子证书并把其 SHA-256 记下。
+ * arg 指向本连接 SConn.fp（每连接私有，多线程并发探测互不覆盖）。 */
 static int trust_verify(void *arg, mbedtls_x509_crt *crt, int depth, uint32_t *flags)
 {
     unsigned char dig[32];
     char hex[65];
+    char *fp = (char *)arg;
     int i;
     (void)arg;
     if (depth != 0) return 0;
@@ -124,7 +141,7 @@ static int trust_verify(void *arg, mbedtls_x509_crt *crt, int depth, uint32_t *f
         hex[i * 2 + 1] = "0123456789ABCDEF"[dig[i] & 0xF];
     }
     hex[64] = 0;
-    snprintf(g_peer_fp, sizeof g_peer_fp, "%s", hex);
+    if (fp) snprintf(fp, 96, "%s", hex);
     *flags = 0;                              /* 自签无 CA：清掉其它校验位 */
     return 0;
 }
@@ -149,14 +166,35 @@ static int net_connect_to(const char *ip, int port, SceLong64 budget_us)
         sceNetSocketClose(fd);
         return -1;
     }
-    sceNetConnect(fd, (const SceNetSockaddr *)&sa, sizeof sa);
+    {
+        int cr = sceNetConnect(fd, (const SceNetSockaddr *)&sa, sizeof sa);
+        /* 非阻塞 connect：立即成功（罕见）或进入在途；返回其它错误=确定失败 */
+        if (cr == 0) return fd;
+        if (cr != SCE_NET_ERROR_EWOULDBLOCK &&
+            cr != SCE_NET_ERROR_EINPROGRESS &&
+            cr != SCE_NET_ERROR_EALREADY) {
+            sceNetSocketClose(fd);
+            return -1;
+        }
+    }
+    /* 在途：轮询判定完成。注意 connect 未裁决时 getpeername 返回
+     * ENOTCONN（不是 EWOULDBLOCK）——老代码在这里把"在途"误判成失败
+     * 秒退，导致一轮 /24 不到 100ms 就"扫完"且永远 0 台；
+     * 连接建立后 getpeername 返回 0。SO_ERROR 非 0 = 内核已裁决失败
+     * （refused/不可达等），读到即快速放弃。 */
     for (;;) {
-        SceNetSockaddrIn p;
-        unsigned int plen = sizeof p;
-        int r = sceNetGetpeername(fd, (SceNetSockaddr *)&p, &plen);
-        if (r == 0) return fd;               /* 连接建立 */
-        if (!NET_AGAIN(r)) break;            /* 拒绝/不可达等明确失败 */
-        if (now_us() >= dl) break;           /* 预算到点，放弃 */
+        int so = 0;
+        unsigned int sl = sizeof so;
+        if (sceNetGetsockopt(fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_ERROR,
+                             &so, &sl) == 0 && so != 0)
+            break;                          /* connect 已失败 */
+        {
+            SceNetSockaddrIn p;
+            unsigned int plen = sizeof p;
+            if (sceNetGetpeername(fd, (SceNetSockaddr *)&p, &plen) == 0)
+                return fd;                  /* 连接建立 */
+        }
+        if (now_us() >= dl) break;          /* 预算到点，放弃 */
         sceKernelDelayThread(SCAN_POLL_US);
     }
     sceNetSocketClose(fd);
@@ -289,7 +327,7 @@ static int s_handshake(SConn *c, const char *ip)
     mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
     mbedtls_x509_crt_init(&c->ca);
     mbedtls_ssl_conf_ca_chain(&c->conf, &c->ca, NULL);
-    mbedtls_ssl_conf_verify(&c->conf, trust_verify, NULL);
+    mbedtls_ssl_conf_verify(&c->conf, trust_verify, c->fp);
     mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->drbg);
     /* mTLS：出示内嵌设备身份证书（接收端强制客户端证书） */
     mbedtls_x509_crt_init(&c->own);
@@ -355,8 +393,10 @@ static void self_info_json(char *out, int outsz)
              ae, fe, port > 0 ? port : SCAN_PORT);
 }
 
-/* 解析 register 200 响应里的对端 member info；成功返回 1 并填 out */
-static int parse_member(const char *body, int tls, const char *ip, Device *out)
+/* 解析 register 200 响应里的对端 member info；成功返回 1 并填 out。
+ * leaf_fp 为本次 TLS 连接记下的叶子证书 SHA-256（明文探测传 NULL）。 */
+static int parse_member(const char *body, int tls, const char *ip, Device *out,
+                        const char *leaf_fp)
 {
     long long v;
     memset(out, 0, sizeof *out);
@@ -364,8 +404,8 @@ static int parse_member(const char *body, int tls, const char *ip, Device *out)
     if (!json_get_str(body, "alias", out->alias, sizeof out->alias)) return 0;
     if (!json_get_str(body, "fingerprint", out->fingerprint,
                       sizeof out->fingerprint)) {
-        if (tls && g_peer_fp[0])
-            snprintf(out->fingerprint, sizeof out->fingerprint, "%s", g_peer_fp);
+        if (tls && leaf_fp && leaf_fp[0])
+            snprintf(out->fingerprint, sizeof out->fingerprint, "%s", leaf_fp);
     }
     if (out->fingerprint[0] &&
         strcmp(out->fingerprint, g_cfg.fingerprint) == 0)
@@ -410,7 +450,7 @@ static int probe_host(const char *ip, Device *out)
         if (r == 0) r = s_read_resp(&c, &code, resp, (int)sizeof resp, SCAN_RESP_US);
         else r = -1;
         if (r > 0 && code == 200) {
-            int ok = parse_member(resp, c.tls != 0, ip, out);
+            int ok = parse_member(resp, c.tls != 0, ip, out, c.fp);
             s_close(&c);
             return ok;
         }
@@ -419,47 +459,186 @@ static int probe_host(const char *ip, Device *out)
     return 0;
 }
 
-/* ---------- 一轮全扫 ---------- */
+/* ---------- 一轮全扫（多 worker 并发） ---------- */
+
+/* 单 worker 探测上下文。静态全局：轮次严格串行（g_active 挡住并发轮），而
+ * 被预算超时"废弃"的 worker 可能仍在跑、还会引用 ctx，故不能放栈上。
+ * round 字段=本轮轮次号：worker 入口捕获，之后每次动共享统计前比对全局
+ * g_round，轮次变了说明自己已被废弃，立刻收手（不再入表/计数/碰 ctx）。 */
+typedef struct {
+    char   prefix[16];
+    int    hosts[254];    /* 候选主机号（排除本机） */
+    int    n;
+    int    cur;           /* 共享游标（锁保护） */
+    int    round;
+} ScanCtx;
+
+static ScanCtx g_ctx;
+static volatile int g_round = 0;
+
+#define SCAN_ROUND_BUDGET_US (120 * 1000000LL)  /* 一轮硬预算：超时视为 worker 挂死 */
+#define SCAN_ROUND_SLOW_US   (15 * 1000000LL)   /* 超过则周期性打慢速日志 */
+
+static int scan_worker_thr(SceSize args, void *argp)
+{
+    ScanCtx *c = &g_ctx;          /* 不用 argp：StartThread(0,NULL) 传不了可靠指针 */
+    int my_round = c->round;
+    (void)args; (void)argp;
+    dlog("scan: worker up (round %d)", my_round);
+    for (;;) {
+        int idx;
+        Device dev;
+        char hip[16];
+        slock();
+        if (g_round != my_round || c->cur >= c->n) { sunlock(); break; }
+        idx = c->cur++;
+        sunlock();
+        snprintf(hip, sizeof hip, "%s%d", c->prefix, c->hosts[idx]);
+        if (probe_host(hip, &dev)) {
+            if (g_round != my_round) break;   /* 本轮已被废弃：不再入表/计数 */
+            dlog("scan: found '%s' %s:%d (%s)", dev.alias, dev.ip, dev.port,
+                 dev.protocol);
+            discovery_upsert_peer(&dev);
+            slock();
+            if (g_round_found_n < SCAN_KNOWN_MAX)
+                g_round_found[g_round_found_n++] = c->hosts[idx];
+            g_found++;
+            sunlock();
+        }
+        slock();
+        g_done++;
+        sunlock();
+    }
+    return 0;
+}
+
 static void scan_round(void)
 {
     const char *lip = net_local_ip();
     unsigned a = 0, b = 0, c = 0, d = 0;
     char prefix[16];
-    int host, self_host = -1;
+    ScanCtx *ctx = &g_ctx;
+    SceUID wt[SCAN_WORKERS];
+    int alive[SCAN_WORKERS];
+    int wn = 0, i;
+    int my_round;
     if (!lip || sscanf(lip, "%u.%u.%u.%u", &a, &b, &c, &d) != 4 ||
         a > 255 || b > 255 || c > 255 || d > 255) {
         dlog("scan: no usable local ip, skip round");
         return;
     }
-    self_host = (int)d;
+    if (g_lock < 0)
+        g_lock = sceKernelCreateMutex("psvsend_scan", 0, 0, NULL);
+
+    my_round = ++g_round;
+
+    /* 候选顺序：上次在线的主机排最前（"重点先探"），其余按序补全 */
+    memset(ctx, 0, sizeof *ctx);
     snprintf(prefix, sizeof prefix, "%u.%u.%u.", a, b, c);
-    g_done = 0;
-    g_total = 254;
-    dlog("scan: round start on %u.%u.%u.0/24", a, b, c);
-    for (host = 1; host <= 254; host++) {
-        char hip[16];
-        Device dev;
-        if (host == self_host) { g_done = host; continue; }
-        snprintf(hip, sizeof hip, "%s%d", prefix, host);
-        if (probe_host(hip, &dev)) {
-            dlog("scan: found '%s' %s:%d (%s)", dev.alias, dev.ip, dev.port,
-                 dev.protocol);
-            discovery_upsert_peer(&dev);
+    snprintf(ctx->prefix, sizeof ctx->prefix, "%s", prefix);
+    ctx->round = my_round;
+    {
+        int h, k;
+        for (i = 0; i < g_known_n; i++) {
+            h = g_known[i];
+            if (h == (int)d || h < 1 || h > 254) continue;
+            ctx->hosts[ctx->n++] = h;
         }
-        g_done = host;
+        for (h = 1; h <= 254; h++) {
+            if (h == (int)d) continue;
+            for (k = 0; k < ctx->n; k++)
+                if (ctx->hosts[k] == h) break;
+            if (k == ctx->n) ctx->hosts[ctx->n++] = h;
+        }
     }
-    dlog("scan: round done (%d hosts)", g_total);
+    slock();
+    g_total = 254;
+    g_done = 1;                       /* 本机占 1 格，进度按 /254 走 */
+    g_found = 0;
+    g_round_found_n = 0;
+    sunlock();
+    dlog("scan: round #%d start on %s0/24 (%d candidates, %d known first)",
+         my_round, prefix, ctx->n, ctx->n < g_known_n ? ctx->n : g_known_n);
+
+    for (i = 0; i < SCAN_WORKERS && i < ctx->n; i++) {
+        SceUID t = sceKernelCreateThread("psvsend_scanw", scan_worker_thr,
+                                         0x40, SCAN_WORKER_STACK, 0, 0, NULL);
+        if (t < 0) {
+            dlog("scan: worker create fail 0x%08X", (unsigned)t);
+            break;
+        }
+        if (sceKernelStartThread(t, 0, NULL) < 0) {
+            dlog("scan: worker start fail");
+            sceKernelDeleteThread(t);
+            break;
+        }
+        alive[wn] = 1;
+        wt[wn++] = t;
+    }
+    if (wn == 0) {                     /* 线程全没起来：退化成串行兜底 */
+        dlog("scan: no worker, fallback serial");
+        ctx->cur = 0;
+        scan_worker_thr(0, NULL);
+    } else {
+        /* 等待 worker 结束：带总预算轮询，挂死的 worker 不再无限等。
+         * 单 worker 单 host 的探测本身有超时预算，正常一轮几秒~几十秒；
+         * 超预算说明有 worker 卡在内核调用/锁上，废弃它让 UI 恢复。 */
+        SceLong64 t0 = now_us();
+        int pending = wn, slow_log = 0;
+        while (pending > 0) {
+            if (now_us() - t0 > SCAN_ROUND_BUDGET_US) break;
+            for (i = 0; i < wn; i++) {
+                SceUInt to;
+                if (!alive[i]) continue;
+                to = 100 * 1000;              /* 每个 worker 单次最多等 100ms */
+                if (sceKernelWaitThreadEnd(wt[i], NULL, &to) == 0) {
+                    alive[i] = 0;
+                    sceKernelDeleteThread(wt[i]);
+                    pending--;
+                }
+            }
+            {
+                SceLong64 el = now_us() - t0;
+                if (el > SCAN_ROUND_SLOW_US && (int)(el / 10000000) > slow_log) {
+                    slow_log = (int)(el / 10000000);
+                    dlog("scan: round #%d running %lld ms (pending %d, found %d)",
+                         my_round, (long long)(el / 1000), pending, g_found);
+                }
+            }
+            if (pending > 0) sceKernelDelayThread(SCAN_TICK_US);
+        }
+        if (pending > 0)
+            dlog("scan: round #%d budget exceeded, abandon %d worker(s) (found %d)",
+                 my_round, pending, g_found);
+        /* 被废弃的 worker 恢复后会在下一轮（轮次号已变）到来前自己收手 */
+    }
+
+    slock();                           /* 记住本轮在线主机：下轮优先探 */
+    g_known_n = g_round_found_n;
+    for (i = 0; i < g_known_n; i++) g_known[i] = g_round_found[i];
+    g_done = 254;
+    sunlock();
+    dlog("scan: round #%d done (%d hosts, %d found)", my_round, 254, g_found);
 }
 
 static int scan_thr(SceSize args, void *argp)
 {
+    int off_logged = 0;        /* 断网挂起只提示一次 */
     (void)args; (void)argp;
     for (;;) {
-        if (g_need || g_active) {
-            g_need = 0;
-            g_active = 1;
-            scan_round();
-            g_active = 0;
+        /* 触发的轮次只在网络可用时真正执行；断网期间按三角 → 请求保持
+         * g_need=1 挂起，链路恢复后本循环自动补跑，不等用户再按一次 */
+        if (g_need && !g_active) {
+            if (net_connected() && strcmp(net_local_ip(), "0.0.0.0") != 0) {
+                g_need = 0;
+                g_active = 1;
+                scan_round();
+                g_active = 0;
+                off_logged = 0;
+            } else if (!off_logged) {
+                off_logged = 1;
+                dlog("scan: round pending, wifi link down - wait for recovery");
+            }
         }
         sceKernelDelayThread(SCAN_TICK_US);
     }
@@ -484,6 +663,10 @@ void scan_trigger(void)
         g_up = 1;
         dlog("scan: thread up");
     }
+    /* 手动扫描 = 重新认识当前网络：先把旧条目清掉（含已离线的"残留"），
+     * 扫到的/期间 register 回来的会立刻重新入表。给用户即时的"清空"反馈。 */
+    dlog("scan: manual trigger, clear device table");
+    discovery_clear();
     g_need = 1;                     /* 空闲则本轮开始；在扫则扫完顺延一轮 */
 }
 
@@ -491,3 +674,4 @@ bool scan_up(void)   { return g_up != 0; }
 int  scan_active(void){ return g_active; }
 int  scan_done(void) { return g_done; }
 int  scan_total(void) { return g_total; }
+int  scan_found(void) { return g_found; }

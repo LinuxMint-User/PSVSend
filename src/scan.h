@@ -21,4 +21,7 @@ int scan_active(void);
 int scan_done(void);
 int scan_total(void);
 
+/* 本轮发现的设备数（active 时逐步累加，round 结束后保留到下次触发） */
+int scan_found(void);
+
 #endif

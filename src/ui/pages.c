@@ -15,6 +15,7 @@
 #include "ui.h"
 #include "theme.h"
 #include "../config.h"
+#include "../i18n.h"
 #include "../net.h"
 #include "../api.h"
 #include "../transfer.h"
@@ -41,11 +42,18 @@ static int xf_scroll = 0;         /* 传输页文件列表内容偏移 */
 static int dev_press_scroll = 0;  /* 本次拖动按下时的滚动位置 */
 static int file_press_scroll = 0;
 static int xf_press_scroll = 0;
+static int set_scroll = 0;        /* 设置页内容偏移 */
+static int set_press_scroll = 0;
 static int recv_focus = 2;        /* 接收确认焦点：0=Reject 1=Setup 2=Accept */
 static int rs_scroll = 0;         /* 接收设置页文件列表内容偏移 */
 static int rs_press_scroll = 0;
 static bool rename_pop = false;   /* 改名占位弹窗（重命名功能 TODO） */
 static bool host_pop = false;     /* 设置页主机名改名的占位弹窗（文字输入 TODO） */
+/* 手动扫描的反馈横幅状态（设备页头与列表之间的一条细字）：
+ * 扫描中显示进度，round 结束时边沿检测记下结束时刻，其后约 4s 显示结果 */
+static uint64_t dev_scan_end_us = 0;
+static int      dev_scan_was = 0;
+static int      dev_scan_last_found = 0;
 
 /* 进度页当前文件清单：发送时每帧由 xfer 快照覆盖；接收时会话快照，
  * 会话还没建好的头几帧用这里的本地清单兜底 */
@@ -132,7 +140,8 @@ static void add_row_hit(int id, int top)
 void pages_init(void)
 {
     int i;
-    config_init();                       /* 读配置：主题/键位布局/设备名等 */
+    config_init();                       /* 读配置：主题/键位布局/设备名/语言等 */
+    i18n_init();                         /* 解析界面语言（跟随系统或偏好） */
     if (g_cfg.theme_id < 0 || g_cfg.theme_id >= THEME_COUNT) g_cfg.theme_id = 0;
     g_app.theme_id = g_cfg.theme_id;
     g_app.confirm_layout = g_cfg.confirm_layout ? 1 : 0;
@@ -188,12 +197,50 @@ static void dev_sync(void)
     else if (g_app.dev_sel >= n) g_app.dev_sel = n - 1;
 }
 
+/* 页头下细条：手动扫描的实时进度/结果（与列表是否为空无关；
+ * 三角键按下后下一帧起可见，round 结束后约 4s 报告"扫到 N 台"） */
+static void dev_scan_strip(void)
+{
+    uint64_t now = (uint64_t)sceKernelGetSystemTimeWide();
+    if (scan_active()) {
+        int d = scan_done(), t = scan_total(), f = g_app.dev_count;
+        char st[96];
+        if (t <= 0) t = 254;
+        if (d < 0 || d > t) d = 0;
+        dev_scan_was = 1;
+        dev_scan_end_us = 0;          /* 新一轮开始，旧的结果提示作废 */
+        snprintf(st, sizeof st, tr("Scanning... %d/%d hosts, %d found"),
+                 d, t, f);
+        w_text(28, 56, 0.9f, theme->text_dim, "%s", st);
+    } else if (dev_scan_was) {        /* round 结束边沿：记时刻与结果 */
+        dev_scan_was = 0;
+        dev_scan_end_us = now;
+        /* 以"表里现有设备数"为准（而非仅主动探测的 scan_found()）：
+         * 扫描期间入表的既可能有探测命中，也可能有设备自己发的 register，
+         * round 结束时列表里实际有几台就报几台，横幅才不与列表矛盾 */
+        dev_scan_last_found = g_app.dev_count;
+    }
+    if (dev_scan_end_us && now - dev_scan_end_us < 4000000ull) {
+        char st[96];
+        if (dev_scan_last_found > 0)
+            snprintf(st, sizeof st, tr("Scan complete, %d device%s found"),
+                     dev_scan_last_found,
+                     dev_scan_last_found == 1 ? "" : "s");
+        else
+            snprintf(st, sizeof st, tr("Scan complete, no devices"));
+        w_text(28, 56, 0.9f, theme->text_dim, "%s", st);
+        return;
+    }
+    dev_scan_end_us = 0;              /* 提示过期，清标记 */
+}
+
 void page_devices_render(void)
 {
     int count;
     dev_sync();
     count = g_app.dev_count;
     w_page_header("PSVSend");
+    dev_scan_strip();
     if (count > 0) {
         int i;
         clamp_scroll(&dev_scroll, count);
@@ -210,34 +257,33 @@ void page_devices_render(void)
     } else {
         if (!api_network_ready()) {
             const char *why = api_discovery_fail();
-            w_text(28, LIST_TOP + 10, 1.15f, theme->text, "Network not ready.");
+            w_text(28, LIST_TOP + 10, 1.15f, theme->text, "%s",
+                   tr("Network not ready."));
             if (why[0]) {
-                w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim, why);
+                w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim, "%s", why);
             } else {
-                w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim,
-                       "Waiting for Wi-Fi to come back up...");
+                w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim, "%s",
+                       tr("Waiting for Wi-Fi to come back up..."));
             }
         } else if (!net_connected()) {
-            w_text(28, LIST_TOP + 10, 1.15f, theme->text, "Wi-Fi link is down.");
+            w_text(28, LIST_TOP + 10, 1.15f, theme->text, "%s",
+                   tr("Wi-Fi link is down."));
+        } else if (scan_active()) {
+            w_text(28, LIST_TOP + 10, 1.15f, theme->text, "%s",
+                   tr("Scanning network..."));
         } else {
-            w_text(28, LIST_TOP + 10, 1.15f, theme->text, "No devices found.");
-            if (scan_active()) {
-                char st[96];
-                snprintf(st, sizeof st, "Scanning... %d/%d hosts",
-                         scan_done(), scan_total() > 0 ? scan_total() : 254);
-                w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim, st);
-            } else {
-                w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim,
-                       "Press Triangle to scan this network.");
-            }
+            w_text(28, LIST_TOP + 10, 1.15f, theme->text, "%s",
+                   tr("No devices found."));
+            w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim, "%s",
+                   tr("Press Triangle to scan this network."));
         }
     }
     HintSeg segs[6];
     int ns = 0;
-    segs[ns].icon = HICON_DPAD;       segs[ns++].text = "Choose";
-    segs[ns].icon = icon_confirm();   segs[ns++].text = "Send";
-    segs[ns].icon = HICON_TRIANGLE;   segs[ns++].text = "Scan";
-    segs[ns].icon = HICON_NONE;       segs[ns++].text = "SELECT Settings";
+    segs[ns].icon = HICON_DPAD;       segs[ns++].text = tr("Choose");
+    segs[ns].icon = icon_confirm();   segs[ns++].text = tr("Send");
+    segs[ns].icon = HICON_TRIANGLE;   segs[ns++].text = tr("Scan");
+    segs[ns].icon = HICON_NONE;       segs[ns++].text = tr("SELECT Settings");
     w_page_footer_segs(segs, ns);
 }
 
@@ -384,7 +430,7 @@ void page_files_render(void)
 {
     int count = g_app.file_count;
     char title[192];
-    snprintf(title, sizeof title, "Send to %s", g_app.dev_alias[g_app.dev_target]);
+    snprintf(title, sizeof title, tr("Send to %s"), g_app.dev_alias[g_app.dev_target]);
     w_page_header(title);
     w_text_clip(28, 56, 1.0f, theme->text_dim, g_app.cur_dir, SCR_W - 56);
     if (count > 0) {
@@ -405,7 +451,7 @@ void page_files_render(void)
             else
                 snprintf(main, sizeof main, "%s", g_app.files[i].name);
             if (g_app.files[i].is_dir)
-                strcpy(sub, "folder");
+                strcpy(sub, tr("folder"));
             else
                 w_human_size(g_app.files[i].size, sub);
             w_row(r, main, sub, i == g_app.file_sel);
@@ -413,20 +459,21 @@ void page_files_render(void)
         vita2d_disable_clipping();
     }
     if (count == 0)
-        w_text(28, LIST_TOP + 8, 1.1f, theme->text_dim, "(empty folder)");
+        w_text(28, LIST_TOP + 8, 1.1f, theme->text_dim, "%s",
+               tr("(empty folder)"));
     char send_lb[24];
-    snprintf(send_lb, sizeof send_lb, "Send(%d)", g_app.picked_count);
+    snprintf(send_lb, sizeof send_lb, tr("Send(%d)"), g_app.picked_count);
     HintSeg segs[6];
     int ns = 0;
-    segs[ns].icon = HICON_DPAD;       segs[ns++].text = "Choose";
-    segs[ns].icon = icon_confirm();   segs[ns++].text = "Open/Pick";
-    segs[ns].icon = icon_back();      segs[ns++].text = "Up";
+    segs[ns].icon = HICON_DPAD;       segs[ns++].text = tr("Choose");
+    segs[ns].icon = icon_confirm();   segs[ns++].text = tr("Open/Pick");
+    segs[ns].icon = icon_back();      segs[ns++].text = tr("Up");
     segs[ns].icon = HICON_TRIANGLE;   segs[ns++].text = send_lb;
     w_page_footer_segs(segs, ns);
     Rect send = { SCR_W - 216, SCR_H - 42, 192, 36 };
     if (g_app.picked_count > 0) {
         char lb[32];
-        snprintf(lb, sizeof lb, "Send (%d)", g_app.picked_count);
+        snprintf(lb, sizeof lb, tr("Send (%d)"), g_app.picked_count);
         w_add(WID_FILES_SEND, send);
         w_button(send, lb, true);
     }
@@ -522,15 +569,15 @@ static void start_send(void)
 void page_send_confirm_render(void)
 {
     int i, n = g_app.picked_count;
-    w_page_header("Confirm Send");
+    w_page_header(tr("Confirm Send"));
     char line[256];
     Rect card = { 24, 80, SCR_W - 48, 330 };
     w_rect(card, theme->card);
-    snprintf(line, sizeof line, "Target: %s", g_app.dev_alias[g_app.dev_target]);
+    snprintf(line, sizeof line, tr("Target: %s"), g_app.dev_alias[g_app.dev_target]);
     w_text(48, 100, 1.2f, theme->text, "%s", line);
     char sz[16];
     w_human_size(g_app.picked_total, sz);
-    snprintf(line, sizeof line, "%d file(s)  total %s", n, sz);
+    snprintf(line, sizeof line, tr("%d file(s)  total %s"), n, sz);
     w_text(48, 140, 1.0f, theme->text_dim, "%s", line);
     int shown = n < 8 ? n : 8;
     for (i = 0; i < shown; i++) {
@@ -538,21 +585,22 @@ void page_send_confirm_render(void)
         if (g_app.picked[i].name[0])
             snprintf(m, sizeof m, "  %s", g_app.picked[i].name);
         else
-            snprintf(m, sizeof m, "  <file %d>", i + 1);
+            snprintf(m, sizeof m, tr("  <file %d>"), i + 1);
         w_text_clip(48, 176 + i * 26, 1.0f, theme->text, m, card.w - 60);
     }
     if (n > shown)
-        w_text(48, 176 + shown * 26, 1.0f, theme->text_dim, "  ... %d more", n - shown);
+        w_text(48, 176 + shown * 26, 1.0f, theme->text_dim, "%s",
+               tr("  ... %d more"), n - shown);
     Rect cancel = { SCR_W / 2 - 220, 444, 200, 48 };
     Rect ok     = { SCR_W / 2 + 20, 444, 200, 48 };
     w_add(0, cancel);
     w_add(1, ok);
-    w_button(cancel, "Cancel", false);
-    w_button(ok, "Send", true);
+    w_button(cancel, tr("Cancel"), false);
+    w_button(ok, tr("Send"), true);
     HintSeg segs[4];
     int ns = 0;
-    segs[ns].icon = icon_confirm();  segs[ns++].text = "Send";
-    segs[ns].icon = icon_back();     segs[ns++].text = "Cancel";
+    segs[ns].icon = icon_confirm();  segs[ns++].text = tr("Send");
+    segs[ns].icon = icon_back();     segs[ns++].text = tr("Cancel");
     w_page_footer_segs(segs, ns);
 }
 
@@ -596,7 +644,7 @@ static void recv_focus_sane(void)
 
 void page_recv_confirm_render(void)
 {
-    w_page_header("Incoming files");
+    w_page_header(tr("Incoming files"));
     char line[256];
     Rect card = { 24, 80, SCR_W - 48, 320 };
 
@@ -605,16 +653,16 @@ void page_recv_confirm_render(void)
     if (g_recv_expired) {
         w_rect(card, theme->card);
         w_text(48, 120, 1.5f, theme->text, "%s", g_app.recv_alias);
-        w_text(48, 172, 1.25f, theme->text_dim,
-               "This request has expired.");
-        w_text(48, 216, 1.0f, theme->text_dim,
-               "No response was sent to the sender.");
+        w_text(48, 172, 1.25f, theme->text_dim, "%s",
+               tr("This request has expired."));
+        w_text(48, 216, 1.0f, theme->text_dim, "%s",
+               tr("No response was sent to the sender."));
         Rect close = { SCR_W / 2 - 100, 444, 200, 48 };
         w_add(2, close);
-        w_button(close, "Close", true);
+        w_button(close, tr("Close"), true);
         HintSeg segs[2];
         int ns = 0;
-        segs[ns].icon = icon_confirm(); segs[ns++].text = "Close";
+        segs[ns].icon = icon_confirm(); segs[ns++].text = tr("Close");
         w_page_footer_segs(segs, ns);
         return;
     }
@@ -625,10 +673,11 @@ void page_recv_confirm_render(void)
     /* 来者名字（右上是平台类型） */
     w_text(48, 100, 1.5f, theme->text, "%s", g_app.recv_alias);
     int tw = 0, th = 0;
-    w_text_w(1.1f, g_app.recv_type, &tw, &th);
-    w_text(card.x + card.w - tw - 24, 106, 1.1f, theme->text_dim, "%s", g_app.recv_type);
+    w_text_w(1.1f, tr(g_app.recv_type), &tw, &th);
+    w_text(card.x + card.w - tw - 24, 106, 1.1f, theme->text_dim, "%s",
+           tr(g_app.recv_type));
 
-    snprintf(line, sizeof line, "%s wants to send you %d file(s).",
+    snprintf(line, sizeof line, tr("%s wants to send you %d file(s)."),
              g_app.recv_alias, n);
     w_text(48, 152, 1.15f, theme->text, "%s", line);
 
@@ -637,23 +686,36 @@ void page_recv_confirm_render(void)
     char sz[16];
     w_human_size(t, sz);
     if (seln == n)
-        snprintf(line, sizeof line, "Total %s", sz);
+        snprintf(line, sizeof line, tr("Total %s"), sz);
     else
-        snprintf(line, sizeof line, "Total %s  (%d of %d selected)", sz, seln, n);
+        snprintf(line, sizeof line, tr("Total %s  (%d of %d selected)"),
+                 sz, seln, n);
     w_text(48, 190, 1.0f, theme->text_dim, "%s", line);
+
+    if (g_app.recv_overflow > 0) {
+        snprintf(line, sizeof line,
+                 tr("%d more file(s) exceed the receive limit and will be skipped."),
+                 g_app.recv_overflow);
+        w_text(48, 212, 0.9f, theme->warn, "%s", line);
+    }
 
     /* 文件预览（前几条） */
     int show = n < 5 ? n : 5;
+    int py = g_app.recv_overflow > 0 ? 244 : 240;
     for (i = 0; i < show; i++) {
         char m[256];
         w_human_size(g_app.inc_files[i].size, sz);
         snprintf(m, sizeof m, "  %s  (%s)", g_app.inc_files[i].name, sz);
-        w_text_clip(60, 240 + i * 26, 1.0f, theme->text, m, card.w - 140);
+        w_text_clip(60, py + i * 26, 1.0f, theme->text, m, card.w - 140);
     }
     if (n > show)
-        w_text(60, 240 + show * 26, 1.0f, theme->text_dim, "  ... %d more", n - show);
+        w_text(60, py + show * 26, 1.0f, theme->text_dim,
+               tr("  ... %d more"), n - show);
 
     /* 底部三个按钮：Reject / Setup / Accept */
+    const char *s_reject = tr("Reject");
+    const char *s_setup  = tr("Setup");
+    const char *s_accept = tr("Accept");
     Rect rej = { 183, 444, 190, 48 };
     Rect set = { 385, 444, 190, 48 };
     Rect acc = { 587, 444, 190, 48 };
@@ -663,34 +725,34 @@ void page_recv_confirm_render(void)
     if (recv_focus == 0) {
         w_rect(rej, theme->danger);
         int w = 0, h = 0;
-        w_text_w(1.3f, "Reject", &w, &h);
+        w_text_w(1.3f, s_reject, &w, &h);
         w_text(rej.x + (rej.w - w) / 2, rej.y + (rej.h - h) / 2, 1.3f,
-               theme->accent_text, "Reject");
+               theme->accent_text, "%s", s_reject);
     } else {
         w_rect(rej, theme->card);
         w_rect_outline(rej, theme->border);
         int w = 0, h = 0;
-        w_text_w(1.3f, "Reject", &w, &h);
+        w_text_w(1.3f, s_reject, &w, &h);
         w_text(rej.x + (rej.w - w) / 2, rej.y + (rej.h - h) / 2, 1.3f,
-               theme->text, "Reject");
+               theme->text, "%s", s_reject);
     }
-    w_button(set, "Setup", recv_focus == 1);
+    w_button(set, s_setup, recv_focus == 1);
     if (seln > 0) {
-        w_button(acc, "Accept", recv_focus == 2);
+        w_button(acc, s_accept, recv_focus == 2);
     } else {
         w_rect(acc, theme->card);
         w_rect_outline(acc, theme->border);
         int w = 0, h = 0;
-        w_text_w(1.3f, "Accept", &w, &h);
+        w_text_w(1.3f, s_accept, &w, &h);
         w_text(acc.x + (acc.w - w) / 2, acc.y + (acc.h - h) / 2, 1.3f,
-               theme->text_dim, "Accept");
+               theme->text_dim, "%s", s_accept);
     }
 
     HintSeg segs[6];
     int ns = 0;
-    segs[ns].icon = HICON_DPAD;       segs[ns++].text = "Switch";
-    segs[ns].icon = icon_confirm();   segs[ns++].text = "Accept";
-    segs[ns].icon = icon_back();      segs[ns++].text = "Reject";
+    segs[ns].icon = HICON_DPAD;       segs[ns++].text = tr("Switch");
+    segs[ns].icon = icon_confirm();   segs[ns++].text = s_accept;
+    segs[ns].icon = icon_back();      segs[ns++].text = s_reject;
     w_page_footer_segs(segs, ns);
 }
 
@@ -834,7 +896,7 @@ static void w_checkbox(Rect b, bool on)
 
 void page_recv_setup_render(void)
 {
-    w_page_header("Receive setup");
+    w_page_header(tr("Receive setup"));
     int rows = 1 + g_app.inc_count;
     char line[256], sz[16];
     rs_clamp();
@@ -853,13 +915,13 @@ void page_recv_setup_render(void)
 
         if (i == 0) {
             /* 保存目录行：只读默认值；真实目录选择 TODO */
-            w_text(60, top + 8, 1.0f, theme->text_dim, "Save to");
+            w_text(60, top + 8, 1.0f, theme->text_dim, "%s", tr("Save to"));
             w_text_clip(60, top + 30, 1.1f, sel ? theme->text : theme->text_dim,
                         g_app.recv_dir, 700);
             int tw = 0, th = 0;
-            w_text_w(1.0f, "default", &tw, &th);
+            w_text_w(1.0f, tr("default"), &tw, &th);
             w_text(r.x + r.w - tw - 24, top + 16, 1.0f, theme->text_dim,
-                   "%s", "default");
+                   "%s", tr("default"));
             continue;
         }
 
@@ -881,9 +943,9 @@ void page_recv_setup_render(void)
         w_add(RS_CHK_ID + i, chk);
         w_rect_outline(ren, theme->border);
         int w2 = 0, h2 = 0;
-        w_text_w(1.0f, "Rename", &w2, &h2);
+        w_text_w(1.0f, tr("Rename"), &w2, &h2);
         w_text(ren.x + (ren.w - w2) / 2, ren.y + (ren.h - h2) / 2, 1.0f,
-               theme->text_dim, "Rename");
+               theme->text_dim, "%s", tr("Rename"));
         w_checkbox(chk, on);
     }
     vita2d_disable_clipping();
@@ -902,10 +964,10 @@ void page_recv_setup_render(void)
 
     HintSeg segs[8];
     int ns = 0;
-    segs[ns].icon = HICON_DPAD;       segs[ns++].text = "Choose";
-    segs[ns].icon = icon_confirm();   segs[ns++].text = "Toggle";
-    segs[ns].icon = HICON_TRIANGLE;   segs[ns++].text = "Rename";
-    segs[ns].icon = icon_back();      segs[ns++].text = "Back";
+    segs[ns].icon = HICON_DPAD;       segs[ns++].text = tr("Choose");
+    segs[ns].icon = icon_confirm();   segs[ns++].text = tr("Toggle");
+    segs[ns].icon = HICON_TRIANGLE;   segs[ns++].text = tr("Rename");
+    segs[ns].icon = icon_back();      segs[ns++].text = tr("Back");
     w_page_footer_segs(segs, ns);
 
     /* 改名占位弹窗 */
@@ -915,13 +977,14 @@ void page_recv_setup_render(void)
         snprintf(line, sizeof line, "%s",
                  (idx >= 0 && idx < g_app.inc_count)
                      ? g_app.inc_files[idx].name : "");
-        w_text(card.x + 40, card.y + 28, 1.3f, theme->text, "Rename file");
+        w_text(card.x + 40, card.y + 28, 1.3f, theme->text, "%s",
+               tr("Rename file"));
         w_text_clip(card.x + 40, card.y + 76, 1.0f, theme->text_dim,
                     line, card.w - 80);
-        w_text(card.x + 40, card.y + 124, 1.0f, theme->text_dim,
-               "Editing names is not available yet.");
-        w_text(card.x + 40, card.y + 158, 1.0f, theme->text_dim,
-               "TODO: system keyboard / built-in input (see design doc).");
+        w_text(card.x + 40, card.y + 124, 1.0f, theme->text_dim, "%s",
+               tr("Editing names is not available yet."));
+        w_text(card.x + 40, card.y + 158, 1.0f, theme->text_dim, "%s",
+               tr("TODO: system keyboard / built-in input (see design doc)."));
     }
 }
 
@@ -1042,12 +1105,12 @@ void page_progress_render(void)
         g_app.prog_cancel = xv.cancelled;
         fail_state = xv.finished && !xv.ok && !xv.cancelled;
         if (fail_state) {
-            msg = xv.err[0] ? xv.err : "Transfer failed";
+            msg = xv.err[0] ? xv.err : tr("Transfer failed");
             msg_col = theme->danger;
         } else if (xv.active && xv.total_sent == 0 && xv.cur < 0) {
-            msg = xv.msg[0] ? xv.msg : "Waiting for receiver to accept...";
+            msg = xv.msg[0] ? xv.msg : tr("Waiting for receiver to accept...");
         } else if (xv.active && xv.cur >= 0) {
-            msg = xv.msg[0] ? xv.msg : "Sending...";
+            msg = xv.msg[0] ? xv.msg : tr("Sending...");
         }
         for (i = 0; i < xf_count; i++) total += xf_size[i];
     } else {
@@ -1081,14 +1144,14 @@ void page_progress_render(void)
             fail_state = rs.state == RECV_ST_FAIL ||
                          rs.state == RECV_ST_TIMEOUT;
             if (fail_state) {
-                msg = rs.err[0] ? rs.err : "Receive failed";
+                msg = rs.err[0] ? rs.err : tr("Receive failed");
                 msg_col = theme->danger;
             } else if (rs.state == RECV_ST_CANCEL) {
-                msg = rs.err[0] ? rs.err : "Cancelled";
+                msg = rs.err[0] ? rs.err : tr("Cancelled");
             } else if (rs.state == RECV_ST_READY) {
-                msg = "Waiting for sender to start...";
+                msg = tr("Waiting for sender to start...");
             } else if (rs.state == RECV_ST_RECEIVING) {
-                msg = "Receiving...";
+                msg = tr("Receiving...");
             }
         } else {
             /* 首帧兜底：按已接受的清单画 0%，马上会被真实会话快照取代。
@@ -1100,13 +1163,13 @@ void page_progress_render(void)
                 total += xf_size[i];
                 if (xf_size[i] == 0) fin++;
             }
-            msg = "Waiting for sender to start...";
+            msg = tr("Waiting for sender to start...");
             if (recv_pending_pull(NULL) == 0 &&
                 (uint64_t)sceKernelGetSystemTimeWide() - g_app.prog_start >
                     2000000ULL) {
                 g_app.prog_running = false;
                 g_app.prog_cancel = true;
-                msg = "Session was not created (request expired).";
+                msg = tr("Session was not created (request expired).");
                 msg_col = theme->danger;
             }
         }
@@ -1121,7 +1184,7 @@ void page_progress_render(void)
         if (xf_scroll > max_s) xf_scroll = max_s;
     }
 
-    w_page_header(g_app.prog_dir == 0 ? "Sending" : "Receiving");
+    w_page_header(tr(g_app.prog_dir == 0 ? "Sending" : "Receiving"));
 
     /* 每文件一行：名称 + 百分比 + 细进度条（内容随 xf_scroll 像素滚动） */
     vita2d_enable_clipping();
@@ -1157,11 +1220,11 @@ void page_progress_render(void)
 
     /* 总进度条与状态 */
     char ov[48];
-    snprintf(ov, sizeof ov, "Total   %d%%", g_app.prog_pct);
+    snprintf(ov, sizeof ov, tr("Total   %d%%"), g_app.prog_pct);
     w_text(40, 376, 1.15f, theme->text, "%s", ov);
     if (g_app.prog_done || g_app.prog_cancel || fail_state) {
-        const char *st = g_app.prog_done ? "Complete"
-                       : (g_app.prog_cancel ? "Cancelled" : "Failed");
+        const char *st = g_app.prog_done ? tr("Complete")
+                       : (g_app.prog_cancel ? tr("Cancelled") : tr("Failed"));
         uint32_t sc = g_app.prog_done ? theme->success : theme->danger;
         int tw = 0, th = 0;
         w_text_w(1.15f, st, &tw, &th);
@@ -1180,7 +1243,8 @@ void page_progress_render(void)
         double mb = (double)(total * (SceOff)g_app.prog_pct / 100) / 1000000.0;
         double speed = sec > 0.05 ? mb / sec : 0.0;
         char st[160];
-        snprintf(st, sizeof st, "Files %d/%d    Elapsed %d:%02d    Speed %.2f MB/s",
+        snprintf(st, sizeof st,
+                 tr("Files %d/%d    Elapsed %d:%02d    Speed %.2f MB/s"),
                  fin, xf_count, g_app.prog_ms / 60000,
                  (g_app.prog_ms / 1000) % 60, speed);
         w_text(40, 456, 1.0f, theme->text_dim, "%s", st);
@@ -1188,8 +1252,9 @@ void page_progress_render(void)
 
     HintSeg segs[6];
     int ns = 0;
-    segs[ns].icon = icon_confirm();  segs[ns++].text = g_app.prog_running ? "Cancel" : "Done";
-    segs[ns].icon = HICON_TRIANGLE;  segs[ns++].text = "Advanced";
+    segs[ns].icon = icon_confirm();
+    segs[ns++].text = g_app.prog_running ? tr("Cancel") : tr("Done");
+    segs[ns].icon = HICON_TRIANGLE;  segs[ns++].text = tr("Advanced");
     w_page_footer_segs(segs, ns);
 
     /* 底部右侧按钮：右边=取消/完成，其左=高级 */
@@ -1197,15 +1262,15 @@ void page_progress_render(void)
     Rect adv  = { main.x - 12 - 140, SCR_H - 42, 140, 36 };
     w_add(0, adv);
     w_add(1, main);
-    w_button(adv, "Advanced", g_app.prog_info);
+    w_button(adv, tr("Advanced"), g_app.prog_info);
     if (g_app.prog_running) {
         w_rect(main, theme->danger);
         int tw = 0, th = 0;
-        w_text_w(1.3f, "Cancel", &tw, &th);
+        w_text_w(1.3f, tr("Cancel"), &tw, &th);
         w_text(main.x + (main.w - tw) / 2, main.y + (main.h - th) / 2, 1.3f,
-               theme->accent_text, "Cancel");
+               theme->accent_text, "%s", tr("Cancel"));
     } else {
-        w_button(main, "Done", true);
+        w_button(main, tr("Done"), true);
     }
 }
 
@@ -1263,73 +1328,240 @@ void page_progress_input(const Input *in)
     if (in->alt) g_app.prog_info = !g_app.prog_info;
 }
 
-/* ================= 设置 ================= */
-#define SET_ROWS 3            /* 0=主题 1=确认键 2=主机名(壳子) */
+/* ================= 设置 =================
+ * 设置页行 = 分组标题(不可选) + 设置项。整页像素滚动（模型同设备/文件列表）：
+ * 可视区 LIST_TOP..LIST_BOTTOM，内容总高超出时拖动跟手、方向键自动滚到选中项。
+ * g_app.set_sel 存设置项 id（SET_ITEM_*）；分组标题不参与选择。
+ * 每行触摸分成两半：左半=上一档，右半=下一档（主机名行两半都弹占位）。 */
+enum {
+    SET_ITEM_THEME = 0,    /* 显示：主题 */
+    SET_ITEM_LANG,         /* 显示：界面语言 */
+    SET_ITEM_KEY,          /* 操作：确认键布局 */
+    SET_ITEM_HOSTNAME,     /* 设备：主机名（改名需文字输入，先占位弹窗） */
+    SET_ITEM_N
+};
 
-void page_settings_render(void)
+/* 渲染行槽（顺序即页面顺序）：HDR=分组标题 ITEM=设置项 HINT=提示行 */
+enum {
+    SET_SLOT_HDR_A = 0,    /* 分组：设备 */
+    SET_SLOT_HOST,
+    SET_SLOT_HDR_B,        /* 分组：显示 */
+    SET_SLOT_THEME,
+    SET_SLOT_LANG,
+    SET_SLOT_HDR_C,        /* 分组：操作 */
+    SET_SLOT_KEY,
+    SET_SLOT_HINT,
+    SET_SLOT_HDR_D,        /* 分组：关于（页面最底部） */
+    SET_SLOT_ABOUT_A,      /* logo：PSVSend 大字 + 版本号 */
+    SET_SLOT_ABOUT_B,      /* 适配说明行 */
+    SET_SLOT_N
+};
+#define SET_HDR_H   44        /* 分组标题行高（含上方留白） */
+#define SET_ROW_H   60        /* 设置项行步进（视觉行 56） */
+#define SET_HINT_H  30        /* 结尾提示行高 */
+#define SET_LOGO_H  60        /* 关于组 logo 行（大字，底部再留白） */
+#define SET_ADAPT_H 40        /* 关于组适配说明行 */
+
+static int slot_item(int slot)
 {
-    char theme_v[64], layout_v[96];
-    const char *vals[SET_ROWS];
-    const char *labels[SET_ROWS];
-    int i;
-
-    w_page_header("Settings");
-    snprintf(theme_v, sizeof theme_v, "%s", theme_names[g_cfg.theme_id]);
-    snprintf(layout_v, sizeof layout_v, "%s confirm / %s back (%s)",
-             key_confirm(), key_back(),
-             g_app.confirm_layout == 0 ? "US" : "JP");
-    labels[0] = "Theme";
-    labels[1] = "Confirm key";
-    labels[2] = "Hostname";
-    vals[0] = theme_v;
-    vals[1] = layout_v;
-    vals[2] = g_cfg.alias[0] ? g_cfg.alias : DEFAULT_ALIAS;
-    for (i = 0; i < SET_ROWS; i++) {
-        Rect r = { 24, 100 + i * 78, SCR_W - 48, 62 };
-        Rect rl = { r.x, r.y, r.w / 2, r.h };
-        Rect rr = { r.x + r.w / 2, r.y, r.w - r.w / 2, r.h };
-        w_add(i * 2, rl);          /* 左半 = 上一个/编辑 */
-        w_add(i * 2 + 1, rr);      /* 右半 = 下一个/编辑 */
-        w_row(r, labels[i], vals[i], i == g_app.set_sel);
+    switch (slot) {
+    case SET_SLOT_HOST:  return SET_ITEM_HOSTNAME;
+    case SET_SLOT_THEME: return SET_ITEM_THEME;
+    case SET_SLOT_LANG:  return SET_ITEM_LANG;
+    case SET_SLOT_KEY:   return SET_ITEM_KEY;
     }
-    w_text(28, 100 + SET_ROWS * 78 + 10, 1.0f, theme->text_dim,
-           "LEFT / tap left half: prev   RIGHT / tap right half: next");
-    HintSeg segs[6];
-    int ns = 0;
-    segs[ns].icon = HICON_DPAD;      segs[ns++].text = "Choose";
-    segs[ns].icon = icon_confirm();  segs[ns++].text = "Change";
-    segs[ns].icon = icon_back();     segs[ns++].text = "Back";
-    w_page_footer_segs(segs, ns);
+    return -1;
+}
 
-    /* 主机名编辑占位弹窗（文字输入方案未定，先壳子） */
-    if (host_pop) {
-        Rect card = w_modal_box(230);
-        w_text(card.x + 40, card.y + 28, 1.3f, theme->text, "Hostname");
-        w_text_clip(card.x + 40, card.y + 76, 1.0f, theme->text_dim,
-                    vals[2], card.w - 80);
-        w_text(card.x + 40, card.y + 124, 1.0f, theme->text_dim,
-               "This name is shown to other LocalSend devices.");
-        w_text(card.x + 40, card.y + 158, 1.0f, theme->text_dim,
-               "Editing needs text input - not available yet (TODO).");
+static int item_slot(int item)
+{
+    switch (item) {
+    case SET_ITEM_HOSTNAME: return SET_SLOT_HOST;
+    case SET_ITEM_THEME:    return SET_SLOT_THEME;
+    case SET_ITEM_LANG:     return SET_SLOT_LANG;
+    case SET_ITEM_KEY:      return SET_SLOT_KEY;
+    }
+    return -1;
+}
+
+static int set_row_h(int slot)
+{
+    if (slot == SET_SLOT_HINT)   return SET_HINT_H;
+    if (slot == SET_SLOT_ABOUT_A) return SET_LOGO_H;
+    if (slot == SET_SLOT_ABOUT_B) return SET_ADAPT_H;
+    return slot_item(slot) >= 0 ? SET_ROW_H : SET_HDR_H;
+}
+
+static int set_row_top(int slot)
+{
+    int y = 0, s;
+    for (s = 0; s < slot; s++) y += set_row_h(s);
+    return y;
+}
+
+static int set_content_h(void)
+{
+    int y = 0, s;
+    for (s = 0; s < SET_SLOT_N; s++) y += set_row_h(s);
+    return y;
+}
+
+static void set_clamp_scroll(void)
+{
+    int m = set_content_h() - LIST_VIEW_H;
+    if (m < 0) m = 0;
+    if (set_scroll < 0) set_scroll = 0;
+    if (set_scroll > m) set_scroll = m;
+}
+
+/* 从 slot 出发沿 dir 找下一个可选项行槽（跳过分组标题），越界原地不动 */
+static int slot_step(int slot, int dir)
+{
+    int s = slot;
+    for (;;) {
+        s += dir;
+        if (s < 0 || s >= SET_SLOT_N) return slot;
+        if (slot_item(s) >= 0) return s;
     }
 }
 
-/* 修改设置项并落盘：row=0 主题循环切换，row=1 键位布局翻转；dir=±1 */
-static void settings_change(int row, int dir)
+/* 方向键移动选中后保持整行可见（最小滚动量） */
+static void set_keep_visible(void)
 {
-    if (row == 0) {
+    int slot = item_slot(g_app.set_sel);
+    int top;
+    if (slot < 0) return;
+    top = set_row_top(slot);
+    if (top < set_scroll) set_scroll = top;
+    if (top + SET_ROW_H > set_scroll + LIST_VIEW_H)
+        set_scroll = top + SET_ROW_H - LIST_VIEW_H;
+    set_clamp_scroll();
+}
+
+/* 改设置项并落盘：主题/语言循环切换、键位翻转；dir=±1 上一档/下一档 */
+static void settings_change(int item, int dir)
+{
+    if (item == SET_ITEM_THEME) {
         g_app.theme_id += dir;
         if (g_app.theme_id < 0) g_app.theme_id = THEME_COUNT - 1;
         if (g_app.theme_id >= THEME_COUNT) g_app.theme_id = 0;
         g_cfg.theme_id = g_app.theme_id;
         theme_set(g_app.theme_id);
         config_save();
-    } else if (row == 1) {
+    } else if (item == SET_ITEM_LANG) {
+        int p = i18n_lang_pref() + dir;
+        if (p < I18N_LANG_AUTO) p = I18N_LANG_ZH;      /* 0↔1↔2 循环 */
+        if (p >= I18N_LANG_COUNT) p = I18N_LANG_AUTO;
+        i18n_set_lang(p);          /* 写 cfg + 存盘 + 重解析：立即生效 */
+    } else if (item == SET_ITEM_KEY) {
         g_app.confirm_layout = g_app.confirm_layout ? 0 : 1;
         g_cfg.confirm_layout = g_app.confirm_layout;
         config_save();
     }
-    /* row=2 主机名：无文字输入，改不了（见占位弹窗） */
+    /* SET_ITEM_HOSTNAME：改名需要文字输入，未实现（见占位弹窗） */
+}
+
+void page_settings_render(void)
+{
+    char theme_v[64], layout_v[96], lang_v[32];
+    int slot;
+
+    w_page_header(tr("Settings"));
+    set_clamp_scroll();
+    snprintf(theme_v, sizeof theme_v, "%s", theme_names[g_cfg.theme_id]);
+    snprintf(layout_v, sizeof layout_v, tr("%s confirm / %s back (%s)"),
+             key_confirm(), key_back(),
+             g_app.confirm_layout == 0 ? "US" : "JP");
+    snprintf(lang_v, sizeof lang_v, "%s", i18n_lang_name(i18n_lang_pref()));
+
+    vita2d_enable_clipping();
+    vita2d_set_clip_rectangle(0, LIST_TOP, SCR_W, LIST_BOTTOM);
+    for (slot = 0; slot < SET_SLOT_N; slot++) {
+        int item = slot_item(slot);
+        int top = LIST_TOP - set_scroll + set_row_top(slot);
+        int h = set_row_h(slot);
+        if (top + h <= LIST_TOP) continue;      /* 整行滚到可视区上方外 */
+        if (top >= LIST_BOTTOM) break;          /* 以下都滚到可视区下方外 */
+        if (item < 0) {
+            /* 分组标题 / 提示行 / 关于区（只读，不注册触摸） */
+            const char *txt = NULL;
+            switch (slot) {
+            case SET_SLOT_HDR_A: txt = tr("Device"); break;
+            case SET_SLOT_HDR_B: txt = tr("Display"); break;
+            case SET_SLOT_HDR_C: txt = tr("Controls"); break;
+            case SET_SLOT_HDR_D: txt = tr("About"); break;
+            default: break; /* 下方各自 case，绝不落到空绘制 */
+            }
+            if (txt)
+                w_text(28, top + 12, 1.05f, theme->text_dim, "%s", txt);
+            if (slot == SET_SLOT_HINT)
+                w_text(28, top + 6, 0.9f, theme->text_dim, "%s",
+                       tr("Tap row halves to change"));
+            if (slot == SET_SLOT_ABOUT_A) {
+                /* 文字 logo：PSVSend 主色大字 + 右侧版本号 */
+                int lw = 0, lh = 0;
+                w_text_w(1.3f, "PSVSend", &lw, &lh);
+                w_text(28, top + 16, 1.3f, theme->accent, "PSVSend");
+                w_text(28 + lw + 16, top + 20, 1.0f, theme->text_dim,
+                       "v" PSVSEND_APP_VERSION);
+            }
+            if (slot == SET_SLOT_ABOUT_B)
+                w_text(28, top + 12, 0.9f, theme->text_dim, "%s",
+                       tr("LocalSend client v1.15+ compatible (protocol v2.0)"));
+            continue;
+        }
+        Rect r = { 24, top, SCR_W - 48, SET_ROW_H - 4 };
+        w_add(item * 2,     (Rect){ r.x, r.y, r.w / 2, r.h });
+        w_add(item * 2 + 1, (Rect){ r.x + r.w / 2, r.y, r.w - r.w / 2, r.h });
+        switch (item) {
+        case SET_ITEM_HOSTNAME:
+            w_row(r, tr("Hostname"),
+                  g_cfg.alias[0] ? g_cfg.alias : DEFAULT_ALIAS,
+                  item == g_app.set_sel);
+            break;
+        case SET_ITEM_THEME:
+            w_row(r, tr("Theme"), theme_v, item == g_app.set_sel);
+            break;
+        case SET_ITEM_LANG:
+            w_row(r, tr("Language"), lang_v, item == g_app.set_sel);
+            break;
+        case SET_ITEM_KEY:
+            w_row(r, tr("Confirm key"), layout_v, item == g_app.set_sel);
+            break;
+        }
+    }
+    vita2d_disable_clipping();
+
+    /* 内容超长时的右侧细滚动条（后续设置项多了自动出现） */
+    {
+        int m = set_content_h() - LIST_VIEW_H;
+        if (m > 0) {
+            int bh = LIST_VIEW_H * LIST_VIEW_H / set_content_h();
+            if (bh < 24) bh = 24;
+            int by = LIST_TOP + (LIST_VIEW_H - bh) * set_scroll / m;
+            w_rect((Rect){ 936, LIST_TOP, 4, LIST_VIEW_H }, theme->card);
+            w_rect((Rect){ 936, by, 4, bh }, theme->text_dim);
+        }
+    }
+
+    HintSeg segs[6];
+    int ns = 0;
+    segs[ns].icon = HICON_DPAD;      segs[ns++].text = tr("Choose");
+    segs[ns].icon = icon_confirm();  segs[ns++].text = tr("Change");
+    segs[ns].icon = icon_back();     segs[ns++].text = tr("Back");
+    w_page_footer_segs(segs, ns);
+
+    /* 主机名编辑占位弹窗（文字输入方案未定，先壳子） */
+    if (host_pop) {
+        Rect card = w_modal_box(230);
+        w_text(card.x + 40, card.y + 28, 1.3f, theme->text, "%s", tr("Hostname"));
+        w_text_clip(card.x + 40, card.y + 76, 1.0f, theme->text_dim,
+                    g_cfg.alias[0] ? g_cfg.alias : DEFAULT_ALIAS, card.w - 80);
+        w_text(card.x + 40, card.y + 124, 1.0f, theme->text_dim, "%s",
+               tr("This name is shown to other LocalSend devices."));
+        w_text(card.x + 40, card.y + 158, 1.0f, theme->text_dim, "%s",
+               tr("Editing needs text input - not available yet (TODO)."));
+    }
 }
 
 void page_settings_input(const Input *in)
@@ -1342,21 +1574,38 @@ void page_settings_input(const Input *in)
             host_pop = false;
         return;
     }
-    if (in->drag_start || in->dragging) return;
+    if (in->drag_start || in->dragging) {
+        int m = set_content_h() - LIST_VIEW_H;
+        if (m < 0) m = 0;
+        if (in->drag_start) set_press_scroll = set_scroll;
+        int ns = set_press_scroll - in->drag_dy;
+        if (ns < 0) ns = 0;
+        if (ns > m) ns = m;
+        set_scroll = ns;
+        return;
+    }
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id >= 0) {
-            g_app.set_sel = id / 2;
-            if (g_app.set_sel == 2) host_pop = true;   /* 主机名行：占位弹窗 */
-            else settings_change(g_app.set_sel, (id & 1) ? 1 : -1);
+            int item = id / 2;
+            if (item >= 0 && item < SET_ITEM_N) {
+                g_app.set_sel = item;
+                if (item == SET_ITEM_HOSTNAME) host_pop = true;
+                else settings_change(item, (id & 1) ? 1 : -1);
+            }
         }
         return;
     }
-    if (in->up && g_app.set_sel > 0) g_app.set_sel--;
-    if (in->down && g_app.set_sel < SET_ROWS - 1) g_app.set_sel++;
+    if (in->up || in->down) {
+        int slot = item_slot(g_app.set_sel);
+        slot = slot_step(slot, in->down ? 1 : -1);
+        g_app.set_sel = slot_item(slot);
+        set_keep_visible();
+    }
     if (in->left || in->right || in->confirm) {
-        if (g_app.set_sel == 2) host_pop = true;
-        else settings_change(g_app.set_sel, in->left ? -1 : 1);
+        int item = g_app.set_sel;
+        if (item == SET_ITEM_HOSTNAME) host_pop = true;
+        else settings_change(item, in->left ? -1 : 1);
     }
     if (in->back) g_app.page = PAGE_DEVICES;
 }
@@ -1368,6 +1617,7 @@ static void open_recv_request(const RecvPending *rp)
     int i, n = rp->count;
     if (n > RECV_MAX_FILES) n = RECV_MAX_FILES;
     if (n > MAX_INF) n = MAX_INF;
+    g_app.recv_overflow = rp->overflow;
     snprintf(g_app.recv_alias, sizeof g_app.recv_alias, "%s", rp->peer_alias);
     snprintf(g_app.recv_type, sizeof g_app.recv_type, "%s",
              rp->peer_type[0] ? rp->peer_type : "unknown");

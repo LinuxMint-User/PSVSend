@@ -770,7 +770,7 @@ int xfer_start(const char *ip, int port, const char *proto, const char *fp,
 {
     int i;
     if (g_mtx < 0)
-        g_mtx = sceKernelCreateMutex("psvsend_xfer", 0, 1, NULL);
+        g_mtx = sceKernelCreateMutex("psvsend_xfer", 0, 0, NULL);
     lock();
     if (g_j.v.active) {
         snprintf(g_j.v.err, sizeof g_j.v.err, "transfer already active");

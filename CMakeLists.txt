@@ -10,7 +10,21 @@ set(VITASDK $ENV{VITASDK})
 include(${VITASDK}/share/vita.toolchain.cmake)
 include(${VITASDK}/share/vita.cmake)
 
-project(psvsend VERSION 0.1.0 LANGUAGES C)
+project(psvsend VERSION 2.0.0 LANGUAGES C)
+
+# SFO APP_VER（格式 xx.xx）由 project VERSION 派生（不足 10 补前导零），
+# 保证 APP_VER / 工程版本 只有 VERSION 一处手改，不会漂移。
+if(PROJECT_VERSION_MAJOR LESS 10)
+    set(_av_major "0${PROJECT_VERSION_MAJOR}")
+else()
+    set(_av_major "${PROJECT_VERSION_MAJOR}")
+endif()
+if(PROJECT_VERSION_MINOR LESS 10)
+    set(_av_minor "0${PROJECT_VERSION_MINOR}")
+else()
+    set(_av_minor "${PROJECT_VERSION_MINOR}")
+endif()
+set(APP_VER "${_av_major}.${_av_minor}")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -31,6 +45,7 @@ add_executable(${PROJECT_NAME}
     src/dlog.c
     src/discovery.c
     src/http.c
+    src/i18n.c
     src/identity.c
     src/json_util.c
     src/net.c
@@ -51,6 +66,7 @@ target_link_libraries(${PROJECT_NAME}
     SceGxm_stub SceIofilemgr_stub SceKernelThreadMgr_stub
     SceNet_stub SceNetCtl_stub
     ScePgf_stub ScePvf_stub SceSysmodule_stub SceTouch_stub
+    SceAppUtil_stub
 )
 
 vita_create_self(${PROJECT_NAME}.elf ${PROJECT_NAME})
@@ -64,7 +80,7 @@ set(_elf  ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.elf)
 add_custom_command(OUTPUT ${_vpk}
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys ${_pkgsce}
-  COMMAND ${VITA_MKSFOEX} -s TITLE_ID=${VITA_TITLEID} -s APP_VER=01.00
+  COMMAND ${VITA_MKSFOEX} -s TITLE_ID=${VITA_TITLEID} -s APP_VER=${APP_VER}
           ${VITA_TITLE} ${_sfo}
   COMMAND ${VITA_PACK_VPK} -s ${_sfo} -b ${_elf}
           -a ${_pkgsce}/icon0.png=sce_sys/icon0.png

@@ -24,7 +24,7 @@
 #define DISC_ADDR    "224.0.0.167"
 #define DISC_PORT    53317
 #define ANNOUNCE_MS  5000          /* 广播间隔 */
-#define STALE_MS     90000         /* 90s 没动静的设备移除（对方按 announce 周期回 register） */
+#define STALE_MS     30000          /* 30s 没动静的设备移除（对方按 announce 周期回 register，~5s 一轮） */
 
 typedef struct {
     Device   d;
@@ -92,6 +92,18 @@ static void table_purge(void)
     }
     g_count = w;
     if (g_mtx >= 0) sceKernelUnlockMutex(g_mtx, 1);
+}
+
+/* 公开：整表清空。手动扫描前 / 链路断开时调用，避免界面残留已离线的"幽灵"设备。
+ * 之后 announce/register/扫描会把真实在线的设备快速重新填回来。 */
+void discovery_clear(void)
+{
+    int n;
+    if (g_mtx >= 0) sceKernelLockMutex(g_mtx, 1, NULL);
+    n = g_count;
+    g_count = 0;
+    if (g_mtx >= 0) sceKernelUnlockMutex(g_mtx, 1);
+    if (n > 0) dlog("disc: table cleared (%d entries)", n);
 }
 
 /* 公开：http 服务器收到对方 register POST 时把对方记入设备表 */
@@ -218,7 +230,33 @@ static int send_announce_dnet(void)
 static int ann_ticks = 0;
 static bool ann_first = true;
 static int g_err = 1, b_err = 1, d_err = 1;
+static volatile int g_tx_dirty = 0;   /* 链路事件：下一 tick 重建发送 socket */
+static int ever_ok = 0;               /* 本会话广播/定向广播曾成功过 */
+static uint64_t last_rc_ms = 0;       /* 上次自动回收发送 socket 的时刻（冷却） */
 static int disc_open_tx(void);
+
+#define D_AGAIN(r) ((r) == 0x80410123)
+
+/* 链路事件（断网/恢复/IP 变化，api 看门狗线程调用）：标记发送 socket 待重建。
+ * 真正的关闭/重开放在 UI 主线程的 announce 节奏里做（Vita 的 UDP socket
+ * 创建/使用都必须在主线程），这里只置标志，最迟下个 tick 生效。 */
+void disc_link_changed(void)
+{
+    g_tx_dirty = 1;
+}
+
+/* 主线程内：立即回收发送 socket 并安排下轮重发（重置错误/首轮日志状态） */
+static void recycle_tx_now(void)
+{
+    g_tx_dirty = 0;
+    if (g_tx_sock >= 0) {
+        sceNetSocketClose(g_tx_sock);
+        g_tx_sock = -1;
+    }
+    g_err = b_err = d_err = 1;      /* 重建后如实记录新的失败码 */
+    ann_first = true;               /* 重建后再打一条 first announce 便于核对 */
+    ann_ticks = 9;                  /* 下一 tick 立刻补发一轮 */
+}
 
 void disc_tick_announce(void)
 {
@@ -229,6 +267,19 @@ void disc_tick_announce(void)
             dlog("disc: tick gated (state=%d run=%d)", g_state, g_run);
         return;
     }
+    if (!net_connected()) {         /* Wi-Fi 断开：不盲发，恢复后自动继续 */
+        static int ng = 0;
+        if ((++ng % 20) == 0)
+            dlog("disc: tick no-wifi (ctl_st=%d)", net_ctl_state());
+        return;
+    }
+
+    if (g_tx_dirty) {               /* 链路变了：回收旧 socket，下轮重建重发 */
+        int was = g_tx_sock >= 0;
+        recycle_tx_now();
+        if (was) dlog("disc: tx recycled after link change");
+    }
+
     if (++ann_ticks < 10) return;
     ann_ticks = 0;
 
@@ -246,6 +297,19 @@ void disc_tick_announce(void)
         if (g < 0 && g != g_err) { g_err = g; dlog("disc: group send err 0x%08X", (unsigned)g); }
         if (b < 0 && b != b_err) { b_err = b; dlog("disc: bcast send err 0x%08X", (unsigned)b); }
         if (d < 0 && d != d_err) { d_err = d; dlog("disc: dnet send err 0x%08X", (unsigned)d); }
+        if (b >= 0 || d >= 0) ever_ok = 1;
+
+        /* 自愈：曾成功过、现在 Wi-Fi 连着却连广播/定向广播都报硬错 → 多半是
+         * 待机/唤醒后发送 socket 已失效，回收让下轮用新 socket 重发（30s 冷却） */
+        if (ever_ok && b < 0 && d < 0 && !D_AGAIN(b) && !D_AGAIN(d)) {
+            uint64_t t = now_ms();
+            if (t - last_rc_ms > 30000) {
+                last_rc_ms = t;
+                recycle_tx_now();
+                dlog("disc: bcast=%d dnet=%d both hard-fail -> auto recycle tx",
+                     b, d);
+            }
+        }
         table_purge();
     }
 }
@@ -253,10 +317,14 @@ void disc_tick_announce(void)
 /* ---------- 发送 socket ----------
  * 真机坑：Vita SceNet 的 UDP sendto 从非主线程调用会无限卡死（无论 socket 归属），
  * 只有 UI 主循环能稳定发。因此 announce 节奏由 UI 调 api_tick 驱动（见 api.c），
- * 发送 socket 也在此路径上懒创建，保证"创建与使用都在主线程"。 */
+ * 发送 socket 也在此路径上懒创建，保证"创建与使用都在主线程"。
+ * socket 置非阻塞（SCE_NET_SO_NBIO）：Wi-Fi 刚恢复、接口还没完全就绪的模糊窗口
+ * 里 sendto 可能长时间等待路由可用——若阻塞会钉死主线程（UI 定格、三角/announce
+ * 全失效，重进才恢复）。announce 是尽力而为的周期包，发不出去跳过本轮即可，
+ * 绝不能阻塞 UI。 */
 static int disc_open_tx(void)
 {
-    int so_bcast = 1;
+    int so_bcast = 1, so_nbio = 1;
     int sock = sceNetSocket("psvsend_disc_tx", SCE_NET_AF_INET,
                             SCE_NET_SOCK_DGRAM, SCE_NET_IPPROTO_UDP);
     if (sock < 0) {
@@ -265,6 +333,8 @@ static int disc_open_tx(void)
     }
     sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_BROADCAST,
                      &so_bcast, sizeof so_bcast);
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
+                     &so_nbio, sizeof so_nbio);
     /* 组播出口网卡 + TTL：不选网卡时部分协议栈默认不发/乱发组播 */
     {
         unsigned int ip4 = 0;
@@ -295,8 +365,11 @@ int discovery_start(void)
     g_state = 0;
     g_run = 0;
 
-    if (g_mtx < 0)  g_mtx  = sceKernelCreateMutex("psvsend_disc_tbl", 0, 1, NULL);
-    if (g_send_mtx < 0) g_send_mtx = sceKernelCreateMutex("psvsend_disc_snd", 0, 1, NULL);
+    /* initCount 必须为 0（Vita 内核下 =1 会以"已由创建线程持有"出生；本函数
+     * 常在 watch 线程补跑，创建者不会去 unlock，首把由别的线程（UI dev_sync）
+     * 取锁会永久阻塞 → 界面冻结。恢复后由 UI/scan/http 各线程正常 lock/unlock。） */
+    if (g_mtx < 0)  g_mtx  = sceKernelCreateMutex("psvsend_disc_tbl", 0, 0, NULL);
+    if (g_send_mtx < 0) g_send_mtx = sceKernelCreateMutex("psvsend_disc_snd", 0, 0, NULL);
 
     /* 发送 socket 不在这里建——由 UI 主循环的 announce 节奏懒创建（线程亲缘，见上） */
 

@@ -4,6 +4,8 @@
 
 > 本项目是独立开发的自制软件，仅兼容 LocalSend 的开放协议（v2），与 LocalSend 品牌及其项目无任何关联。
 
+> 当前版本 **v2.0.0**（LocalSend 协议 v2，适配官方客户端 v1.15+）；设置页底部「关于」可查看版本与适配信息。
+
 ## 当前状态
 
 - [x] VitaSDK 交叉编译环境 + vita2d 渲染骨架 + VPK 打包（含 LiveArea 素材）
@@ -12,6 +14,8 @@
 - [x] TLS 加密传输（mbedTLS 3.6.5，含 mTLS 客户端身份）
 - [x] 文件接收（手机 / PC → PSV）：prepare-upload 弹确认 → upload 流式写盘，兼容无 Content-Length 的 chunked 上传
 - [x] 主动扫描：Vita 收不了 UDP 组播，改向局域网 /24 各 IP 主动 HTTP 探测补全设备表
+- [x] 网络稳定性：待机唤醒 / Wi-Fi 断开恢复后自动恢复发现（watch 看门狗 + 低频 netctl 轮询，v2.0.0）
+- [x] 渲染稳定性：修复偶发 GPU render crash（界面撕裂后崩溃）——每帧等待 GPU 渲染完成（v2.0.0）
 
 ## 构建
 

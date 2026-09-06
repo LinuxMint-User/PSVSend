@@ -28,6 +28,10 @@ void api_start(void);
 
 /* UI 主循环每帧调用：500ms 节流喂 announce 节奏。必须跑在主线程。 */
 void api_tick(void);
+/* UI 主循环每帧在 swap 之后调用：断网时每 4s 发一包 UDP"活性刺激"唤醒
+ * 待机省电断开的 Wi-Fi（sendto 只可靠在主线程；Wi-Fi 重连时可能阻塞数秒，
+ * 故放在一帧渲染完之后）。必须跑在主线程。 */
+void api_poke(void);
 
 /* 拷贝设备快照到 out（最多 max 台），返回当前设备数（快照锁内完成） */
 int api_device_snapshot(Device *out, int max);

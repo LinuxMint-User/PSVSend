@@ -20,6 +20,12 @@
 int http_start(void);
 /* 当前绑定的端口（未启动返回 0） */
 int http_port(void);
+/* 探活：监听 socket 与 accept 线程是否还健康（0=已死，需 http_restart 重建） */
+int http_alive(void);
+/* 停服务器（关监听、等 accept 线程退出）；唤醒/链路变化后用 */
+void http_stop(void);
+/* 停掉再按候选端口重绑（http_stop + http_start） */
+int http_restart(void);
 /* register POST 到达时的回调（body=对方 JSON，src_ip=对方来源 IP） */
 void http_set_register_cb(void (*cb)(const char *body, const char *src_ip));
 

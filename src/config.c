@@ -8,7 +8,7 @@
 #include "config.h"
 #include "json_util.h"
 
-Config g_cfg = { DEFAULT_ALIAS, "", DEFAULT_PORT, 0, 0 };
+Config g_cfg = { DEFAULT_ALIAS, "", DEFAULT_PORT, 0, 0, 0 };
 
 static void ensure_dir(const char *path)
 {
@@ -33,6 +33,7 @@ static void cfg_defaults(void)
     g_cfg.port = DEFAULT_PORT;
     g_cfg.theme_id = 0;
     g_cfg.confirm_layout = 0;
+    g_cfg.lang = 0;                    /* 语言偏好默认跟随系统 */
 }
 
 void config_init(void)
@@ -57,6 +58,7 @@ void config_init(void)
             if (json_get_int(buf, "port", &v)) g_cfg.port = (int)v;
             if (json_get_int(buf, "theme", &v)) g_cfg.theme_id = (int)v;
             if (json_get_int(buf, "confirmLayout", &v)) g_cfg.confirm_layout = (int)v;
+            if (json_get_int(buf, "lang", &v)) g_cfg.lang = (int)v;
         }
     }
 
@@ -80,9 +82,11 @@ void config_save(void)
                    "  \"fingerprint\": \"%s\",\n"
                    "  \"port\": %d,\n"
                    "  \"theme\": %d,\n"
-                   "  \"confirmLayout\": %d\n"
+                   "  \"confirmLayout\": %d,\n"
+                   "  \"lang\": %d\n"
                    "}\n",
-                   a, f, g_cfg.port, g_cfg.theme_id, g_cfg.confirm_layout);
+                   a, f, g_cfg.port, g_cfg.theme_id, g_cfg.confirm_layout,
+                   g_cfg.lang);
     if (len < 0 || len >= (int)sizeof out) return;
     SceUID fd = sceIoOpen(PSVSEND_CONFIG, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC,
                           0777);

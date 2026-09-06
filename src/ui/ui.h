@@ -70,7 +70,7 @@ typedef struct {
     SceOff size;
 } PickedFile;
 
-#define MAX_INF 32
+#define MAX_INF 64
 typedef struct {
     char  name[128];    /* 原始文件名 */
     char  rname[128];   /* 接收时的保存名（重命名功能 TODO，尚未实现） */
@@ -135,6 +135,7 @@ typedef struct {
     int     inc_sel;       /* 接收设置页焦点：0=目录行，1..=文件行 */
     char    recv_dir[64];  /* 本次保存目录（暂固定默认值；目录选择 TODO） */
     bool    recv_cancel;   /* 发送方已取消请求 */
+    int     recv_overflow; /* 发送方文件数超出上限被丢弃的个数（确认页提示） */
 
     /* 设置 */
     int     theme_id;      /* 0=Yaru 1=OLED */

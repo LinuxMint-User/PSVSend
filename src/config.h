@@ -11,12 +11,18 @@
 #define DEFAULT_ALIAS     "PS Vita"
 #define DEFAULT_PORT      53317
 
+/* 客户端发布版本（运行时显示 / 设置页"关于"）。
+ * 与 CMakeLists.txt 的 project(VERSION 2.0.0) 保持一致——升级版本号时
+ * 两处一起改，SFO APP_VER 由 CMake 从 VERSION 派生，无需手改。 */
+#define PSVSEND_APP_VERSION "2.0.0"
+
 typedef struct {
     char alias[64];          /* 设备名，广播给其他 LocalSend 设备 */
     char fingerprint[64];    /* 随机身份串：防自发现；首次生成后持久化 */
     int  port;               /* HTTP 服务端口（默认 53317，与协议一致） */
     int  theme_id;           /* 0=Yaru 1=OLED */
     int  confirm_layout;     /* 0=美式 1=日式 */
+    int  lang;               /* 界面语言偏好：0=跟随系统 1=English 2=中文 */
 } Config;
 
 extern Config g_cfg;

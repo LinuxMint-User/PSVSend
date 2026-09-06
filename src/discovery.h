@@ -18,6 +18,8 @@ int discovery_snapshot(Device *out, int max);
 int discovery_device_count(void);
 /* 1=运行 0=未启动 <0=启动失败码 */
 int discovery_state(void);
+/* 整表清空（手动扫描前/链路断开时，清除已离线的残留条目） */
+void discovery_clear(void);
 /* 失败定位：最近一次启动失败发生在哪一步（"step 0x.."，无失败返回 ""） */
 const char *discovery_fail_step(void);
 /* http 服务器回调：收到对方 register POST（body=对方 JSON, src_ip=来源 IP） */
@@ -26,4 +28,6 @@ void discovery_peer_registered(const char *body, const char *src_ip);
 void discovery_upsert_peer(const Device *dev);
 
 void disc_tick_announce(void);          /* 看门狗每 500ms 调：内部按 5s 节奏发 announce */
+/* 链路事件（断网/恢复/IP 变化，api 看门狗调用）：标记重建 announce 发送 socket */
+void disc_link_changed(void);
 #endif

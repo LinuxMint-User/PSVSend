@@ -14,14 +14,15 @@
 #include <stdint.h>
 #include <psp2/types.h>
 
-#define RECV_MAX_FILES 32       /* 单次接收会话文件数上限 */
+#define RECV_MAX_FILES 64       /* 单次接收会话文件数上限（超出的在确认页明示丢弃） */
 
 /* UI：待确认请求快照（recv_pending_pull 锁内拷贝） */
 typedef struct {
     char peer_alias[64];
     char peer_type[24];
     char peer_ip[16];
-    int  count;
+    int  count;                  /* 列入清单的文件数（≤ RECV_MAX_FILES） */
+    int  overflow;               /* 发送方实际文件数超过上限、被丢弃的个数 */
     struct { char name[192]; SceOff size; } files[RECV_MAX_FILES];
     SceOff total;
 } RecvPending;

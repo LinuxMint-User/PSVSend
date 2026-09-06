@@ -17,16 +17,18 @@
 #include "dlog.h"
 
 #define HTTP_RECV_TIMEOUT_S 3
-#define HTTP_MAX_REQ        16384
+#define HTTP_MAX_REQ        32768   /* 请求头+体总读入上限（64 文件 prepare 清单可能 ~20KB） */
 #define HTTP_MAX_BODY       2048    /* register 体上限 */
-#define HTTP_MAX_PREPARE    8192    /* prepare-upload 体上限（清单 JSON） */
+#define HTTP_MAX_PREPARE    32768   /* prepare-upload 体/回执上限（清单 JSON，64 文件会话） */
 #define UPLOAD_IDLE_US      (30 * 1000000LL)  /* 收体时单块读的空闲上限 */
 #define NET_AGAIN(r) ((r) == 0x80410123)
 #define NET_RETRY_DELAY_US 20000    /* 20ms 轮询间隔 */
 
 static int    g_port = 0;           /* 实际绑定端口（0=未启动） */
 static int    g_lsock = -1;
+static SceUID g_thr = -1;           /* accept 线程（http_stop 要等它退） */
 static volatile int g_run = 0;
+static volatile int g_gen = 0;      /* 服务器代次：stop/start 递增，旧线程据此收手 */
 static void (*g_cb)(const char *body, const char *src_ip) = NULL;
 
 /* ---------- 收/发工具 ---------- */
@@ -522,20 +524,42 @@ static void handle_conn(int c, const char *rip)
     http_respond(c, 404, "Not Found", "{\"error\":\"not found\"}");
 }
 
-/* ---------- accept 线程 ---------- */
+/* ---------- accept 线程 ----------
+ * 注意：g_lsock/g_run/g_gen 都是全局。线程在入口快照自己的监听 fd 与代次：
+ *  http_stop 会关旧 fd、g_run=0、g_gen++，唤醒卡在 accept 的本线程退出；
+ *  即便 fd 号被后续 http_start 复用，旧线程因代次不符也不会再去 accept，
+ *  避免"新旧两线程抢同一监听 fd"。 */
 static int http_thr(SceSize args, void *argp)
 {
+    int my_gen = g_gen;
+    int ls = g_lsock;
+    int errs = 0;
     (void)args; (void)argp;
-    while (g_run) {
+    dlog("http: accept thread gen %d on :%d", my_gen, g_port);
+    while (g_run && g_gen == my_gen) {
         SceNetSockaddrIn cli;
         unsigned int clen = sizeof cli;
         char ip[16] = "";
-        int c = sceNetAccept(g_lsock, (SceNetSockaddr *)&cli, &clen);
+        int c = sceNetAccept(ls, (SceNetSockaddr *)&cli, &clen);
         if (c < 0) {
-            if (!g_run) break;
+            if (!g_run || g_gen != my_gen) break;      /* 停机/换代：收手 */
+            if (c == 0x80410123) {                     /* 空闲空转（非阻塞 accept） */
+                sceKernelDelayThread(50000);
+                continue;
+            }
+            errs++;
+            if (errs == 1 || (errs % 100) == 0)
+                dlog("http: accept err x%d -> 0x%08X (gen %d)", errs,
+                     (unsigned)c, my_gen);
+            if (errs > 300) {   /* 持续 ~15s 报错：监听 socket 已死，自退交看门狗重启 */
+                dlog("http: accept err x%d -> listener dead, self stop (gen %d)",
+                     errs, my_gen);
+                break;
+            }
             sceKernelDelayThread(50000);
             continue;
         }
+        errs = 0;
         if (sceNetInetNtop(SCE_NET_AF_INET, &cli.sin_addr.s_addr,
                            ip, sizeof ip) == NULL)
             snprintf(ip, sizeof ip, "?");
@@ -543,6 +567,7 @@ static int http_thr(SceSize args, void *argp)
         handle_conn(c, ip);
         sceNetSocketClose(c);
     }
+    dlog("http: accept thread gen %d exit", my_gen);
     return 0;
 }
 
@@ -587,11 +612,21 @@ int http_start(void)
     g_lsock = s;
     g_port = chosen > 0 ? chosen : 0;
     g_run = 1;
+    g_gen++;                              /* 新代次：旧代线程（若有）不再碰新监听 */
     {
         SceUID t = sceKernelCreateThread("psvsend_http", http_thr,
-                                         0x40, 0x10000, 0, 0, NULL);
+                                         0x40, 0x40000, 0, 0, NULL);
         dlog("http: thread create -> 0x%08X", (unsigned)t);
-        if (t >= 0) {
+        if (t < 0) {
+            dlog("http: thread create FAILED -> tear down listener");
+            sceNetSocketClose(s);
+            g_lsock = -1;
+            g_port = 0;
+            g_run = 0;
+            return -3;
+        }
+        g_thr = t;
+        {
             int sr = sceKernelStartThread(t, 0, NULL);
             dlog("http: thread start -> 0x%08X", (unsigned)sr);
         }
@@ -603,6 +638,54 @@ int http_start(void)
 int http_port(void)
 {
     return g_port;
+}
+
+/* 探活：监听 socket 还在、accept 线程还活着？0 表示服务已死需要重启。
+ * 用超时 0 的 WaitThreadEnd 探测线程是否已退出（不自占线程状态：已退出时
+ * 后续 http_stop 的 WaitThreadEnd 会立即返回 0，无副作用）。 */
+int http_alive(void)
+{
+    if (g_port <= 0 || g_thr < 0) return 0;
+    {
+        SceUInt to = 0;
+        int st = sceKernelWaitThreadEnd(g_thr, NULL, &to);
+        if (st == 0) {                     /* 线程已退出（自尽/异常） */
+            dlog("http: accept thread exited unexpectedly");
+            g_thr = -1;
+            return 0;
+        }
+    }
+    return 1;                              /* 仍在跑（st 为超时/其他错误码） */
+}
+
+/* 停服务器：置停跑标志、换代、关监听 socket 让 accept 立刻出错退出，等线程结束。
+ * 等不到（异常，如正卡在慢连接收尾）也把句柄丢掉并换代；旧线程回到循环头时
+ * 因代次不符会自行退出，不会碰新启动的监听。 */
+void http_stop(void)
+{
+    if (g_port <= 0 && g_thr < 0) return;
+    dlog("http: stop (was :%d)", g_port);
+    g_run = 0;
+    g_gen++;
+    if (g_lsock >= 0) {
+        sceNetSocketClose(g_lsock);
+        g_lsock = -1;
+    }
+    if (g_thr >= 0) {
+        SceUInt to = 500 * 1000;      /* 最多等 500ms（收体中关 fd 会立刻返回） */
+        int st = sceKernelWaitThreadEnd(g_thr, NULL, &to);
+        if (st < 0)
+            dlog("http: wait thread end -> 0x%08X", (unsigned)st);
+        g_thr = -1;
+    }
+    g_port = 0;
+}
+
+/* 整机重绑（唤醒/链路变化后用）：停旧监听，再走一遍候选端口 */
+int http_restart(void)
+{
+    http_stop();
+    return http_start();
 }
 
 void http_set_register_cb(void (*cb)(const char *body, const char *src_ip))
