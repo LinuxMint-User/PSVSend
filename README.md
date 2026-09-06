@@ -4,7 +4,7 @@
 
 > 本项目是独立开发的自制软件，仅兼容 LocalSend 的开放协议（v2），与 LocalSend 品牌及其项目无任何关联。
 
-> 当前版本 **v2.0.0**（LocalSend 协议 v2，适配官方客户端 v1.15+）；设置页底部「关于」可查看版本与适配信息。
+> 当前版本 **v2.0.0**（LocalSend 协议 v2，适配官方客户端 v1.15+）；设置页底部「关于」可查看版本与适配信息。正式版 VPK 由 GitHub Actions 自动构建并发布到 [Releases](https://github.com/LinuxMint-User/PSVSend/releases)（草稿确认后公开），无需本地自行编译。
 
 ## 当前状态
 
@@ -16,6 +16,7 @@
 - [x] 主动扫描：Vita 收不了 UDP 组播，改向局域网 /24 各 IP 主动 HTTP 探测补全设备表
 - [x] 网络稳定性：待机唤醒 / Wi-Fi 断开恢复后自动恢复发现（watch 看门狗 + 低频 netctl 轮询，v2.0.0）
 - [x] 渲染稳定性：修复偶发 GPU render crash（界面撕裂后崩溃）——每帧等待 GPU 渲染完成（v2.0.0）
+- [x] 中 / 英双语界面（设置页可切换）与设置页底部「关于」区（版本 + 适配 LocalSend 说明，v2.0.0）
 
 ## 构建
 
@@ -44,11 +45,13 @@ mv ~/vitasdk <项目根目录>/vitasdk
 
 ### 2. 安装依赖库
 
-本项目依赖 libvita2d、freetype、libpng、libjpeg、zlib 等库，用工具链自带的 vdpm 包管理器安装（`tools/vdpm` 是 vdpm 的本地克隆）：
+本项目链接的库：mbedTLS、libvita2d、freetype、bzip2、libpng、libjpeg(-turbo)、zlib（清单见 `CMakeLists.txt` 的 `target_link_libraries`）。用 vdpm 包管理器安装（`tools/vdpm` 是 vdpm 的本地克隆）——**注意 vdpm 包名与库文件名不同**：vita2d 的包名是 `libvita2d`，jpeg 的包名是 `libjpeg-turbo`：
 
 ```bash
-vdpm vita2d freetype libpng libjpeg zlib
+vdpm libvita2d mbedtls freetype bzip2 libpng libjpeg-turbo zlib
 ```
+
+（官方预编译包已内置这些库；重复执行 vdpm 会检测到已装版本并跳过。）
 
 ### 3. 编译打包
 
@@ -65,6 +68,8 @@ cmake --build build
 ```
 
 产物：`build/psvsend.vpk`
+
+> 不想本地构建？仓库已配置 GitHub Actions（[`.github/workflows/build-vpk.yml`](.github/workflows/build-vpk.yml)），在官方 vitasdk Docker 镜像内自动构建：推送 `v*` tag 或在 Actions 页手动触发，VPK 会上传为 **Releases 草稿**（人工确认后公开）。直接到 [Releases](https://github.com/LinuxMint-User/PSVSend/releases) 下载即可。
 
 ## 安装
 
@@ -140,12 +145,13 @@ cmake --build build
 | `sce_sys/` | LiveArea 素材（图标 / 背景 / 启动图） |
 | `fonts/` | 界面内嵌字体：Droid Sans（拉丁）+ Droid Sans Fallback Full（CJK），均来自 AOSP（Apache-2.0），编译时打进 VPK `app0:/fonts/` |
 | `docs/localsend-protocol/` | LocalSend 协议参考文档 |
+| `.github/workflows/` | GitHub Actions：自动构建 VPK 并发布 Releases 草稿 |
 
 **本地安装（不随仓库分发）：**
 
 | 路径 | 来源 | 用途 |
 |------|------|------|
-| `tools/` | 克隆自 [vitasdk/samples](https://github.com/vitasdk/samples) 与 [vitasdk/vdpm](https://github.com/vitasdk/vdpm) | 官方示例与包管理器（本地参考） |
+| `tools/` | 克隆自 [vitasdk/samples](https://github.com/vitasdk/samples) / [vitasdk/vdpm](https://github.com/vitasdk/vdpm) / [xyzz/vita-parse-core](https://github.com/xyzz/vita-parse-core) | 官方示例、vdpm 包管理器与 PSVita 核心转储解析工具（本地参考） |
 | `vitasdk/` | 获取自 [vitasdk.org](https://vitasdk.org)（安装步骤见构建章节） | 交叉编译工具链 |
 
 克隆仓库后本地只有"随仓库分发"的部分；按构建章节安装工具链和依赖库后，完整的本地目录布局如下：
@@ -158,6 +164,7 @@ cmake --build build
 ├── .gitignore                  # 随仓库分发
 ├── env.sh                      # 随仓库分发
 ├── build.sh                    # 随仓库分发：一键构建脚本
+├── .github/workflows/          # 随仓库分发：CI 构建 + Release 草稿发布
 ├── src/                        # 随仓库分发：源码
 │   ├── main.c                  # 入口
 │   ├── api.c                   # 前后端契约：启动 / 网络巡检 / 设备快照
@@ -168,16 +175,17 @@ cmake --build build
 │   ├── receive.c               # 接收会话：确认/拒绝、流式写盘 downloads/、断流清理
 │   ├── scan.c                  # 主动扫描：向 /24 网段逐 IP HTTP 探测补全设备表
 │   ├── identity.c / id_cert.inc / id_key.inc  # 内嵌设备身份证书（HTTPS mTLS）
-│   ├── config.c / json_util.c / dlog.c
+│   ├── config.c / i18n.c / json_util.c / dlog.c
 │   └── ui/                     # vita2d 界面（设备列表 / 文件浏览 / 进度）
 ├── sce_sys/                    # 随仓库分发：LiveArea 素材
 │   ├── icon0.png
 │   └── livearea/contents/
 ├── docs/                       # 随仓库分发：协议参考文档
 │   └── localsend-protocol/
-├── tools/                      # 本地克隆：官方示例与 vdpm
+├── tools/                      # 本地克隆：官方示例 / vdpm / vita-parse-core
 │   ├── samples/
-│   └── vdpm/
+│   ├── vdpm/
+│   └── vita-parse-core/        # PSVita 核心转储解析工具（崩溃分析用）
 └── vitasdk/                    # 本地安装：工具链 + 依赖库
     ├── bin/
     ├── arm-vita-eabi/

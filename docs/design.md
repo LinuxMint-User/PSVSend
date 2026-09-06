@@ -15,6 +15,8 @@
 - 实现边界的完整清单（单会话 409、清单 32 文件/8KB、超时 60s/120s/30s 三档、接收仅明文 HTTP、单线程顺序处理连接、/24 扫描范围等）见 README「边界与已知限制」。
 - **已落地（稳定性，v2.0.0）**：修复待机唤醒 / Wi-Fi 断开恢复后卡「网络未就绪 / 没扫到设备」——watch 看门狗单线程低频轮询 netctl + 全互斥 `initCount=0` 语义修正（发现/扫描/收发/net 各互斥均改为无人先持锁），恢复后 UI 心跳自动续上；另曾用 6s 模拟断网窗口复现，现该调试开关已置 0（net.c `PSVSEND_SIM_DOWN_MS`，需要时 cmake 覆盖）。
 - **已落地（渲染稳定，v2.0.0）**：修复偶发 **GPU render crash**（先兆为界面「三角形空白撕裂」→ 系统判 render gpu crash 重启）。根因：主循环缺 `vita2d_wait_rendering_done()`，每帧 swap 后 GPU 队列无收敛点，渲染/显示队列超前回绕导致撕裂与驱动状态错乱；修复：每帧 swap 后等待渲染完成（ui_main.c）。字体对象另改为启动帧外预载（`font_preload_all`），堵住"渲染中途创建 GPU 纹理"的隐患（非本次根因，作加固保留）。
+- **已落地（界面，v2.0.0）**：中 / 英双语界面（设置页切换，`i18n.c/h`）+ 设置页底部「关于」区（PSVSend 大字 logo、应用版本与 LocalSend 适配说明）。版本号单源维护：手改 `CMakeLists.txt` 的 `project(VERSION)` 与 `config.h` 的 `PSVSEND_APP_VERSION`，SFO `APP_VER` 由 VERSION 自动派生。
+- **已落地（工程，v2.0.0 后）**：GitHub Actions（`.github/workflows/build-vpk.yml`）在官方 vitasdk 2026.08 Docker 镜像内自动构建 VPK：推送 `v*` tag 或 Actions 页手动触发 → 生成 **Releases 草稿**（人工确认后公开）。注意本地与 CI 产物 `eboot.bin` 存在字节差异（本地链接 vdpm prebuilt 静态库，CI 链接镜像内现场编译的同源库），功能等价（真机验证通过）；需字节级可复现则须统一在容器内构建。
 - **未落地**：与 §4/§5 目标架构的规划差项（session.c 拆分、multipart 收件、接收设置页改名/选目录等）仍在路线中；中文字体已落地（见 §5.5），不再在列。
 - 本文按"目标架构"描述，部分命名与实际源码不同（如目标 `http_server.c` / `http_client.c` 实际为 `http.c` / `transfer.c`）；现状与源码布局以 README「目录结构」为准。
 
