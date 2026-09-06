@@ -96,4 +96,4 @@ jobs:
             --target "$GITHUB_SHA" \
             --generate-notes \
             --title "PSVSend v${{ needs.build.outputs.ver }}" \
-            --notes "## PSVSend v${{ needs.build.outputs.ver }}\n\n让 PS Vita 加入 LocalSend 生态的局域网文件传输客户端。\n\n### 功能特性\n- 与手机 / 电脑 / 平板上的 LocalSend 客户端（v1.15+）自动互相发现，双向收发文件\n- HTTP / HTTPS 加密传输（mTLS 设备证书）\n- 中 / 英双语界面\n- IPv4 局域网，支持按网段扫描补全设备发现\n\n### 安装\n将 psvsend.vpk 复制到 Vita，用 VitaShell 安装（需自制系统）。\n\n### 测试环境\n- 变革（HENkaku）3.65 自制系统\n- 其余固件 / 破解环境未逐一验证，如遇问题欢迎提 issue 反馈\n\n### 项目主页\nhttps://github.com/LinuxMint-User/PSVSend\n\n确认内容无误后点击 Publish 对外发布。"
+            --notes $'## PSVSend v${{ needs.build.outputs.ver }}\n\n让 PS Vita 加入 LocalSend 生态的局域网文件传输客户端。\n\n### 功能特性\n- 与手机 / 电脑 / 平板上的 LocalSend 客户端（v1.15+）自动互相发现，双向收发文件\n- HTTP / HTTPS 加密传输（mTLS 设备证书）\n- 中 / 英双语界面\n- IPv4 局域网，支持按网段扫描补全设备发现\n\n### 安装\n将 psvsend.vpk 复制到 Vita，用 VitaShell 安装（需自制系统）。\n\n### 测试环境\n- 变革（HENkaku）3.65 自制系统\n- 其余固件 / 破解环境未逐一验证，如遇问题欢迎提 issue 反馈\n\n### 项目主页\nhttps://github.com/LinuxMint-User/PSVSend'
