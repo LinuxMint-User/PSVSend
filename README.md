@@ -68,6 +68,8 @@ cmake --build build
 
 ## 安装
 
+> 开发与真机测试环境：**变革（HENkaku）3.65** 自制系统。其余固件 / 破解环境（3.60、3.68、3.73 等）未逐一验证，如遇问题欢迎提 issue 反馈（附固件与破解版本信息）。
+
 1. 将 `psvsend.vpk` 拷贝到已破解 PS Vita 的 `ux0:data/`
 2. 使用 VitaShell 打开并安装
 3. 桌面出现 PSVSend 气泡
