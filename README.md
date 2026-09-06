@@ -144,7 +144,7 @@ cmake --build build
 | `src/` | 源码（含发送客户端与内嵌设备身份证书） |
 | `sce_sys/` | LiveArea 素材（图标 / 背景 / 启动图） |
 | `fonts/` | 界面内嵌字体：Droid Sans（拉丁）+ Droid Sans Fallback Full（CJK），均来自 AOSP（Apache-2.0），编译时打进 VPK `app0:/fonts/` |
-| `docs/localsend-protocol/` | LocalSend 协议参考文档 |
+| `docs/localsend-protocol/` | LocalSend 官方协议文档副本（互操作参考，来源与权利声明见 `ATTRIBUTION.md`） |
 | `.github/workflows/` | GitHub Actions：自动构建 VPK 并发布 Releases 草稿 |
 
 **本地安装（不随仓库分发）：**
@@ -180,7 +180,7 @@ cmake --build build
 ├── sce_sys/                    # 随仓库分发：LiveArea 素材
 │   ├── icon0.png
 │   └── livearea/contents/
-├── docs/                       # 随仓库分发：协议参考文档
+├── docs/                       # 随仓库分发：LocalSend 协议文档副本（来源/权利见 localsend-protocol/ATTRIBUTION.md）
 │   └── localsend-protocol/
 ├── tools/                      # 本地克隆：官方示例 / vdpm / vita-parse-core
 │   ├── samples/
