@@ -10,9 +10,13 @@
 #
 # 注意：
 #  - 构建在 vitasdk 官方 Docker 镜像内进行（已设 VITASDK/PATH，含工具链）。
+#    镜像已预装 mbedtls/freetype/libpng/zlib/bzip2 等，这里只补装缺失的
+#    libvita2d / libjpeg-turbo（vdpm 包名，注意不是 vita2d/libjpeg）。
 #  - 不要 source env.sh / build.sh——它们把 VITASDK 指到仓库内 vitasdk/，
 #    在 CI 里不存在；直接调 cmake（CMakeLists 从 ENV{VITASDK} 找工具链）。
-#  - 同一 tag 重复跑（Release 已存在）会报 already exists：换版本号，
+#  - 建 Release 用 GitHub 官方 runner 自带 gh CLI（不依赖第三方 node
+#    action，规避运行时版本弃用告警）。
+#  - 同一 tag 重复跑（Release/tag 已存在）会报 already exists：换版本号，
 #    或先到 Releases 页删除旧草稿再重跑。
 
 name: Build VPK & Draft Release
@@ -36,13 +40,14 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: docker.io/vitasdk/vitasdk:2026.08
+    outputs:
+      ver: ${{ steps.ver.outputs.ver }}
     steps:
       - uses: actions/checkout@v4
 
       # 镜像通常已预装大部分常用库；vdpm install 幂等，缺的会自动补装
-      - name: Install project library deps
-        run: |
-          vdpm install mbedtls vita2d freetype libpng libjpeg zlib bzip2
+      - name: Install library deps
+        run: vdpm install libvita2d libjpeg-turbo
 
       - name: Configure & build VPK
         run: |
@@ -68,18 +73,27 @@ jobs:
           fi
           echo "ver=${VER:-unknown}" >> "$GITHUB_OUTPUT"
 
-      - name: Draft GitHub Release
-        uses: softprops/action-gh-release@v2
+  release:
+    needs: build
+    runs-on: ubuntu-latest   # GitHub 官方 runner：自带 gh CLI，无第三方 node 依赖
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          tag_name: v${{ steps.ver.outputs.ver }}
-          name: PSVSend v${{ steps.ver.outputs.ver }}
-          body: |
-            草稿预览——确认无误后在 Releases 页点击 Publish 对外发布。
+          name: psvsend-vpk
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ needs.build.outputs.ver }}" psvsend.vpk \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --generate-notes \
+            --title "PSVSend v${{ needs.build.outputs.ver }}" \
+            --notes "草稿预览——确认无误后在 Releases 页点击 Publish 对外发布。
 
-            - VPK：`psvsend.vpk`（VitaShell 安装）
-            - 测试环境：变革（HENkaku）3.65 自制系统
-            - 协议：LocalSend v2（IPv4），适配官方客户端 v1.15+
-            - 双向收发文件：HTTP / HTTPS（mTLS 设备证书）
-          draft: true
-          generate_release_notes: true
-          files: build/psvsend.vpk
+- VPK：psvsend.vpk（VitaShell 安装）
+- 测试环境：变革（HENkaku）3.65 自制系统
+- 协议：LocalSend v2（IPv4），适配官方客户端 v1.15+
+- 双向收发文件：HTTP / HTTPS（mTLS 设备证书）"
