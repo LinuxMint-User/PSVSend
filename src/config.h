@@ -11,6 +11,9 @@
 #define DEFAULT_ALIAS     "PS Vita"
 #define DEFAULT_PORT      53317
 
+/* 历史发现的设备 IP 上限（跨启动"最近在线优先扫描"的持久化列表） */
+#define KNOWN_MAX         24
+
 /* 客户端发布版本（运行时显示 / 设置页"关于"）。
  * 与 CMakeLists.txt 的 project(VERSION 2.0.0) 保持一致——升级版本号时
  * 两处一起改，SFO APP_VER 由 CMake 从 VERSION 派生，无需手改。 */
@@ -23,6 +26,8 @@ typedef struct {
     int  theme_id;           /* 0=Yaru 1=OLED */
     int  confirm_layout;     /* 0=美式 1=日式 */
     int  lang;               /* 界面语言偏好：0=跟随系统 1=English 2=中文 */
+    int  known_n;            /* 历史设备 IP 条数（最近发现优先，作扫描种子） */
+    char known_ips[KNOWN_MAX][16]; /* 历史设备 IP，最新在前 */
 } Config;
 
 extern Config g_cfg;
@@ -31,5 +36,9 @@ extern Config g_cfg;
 void config_init(void);
 /* 把当前配置写回磁盘（幂等，失败静默） */
 void config_save(void);
+/* 记录一个最近在线的设备 IP（去重滚动、最新在前；内部节流落盘） */
+void config_note_ip(const char *ip);
+/* 取与 a.b.c. 前缀匹配的历史主机号列表（供扫描优先），返回数量 */
+int config_known_hosts(unsigned a, unsigned b, unsigned c, int *out, int max);
 
 #endif

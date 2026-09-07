@@ -296,6 +296,10 @@ static int s_read_resp(SConn *c, int *code, char *buf, int cap, SceLong64 wait_u
     }
     if (cl > cap - 1 - body_off) return -1;
     buf[body_off + cl] = 0;
+    if (body_off > 0)
+        /* body 移到 buf 头部——之前漏了这步，调用方拿到的是整段响应头，
+         * JSON 解析永远失败 → 手动扫描对任何设备都 found=0 */
+        memmove(buf, buf + body_off, (size_t)cl + 1);
     return cl;
 }
 
@@ -341,13 +345,22 @@ static int s_handshake(SConn *c, const char *ip)
     r = mbedtls_ssl_set_hostname(&c->ssl, ip);
     if (r != 0) return -1;
     for (;;) {
-        if (now_us() >= dl) return -1;
+        if (now_us() >= dl) {
+            dlog("scan: hs timeout to %s", ip);
+            return -1;
+        }
         r = mbedtls_ssl_handshake(&c->ssl);
         if (r == 0) return 0;
         if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) {
             sceKernelDelayThread(SCAN_POLL_US);
             continue;
         }
+        /* 失败留下现场：错误码 + 对端 fatal alert（定位 https/mTLS 拒绝原因） */
+        dlog("scan: hs err -0x%04X to %s", (unsigned)(-r), ip);
+        if (r == MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE &&
+            c->ssl.in_msg != NULL && c->ssl.in_msglen >= 3)
+            dlog("scan: peer fatal alert lvl=%d desc=%d to %s",
+                 c->ssl.in_msg[0], c->ssl.in_msg[1], ip);
         return -1;
     }
 }
@@ -421,7 +434,8 @@ static int parse_member(const char *body, int tls, const char *ip, Device *out,
     return 1;
 }
 
-/* 对 ip 的 53317 发 register：明文先试（对 https 服务器会秒关），失败再 TLS */
+/* 对 ip 的 53317 发 register：TLS 先试（2026 官方端默认 HTTPS；
+ * TLS 对纯明文端握手会被秒拒），失败再明文兜底 */
 static int probe_host(const char *ip, Device *out)
 {
     char body[600], hdr[420], resp[2048];
@@ -434,10 +448,10 @@ static int probe_host(const char *ip, Device *out)
         memset(&c, 0, sizeof c);
         c.fd = net_connect_to(ip, SCAN_PORT, SCAN_CONNECT_US);
         if (c.fd < 0) return 0;
-        c.tls = (i == 1);
+        c.tls = (i == 0);          /* 第 1 轮 TLS（主流官方端）；第 2 轮明文兜底 */
         if (c.tls && s_handshake(&c, ip) != 0) {
             s_close(&c);
-            continue;                        /* TLS 不通；可能不是 https */
+            continue;               /* 不是 https；重连走明文 */
         }
         hlen = snprintf(hdr, sizeof hdr,
                         "POST /api/localsend/v2/register HTTP/1.1\r\n"
@@ -452,8 +466,19 @@ static int probe_host(const char *ip, Device *out)
         if (r > 0 && code == 200) {
             int ok = parse_member(resp, c.tls != 0, ip, out, c.fp);
             s_close(&c);
+            if (!ok) {
+                /* 看 PC 到底回了什么：打印响应体，确认实际字段格式 */
+                int plen = (int)strlen(resp);
+                dlog("scan: probe %s %s 200 unparseable (%d bytes): %.200s",
+                     ip, c.tls ? "tls" : "plain", plen,
+                     plen ? resp : "(empty)");
+            }
             return ok;
         }
+        /* 连上了但没拿到 200：明文/TLS 两阶段都记（明文被拒或 TLS 后
+         * HTTP 失败都在这暴露）——只对连接成功的 IP 记，离线 IP 不刷屏 */
+        dlog("scan: probe %s %s r=%d code=%d", ip,
+             c.tls ? "tls" : "plain", r, code);
         s_close(&c);
     }
     return 0;
@@ -532,15 +557,18 @@ static void scan_round(void)
 
     my_round = ++g_round;
 
-    /* 候选顺序：上次在线的主机排最前（"重点先探"），其余按序补全 */
+    /* 候选顺序：历史在线主机（config 持久、跨启动）排最前，其余按序补全 */
+    int kn = 0;                    /* 历史优先候选数 */
     memset(ctx, 0, sizeof *ctx);
     snprintf(prefix, sizeof prefix, "%u.%u.%u.", a, b, c);
     snprintf(ctx->prefix, sizeof ctx->prefix, "%s", prefix);
     ctx->round = my_round;
     {
         int h, k;
-        for (i = 0; i < g_known_n; i++) {
-            h = g_known[i];
+        int kh[SCAN_KNOWN_MAX];
+        kn = config_known_hosts(a, b, c, kh, SCAN_KNOWN_MAX);
+        for (i = 0; i < kn; i++) {
+            h = kh[i];
             if (h == (int)d || h < 1 || h > 254) continue;
             ctx->hosts[ctx->n++] = h;
         }
@@ -558,7 +586,7 @@ static void scan_round(void)
     g_round_found_n = 0;
     sunlock();
     dlog("scan: round #%d start on %s0/24 (%d candidates, %d known first)",
-         my_round, prefix, ctx->n, ctx->n < g_known_n ? ctx->n : g_known_n);
+         my_round, prefix, ctx->n, kn);
 
     for (i = 0; i < SCAN_WORKERS && i < ctx->n; i++) {
         SceUID t = sceKernelCreateThread("psvsend_scanw", scan_worker_thr,
@@ -613,11 +641,12 @@ static void scan_round(void)
         /* 被废弃的 worker 恢复后会在下一轮（轮次号已变）到来前自己收手 */
     }
 
-    slock();                           /* 记住本轮在线主机：下轮优先探 */
+    slock();                           /* 会话内镜像（下轮持久种子在 config） */
     g_known_n = g_round_found_n;
     for (i = 0; i < g_known_n; i++) g_known[i] = g_round_found[i];
     g_done = 254;
     sunlock();
+    config_save();                     /* 本轮设备落盘：下次启动仍优先探测 */
     dlog("scan: round #%d done (%d hosts, %d found)", my_round, 254, g_found);
 }
 

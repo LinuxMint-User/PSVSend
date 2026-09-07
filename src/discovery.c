@@ -78,6 +78,8 @@ static void table_upsert(const Device *dev)
         }
     }
     if (g_mtx >= 0) sceKernelUnlockMutex(g_mtx, 1);
+    /* 记入"最近在线"列表：下次手动扫描优先探测这台（跨启动持久，见 config） */
+    config_note_ip(dev->ip);
 }
 
 static void table_purge(void)
