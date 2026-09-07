@@ -17,7 +17,7 @@
 - **已落地（渲染稳定，v2.0.0）**：修复偶发 **GPU render crash**（先兆为界面「三角形空白撕裂」→ 系统判 render gpu crash 重启）。根因：主循环缺 `vita2d_wait_rendering_done()`，每帧 swap 后 GPU 队列无收敛点，渲染/显示队列超前回绕导致撕裂与驱动状态错乱；修复：每帧 swap 后等待渲染完成（ui_main.c）。字体对象另改为启动帧外预载（`font_preload_all`），堵住"渲染中途创建 GPU 纹理"的隐患（非本次根因，作加固保留）。
 - **已落地（界面，v2.0.0）**：中 / 英双语界面（设置页切换，`i18n.c/h`）+ 设置页底部「关于」区（PSVSend 大字 logo、应用版本与 LocalSend 适配说明）。版本号单源维护：手改 `CMakeLists.txt` 的 `project(VERSION)` 与 `core/config.h` 的 `PSVSEND_APP_VERSION`，SFO `APP_VER` 由 VERSION 自动派生。
 - **已落地（工程，v2.0.0 后）**：GitHub Actions（`.github/workflows/build-vpk.yml`）在官方 vitasdk 2026.08 Docker 镜像内自动构建 VPK：推送 `v*` tag 或 Actions 页手动触发 → 生成 **Releases 草稿**（人工确认后公开）。注意本地与 CI 产物 `eboot.bin` 存在字节差异（本地链接 vdpm prebuilt 静态库，CI 链接镜像内现场编译的同源库），功能等价（真机验证通过）；需字节级可复现则须统一在容器内构建。
-- **未落地**：与 §4/§5 目标架构的规划差项（multipart 收件、接收设置页改名/选目录、自定义字体等）仍在路线中，动态清单见 docs/TODO.md（本地，不入库）；session.c 拆分已销账（2026-09-07，会话职责由 proto/receive + proto/transfer 承担，见 §4.1）；中文字体已落地（见 §5.5），不再在列。
+- **未落地**：与 §4/§5 目标架构的规划差项（multipart 收件、接收设置页改名/选目录等）仍在路线中，动态清单见 docs/TODO.md（本地，不入库）。已销账（2026-09-07，理由见 TODO 闭环留痕）：session.c 拆分（会话职责由 proto/receive + proto/transfer 承担，见 §4.1）、自定义字体替换/追加、内存监控调试视图、发送入口外置卡浏览。中文字体已落地（见 §5.5）；字形冷启动处理已定案（开机高频页预热，见 §5.5.1）。
 - 本文按"目标架构"描述，部分命名与实际源码不同（如目标 `http_server.c` / `http_client.c` 实际为 `net/http.c` / `proto/transfer.c`）；**现状源码布局以 §4.1 模块树为准**（2026-09-07 起按依赖域分子目录）。
 
 ## 2. 总体架构（前后端分层）
@@ -225,15 +225,23 @@ void on_session_done(const Session *s);      // 完成 / 失败
 
 **校准状态（2026-09-04 真机确认）：** 升部按字形实测为 `FONT_ASC=0.81`（盒 ascender 1.043 不用，理由见上），字号基准 `FONT_PX=20px@scale1`，配合按字号分槽绘制后大字/小字均显示正常；若个别场景仍需微调，改 `widgets.c` 里这两个常量即可。`w_text_w` 返回行高 h=字号（近似）用于垂直居中，如需精确按字形度量再改。
 
-**后续扩展：** 可加"从 `ux0:` 加载自定义字体替换/追加"（当前固定内嵌两份）。
+**自定义字体替换/追加已销账（2026-09-07）**：内嵌双字体已覆盖实际场景，无必要开放字体自定义（理由见 docs/TODO.md 闭环留痕）；若将来出现真实需求再按新里程碑评估。
+
+#### 5.5.1 字形冷启动与开机预热（2026-09-07 d38-d40 定案）
+
+首见字形光栅化成本真机实测：CJK 约 **20~32ms/字**、拉丁约 2~6ms/字，是"首次切页 / 滚动出新行"卡顿的根因；同一字形缓存后重绘几乎免费（约 5µs/字，0.3ms/64 字）。曾试路径与结论（代码：ui_main.c `ui_warm_pass` / pages.c `pages_warm_all`）：
+
+- **逐帧时间预算预热（d33 每帧 96 字形、d34 唯一字符集 + 12ms 预算）**：字形光栅化总量是几十秒级 CPU 成本，无法摊进 60fps 帧预算，预热期间界面持续掉帧 → 否决（d35 整体回退）
+- **全静态页面预热（d37）**：6 页全烤实测 **6226ms** 且屏幕全程纯黑 → 过长
+- **定案（d38-d40）**：收窄到高频页（设备列表 / 文件浏览 / 设置页顶 + About 滚底），实测约 **4.3s**。预热期间屏幕停留在 **LiveArea 壁纸开屏**（`app0:/sce_sys/livearea/contents/bg.png`，与桌面点开应用前的画面同源、启动衔接不跳变；开屏不加文字避免遮挡图面）。字形画进隐帧但**绝不 swap**（收尾只 `vita2d_wait_rendering_done` 等 GPU 画完）——若 swap，display 会去读 GPU 还在逐页异步回放的缓冲，表现为"开屏后一堆页面闪过"。低频页（收发确认 / 进度等）维持首开现烤（一次性几十 ms，可接受）。字体对象仍启动帧外建齐（`font_preload_all`，见 §1 渲染稳定条目；现于开屏上屏后执行），预热只烤字形位图。
 
 ### 5.6 文件组织
 
 ```
 src/ui/
-├── ui.h          # 页面枚举、AppState、字体句柄 font_get(size,cjk)、Input 抽象
-├── ui_main.c     # 主循环：输入 → 事件 → 渲染 + 字体按字号分槽（font_get 实现）
-├── theme.c/.h    # 主题颜色表 + 切换（theme.h 定义 theme_t）
+├── ui.h          # App 全局状态、页面枚举(PageId)、Input 抽象、控件注册接口、font_get
+├── ui_main.c     # 主循环：输入 → 事件 → 渲染 + 字体按字号分槽（font_get 实现）+ 开屏/预热
+├── theme.c/.h    # 主题颜色表 + 切换（Theme 结构，OLED / Yaru）
 ├── widgets.c     # 文本/列表/按钮/进度条/弹窗控件（FONT_PX / FONT_ASC 常量）
 ├── input.c       # 按键 + 触摸 → 抽象动作
 └── pages.c       # 各页面渲染与交互（设备列表/文件浏览/收发确认/进度/设置）

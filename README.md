@@ -19,6 +19,7 @@
 - [x] 网络稳定性：待机唤醒 / Wi-Fi 断开恢复后自动恢复发现（watch 看门狗 + 低频 netctl 轮询，v2.0.0）
 - [x] 渲染稳定性：修复偶发 GPU render crash（界面撕裂后崩溃）——每帧等待 GPU 渲染完成（v2.0.0）
 - [x] 中 / 英双语界面（设置页可切换）与设置页底部「关于」区（版本 + 适配 LocalSend 说明，v2.0.0）
+- [x] 启动开屏 + 高频页字形预热：开机先用 LiveArea 壁纸开屏，期间把设备 / 文件 / 设置常用页的字形烤好，切页与滚动不再因首见字形卡顿（v2.0.0 后）
 
 ## 构建
 
@@ -131,7 +132,7 @@ cmake --build build
 
 ### 界面显示
 
-- **界面内嵌中文字体**（随 VPK 打包到 `app0:/fonts/`，源为 AOSP Droid Sans 与 Droid Sans Fallback Full，Apache-2.0）：ASCII/Latin 走 Droid Sans，CJK/全角走 Fallback，中英文正常显示；无字形的字符（emoji、个别生僻扩展区）直接不渲染，传输本身不受影响（渲染细节见 [docs/design.md](docs/design.md) §5.5/§9）
+- **界面内嵌中文字体**（随 VPK 打包到 `app0:/fonts/`，源为 AOSP Droid Sans 与 Droid Sans Fallback Full，Apache-2.0）：ASCII/Latin-1 与通用标点（省略号 U+2026、弯引号等——CJK 字库缺而拉丁字库含）走 Droid Sans，CJK/全角走 Fallback，中英文正常显示；两字库皆缺的生僻字符（emoji、个别扩展区）由 freetype 栅成空框或留空，传输本身不受影响。字形冷启动处理（开机预热）见 [docs/design.md](docs/design.md) §5.5.1
 
 ### 已知小问题
 
