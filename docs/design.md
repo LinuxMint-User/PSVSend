@@ -17,7 +17,7 @@
 - **已落地（渲染稳定，v2.0.0）**：修复偶发 **GPU render crash**（先兆为界面「三角形空白撕裂」→ 系统判 render gpu crash 重启）。根因：主循环缺 `vita2d_wait_rendering_done()`，每帧 swap 后 GPU 队列无收敛点，渲染/显示队列超前回绕导致撕裂与驱动状态错乱；修复：每帧 swap 后等待渲染完成（ui_main.c）。字体对象另改为启动帧外预载（`font_preload_all`），堵住"渲染中途创建 GPU 纹理"的隐患（非本次根因，作加固保留）。
 - **已落地（界面，v2.0.0）**：中 / 英双语界面（设置页切换，`i18n.c/h`）+ 设置页底部「关于」区（PSVSend 大字 logo、应用版本与 LocalSend 适配说明）。版本号单源维护：手改 `CMakeLists.txt` 的 `project(VERSION)` 与 `core/config.h` 的 `PSVSEND_APP_VERSION`，SFO `APP_VER` 由 VERSION 自动派生。
 - **已落地（工程，v2.0.0 后）**：GitHub Actions（`.github/workflows/build-vpk.yml`）在官方 vitasdk 2026.08 Docker 镜像内自动构建 VPK：推送 `v*` tag 或 Actions 页手动触发 → 生成 **Releases 草稿**（人工确认后公开）。注意本地与 CI 产物 `eboot.bin` 存在字节差异（本地链接 vdpm prebuilt 静态库，CI 链接镜像内现场编译的同源库），功能等价（真机验证通过）；需字节级可复现则须统一在容器内构建。
-- **未落地**：与 §4/§5 目标架构的规划差项（session.c 拆分、multipart 收件、接收设置页改名/选目录等）仍在路线中；中文字体已落地（见 §5.5），不再在列。
+- **未落地**：与 §4/§5 目标架构的规划差项（multipart 收件、接收设置页改名/选目录、自定义字体等）仍在路线中，动态清单见 docs/TODO.md（本地，不入库）；session.c 拆分已销账（2026-09-07，会话职责由 proto/receive + proto/transfer 承担，见 §4.1）；中文字体已落地（见 §5.5），不再在列。
 - 本文按"目标架构"描述，部分命名与实际源码不同（如目标 `http_server.c` / `http_client.c` 实际为 `net/http.c` / `proto/transfer.c`）；**现状源码布局以 §4.1 模块树为准**（2026-09-07 起按依赖域分子目录）。
 
 ## 2. 总体架构（前后端分层）
@@ -217,11 +217,11 @@ void on_session_done(const Session *s);      // 完成 / 失败
 **实现（2026-09-04 落地）：** 双字体逐段路由，均为 AOSP 字库（Apache-2.0，与项目同许可）：
 
 - `fonts/DroidSans.ttf`（拉丁）+ `fonts/DroidSansFallbackFull.ttf`（CJK/全角，28629 字形），CMakeLists 打进 VPK `app0:/fonts/`
-- 单字码点 ≤ `0xFF`（ASCII / Latin-1）走拉丁字体，其余走 CJK 字体；`widgets.c` 内按字符分成连续同字体段、整段一次绘制（保留 kerning、控制调用次数）
+- 单字码点 ≤ 0xFF（ASCII / Latin-1）与**通用标点 U+2000-206F**（省略号 U+2026、弯引号、破折号…——DroidSansFallbackFull 缺、DroidSans 含）走拉丁字体，其余走 CJK 字体；`widgets.c` 内按字符分成连续同字体段、整段一次绘制（保留 kerning、控制调用次数）。2026-09-07 修复：早期"码点>0xFF 一律 CJK"把省略号等发给缺字形的 CJK 字库 → 中文文案省略号渲染成方框
 - freetype 的 y 是**基线**、size 是像素字号；`w_text` 的 y 保持"行首升部线"语义，内部基线放在 `y + 0.81*size`（CJK 满格字形顶比例，实测 glyf yMax/upem；盒 ascender 1.043 含 em 上方行距空白，基线过高会整体偏下）。字号换算 `scale=1.0 → 20px`（`FONT_PX`/`FONT_ASC` 常量集中在 `widgets.c`，整体缩放只改一处）
 - **性能事实 + 按字号分槽（2026-09-04 晚落地）**：libvita2d freetype 后端自带**字形级 atlas 缓存**（FTC_ImageCache + 共享 texture atlas），同一字体对象内字形只栅格化一次、后续直接 blit；但 atlas 缓存**不分字号**——同一字形先以小字号缓存、再以更大字号绘制时会把小位图整体放大（draw_scale≠1），槽位间渗色一并放大，表现为大字笔画不均、横向条纹。这是真机"大字横线/参差"的根因，故改为**按像素字号分槽**：`ui.h` 暴露 `font_get(size, cjk)`，`ui_main.c` 按字号懒加载独立字体对象（各自 atlas、draw_scale 恒为 1），对 `widgets.c` 绘制 API 透明。早期"需字符串级缓存"的顾虑依旧不成立
 - 字库用纯 CJK fallback 单字体不够（无 ASCII），故拉丁/CJK 必须成对；字体本身无 GPL/许可冲突
-- 缺字行为：字符无字形时不渲染（atlas 添加失败即跳过），不会有方块/乱码占位
+- 缺字行为：字符所在字库无字形时，freetype 的 `.notdef` 会被栅格成空框并显示（不是"跳过不渲染"）——所以字体路由必须保证常用字符都进含其字形的字库；生僻字（两库皆缺）才会真正空白/空框
 
 **校准状态（2026-09-04 真机确认）：** 升部按字形实测为 `FONT_ASC=0.81`（盒 ascender 1.043 不用，理由见上），字号基准 `FONT_PX=20px@scale1`，配合按字号分槽绘制后大字/小字均显示正常；若个别场景仍需微调，改 `widgets.c` 里这两个常量即可。`w_text_w` 返回行高 h=字号（近似）用于垂直居中，如需精确按字形度量再改。
 
@@ -275,7 +275,7 @@ src/ui/
 - [x] 中文字体：已落地（freetype 双字体 Droid Sans + Fallback，按字号分槽绘制，见 §5.5）；升部实测校准 0.81、字号基准 20px@scale1，2026-09-04 真机确认显示正常
 - [ ] 深浅色切换是否做（当前统一深色）
 - [ ] 自定义主题色盘的实现时机（先 OLED/Yaru，色盘后置）
-- [ ] HTTP 解析兼容清单最终确认（chunked 已定必做）
+- [x] HTTP 解析兼容清单最终确认：**chunked 已落地**——http.c 对无 Content-Length 的请求按 `Transfer-Encoding: chunked` 走 chunked 解码（upload_stream/chunked_stream），dio/官方客户端流式上传真机验证；大文件 upload 一律不进内存。2026-09-07 确认
 - [ ] 接收设置页：文件重命名输入（接 PSV 系统键盘 SceIme，或自绘内置键盘；当前仅占位弹窗）
 - [ ] 接收设置页：本次保存目录选择（目录浏览/预设；需确认 ux0 目录权限；当前固定 `ux0:data/psvsend/`）
 - [ ] 接收页"验证"功能（LocalSend 的验证码/校验交互）当前不做，等真实协议接入后再定

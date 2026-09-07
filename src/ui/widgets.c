@@ -8,9 +8,10 @@
 #include "ui/theme.h"
 
 /* ---------- 文字 ----------
- * 字符路由：码点 <= 0xFF（ASCII / Latin-1）走拉丁字体，其余（CJK、
- * 全角符号、假名…）走 CJK 字体；同一字体的连续子串一次绘制，减少
- * 调用并保留 kerning。
+ * 字符路由：码点 <= 0xFF（ASCII / Latin-1）与通用标点 U+2000-206F（省略号、
+ * 弯引号、破折号…——CJK 字库缺而拉丁字库含，见 cp_domain 注释）走拉丁字体，
+ * 其余（CJK、全角符号、假名…）走 CJK 字体；同一字体的连续子串一次绘制，
+ * 减少调用并保留 kerning。
  * 字号：ui_main.c 的 font_get 为每个像素字号建独立字体对象，保证每个
  * 字都按本字号原生光栅化（详见 ui_main.c 注释），draw_scale 恒为 1。
  * 尺寸语义（libvita2d freetype 后端，见 vita2d_font.c）：
@@ -57,6 +58,18 @@ static const char *utf8_next_cp(const char *p, uint32_t *cp)
     return p + 1;
 }
 
+/* 字体域判定：ASCII / Latin-1 与通用标点（U+2000-206F，含省略号 U+2026、
+ * 弯引号 U+201C/201D、破折号 U+2014 等）走拉丁字体；其余（CJK 汉字、全角
+ * 符号、假名…）走 CJK 字体。注意：DroidSansFallbackFull（CJK 字库）缺
+ * U+2026 等通用标点，而 DroidSans（拉丁字库）反而含——早期按"码点 >0xFF
+ * 一律 CJK"路由，把这些字符发给了缺字形的字库 → 中文文案渲染成方框。 */
+static int cp_domain(uint32_t cp)
+{
+    if (cp <= 0xFF) return 0;
+    if (cp >= 0x2000 && cp <= 0x206F) return 0;
+    return 1;
+}
+
 /* 对 p 指向的字符串做逐字符字体路由：每段是连续同字体域子串，
  * cjk_out 返回该段字体域（1=CJK、0=拉丁；实际字体对象在绘制时按
  * 当前字号经 font_get 取得）。返回段长度（字节）。 */
@@ -64,12 +77,12 @@ static int next_run(const char *p, int *cjk_out)
 {
     uint32_t cp;
     const char *q = utf8_next_cp(p, &cp);
-    int cjk = (cp <= 0xFF) ? 0 : 1;
+    int cjk = cp_domain(cp);
     *cjk_out = cjk;
     while (*q) {
         uint32_t cp2;
         const char *r = utf8_next_cp(q, &cp2);
-        if (((cp2 <= 0xFF) ? 0 : 1) != cjk) break;
+        if (cp_domain(cp2) != cjk) break;
         q = r;
     }
     return (int)(q - p);
