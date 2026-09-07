@@ -1,0 +1,79 @@
+name: 🐞 问题反馈 / Bug Report
+description: 提交软件功能异常或GPU/硬件崩溃问题
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### ⚠️ 提交前必读：日志与转储文件要求
+        请根据您遇到的问题类型，在下方对应位置附上文件：
+        - **软件功能性问题**：请附上 `ux0:data/psvsend/` 目录中的 `log.txt` 文件。
+        - **GPU崩溃 / 硬件问题**：请在 **PSV重启后**，附上 `ux0:data/psvsend/log.txt` 文件，**以及** `ux0:data/` 目录中**最新生成的核心转储文件**。
+        
+        > 📌 **系统版本说明**：本路径基于 **变革 (Enso) 3.65** 系统。其他系统版本未经完整验证，但目录结构大概率相同。
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 请简单描述您遇到了什么问题，以及预期应该是什么样？
+      placeholder: 例如：点击“发送”按钮后，软件闪退，无法传输文件。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请提供一步步的操作过程，方便我们定位
+      placeholder: |
+        1. 打开 psvsend 应用
+        2. 连接电脑端
+        3. 选择文件并点击发送
+        4. 软件界面卡死后自动退出
+    validations:
+      required: false
+
+  - type: dropdown
+    id: problem_type
+    attributes:
+      label: 问题类型
+      description: 请选择您遇到的类别
+      options:
+        - 软件功能性问题（功能异常、报错）
+        - GPU崩溃 / 硬件问题（画面撕裂、花屏、死机）
+    validations:
+      required: true
+
+  - type: input
+    id: system_version
+    attributes:
+      label: PSV 系统版本
+      description: 请填写您的系统固件版本
+      placeholder: 例如：变革 3.65
+    validations:
+      required: true
+
+  # ---------- 新增的 PSV 型号字段 ----------
+  - type: input
+    id: psv_model
+    attributes:
+      label: PSV 型号
+      description: 请填写您的 PSV 具体型号
+      placeholder: 例如：PSV-1000 (3G/WiFi)、PSV-2000、PSV TV
+    validations:
+      required: true
+  # -------------------------------------
+
+  - type: textarea
+    id: log_content
+    attributes:
+      label: 📎 日志与转储文件内容（重要）
+      description: |
+        请根据您选定的问题类型，将对应文件的**完整内容**粘贴到下方，或者直接拖拽文件到本输入框上传。
+        - 功能问题：上传 `ux0:data/psvsend/log.txt`
+        - 硬件崩溃：上传 `ux0:data/psvsend/log.txt` **和** `ux0:data/` 下最新的核心转储文件
+      render: shell
+    validations:
+      required: true
