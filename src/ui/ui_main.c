@@ -23,6 +23,9 @@ extern void pages_init(void);
 #define FONT_PATHS_BASE "app0:/fonts/"
 #define FONT_LAT_FILE   FONT_PATHS_BASE "DroidSans.ttf"
 #define FONT_CJK_FILE   FONT_PATHS_BASE "DroidSansFallbackFull.ttf"
+/* 开屏底图 = livearea 壁纸（840x500），随 vpk 装在 app0:/sce_sys/livearea/。
+ * 与 Vita 桌面上点开应用前的画面同源，启动衔接不跳变。 */
+#define SPLASH_BG_FILE "app0:/sce_sys/livearea/contents/bg.png"
 #define MAX_FONT_SIZES 24
 static struct { int size; vita2d_font *lat; vita2d_font *cjk; } g_fs[MAX_FONT_SIZES];
 static int g_fs_n;
@@ -50,6 +53,14 @@ vita2d_font *font_get(int size, int cjk)
     return cjk ? g_fs[0].cjk : g_fs[0].lat;
 }
 
+/* UI 字号档位表 = 现有页面全部 w_text scale 经 font_px 取整的集合；
+ * font_preload_all 启动建齐 + glyph warm 预热也按这份表逐字号烤。
+ * 日后新增字号档请同步补进此表。 */
+static const int g_font_sizes[] = {
+    18, 20, 21, 22, 23, 24, 25, 26, 28, 30, 32, 34,
+};
+#define FONT_SIZES_N ((int)(sizeof g_font_sizes / sizeof g_font_sizes[0]))
+
 /* 启动时帧外预加载全部字号档（见 ui_run 的调用点）。
  * 动机：字体对象是懒加载的，若某字号第一次被页面用到才创建，创建动作
  * （vita2d_load_font_file：freetype 初始化 + 512x512 灰度纹理分配 + 显存
@@ -58,20 +69,15 @@ vita2d_font *font_get(int size, int cjk)
  * （无 CPU 异常线程、纯 GPU 驱动报错，表现为撕裂后崩溃）。UI 字号档位
  * 有限，启动一次建齐后 font_get 运行时只命中缓存，此路径被整体消除。
  * 字形 glyph 仍按需光栅化写进已建好的 atlas（纯 CPU memcpy，不创建 GPU
- * 资源，无此风险），故无需也不应全量光栅化字形。
- * 档位表 = 现有页面全部 w_text scale 经 font_px 取整的集合；日后新增
- * 字号档请同步补进此表。 */
+ * 资源，无此风险），故无需也不应全量光栅化字形。 */
 static void font_preload_all(void)
 {
-    static const int sizes[] = {
-        18, 20, 21, 22, 23, 24, 25, 26, 28, 30, 32, 34,
-    };
-    int i, ok = 0, n = (int)(sizeof sizes / sizeof sizes[0]);
-    for (i = 0; i < n; i++) {
-        if (font_get(sizes[i], 0)) ok++;   /* latin */
-        if (font_get(sizes[i], 1)) ok++;   /* CJK  */
+    int i, ok = 0;
+    for (i = 0; i < FONT_SIZES_N; i++) {
+        if (font_get(g_font_sizes[i], 0)) ok++;   /* latin */
+        if (font_get(g_font_sizes[i], 1)) ok++;   /* CJK  */
     }
-    dlog("font preload done: %d/%d fonts, sizes 18..34", ok, 2 * n);
+    dlog("font preload done: %d/%d fonts, sizes 18..34", ok, 2 * FONT_SIZES_N);
 }
 
 /* ---------- widget 命中表 ---------- */
@@ -131,6 +137,49 @@ static void input_page(const Input *in)
     }
 }
 
+/* ---------- 开屏 + 开机预热（temp，实验用） ----------
+ * 先呈现一帧开屏画面（livearea 壁纸铺底，不加文字避免遮挡图面），随即
+ * 建齐字号字体对象、把三个高频页的字形画进隐帧（屏幕停留开屏画面），
+ * 完成后交回主循环画第一帧主界面。预热窗口内用户本就预期等待，无交互
+ * 可抢 → 不构成卡顿感。 */
+static void ui_warm_pass(void)
+{
+    vita2d_texture *bg;
+    dlog("splash begin");
+    bg = vita2d_load_PNG_file(SPLASH_BG_FILE);   /* 840x500 位图解码，一次性 */
+    vita2d_start_drawing();
+    vita2d_set_clear_color(theme->bg);
+    vita2d_clear_screen();
+    if (bg) {
+        /* livearea 壁纸全屏铺底：与桌面点开前的画面同源，无缝衔接 */
+        vita2d_draw_texture_scale(bg, 0, 0,
+            (float)SCR_W / (float)vita2d_texture_get_width(bg),
+            (float)SCR_H / (float)vita2d_texture_get_height(bg));
+    } else {
+        dlog("splash: bg.png load failed, fallback to plain");
+    }
+    vita2d_end_drawing();
+    vita2d_swap_buffers();
+    vita2d_wait_rendering_done();
+    if (bg) vita2d_free_texture(bg);   /* 开屏已上屏，纹理用完即放 */
+    dlog("splash end");
+    font_preload_all();                /* 开屏已可见，此后再建齐字号字体对象（帧外） */
+
+    dlog("warm pass begin");
+    vita2d_start_drawing();
+    vita2d_set_clear_color(theme->bg);
+    vita2d_clear_screen();
+    pages_warm_all();            /* 隐帧烤字形；屏幕此刻仍停留在开屏画面 */
+    vita2d_clear_screen();       /* 隐帧结尾清成底色，防任何途径误上屏时露出最后一页 */
+    vita2d_end_drawing();
+    /* 不 swap：display 继续停在开屏帧。字形光栅化在 CPU 端慢、GPU 命令排队
+     * 异步回放；若在这里 swap，display 会去读那块还在逐页回放(dev→files→
+     * set-top→set-about)的缓冲 → 开屏后一堆页面闪过才到主界面。只等 GPU
+     * 画完（wait_rendering_done），主循环第一帧画好主页面再 swap。 */
+    vita2d_wait_rendering_done();
+    dlog("warm pass end");
+}
+
 /* ---------- 主循环 ---------- */
 void ui_run(void)
 {
@@ -138,7 +187,7 @@ void ui_run(void)
     uint64_t run0 = (uint64_t)sceKernelGetSystemTimeWide() / 1000;
     ui_input_init();           /* 开启触摸采样 */
     pages_init();
-    font_preload_all();        /* 帧外建齐全部字号字体对象（防渲染中途建 GPU 资源） */
+    ui_warm_pass();            /* 开屏先上屏（不依赖字体），再建字体 + 高频页预热 */
 
     while (!g_app.done) {
         /* 主线程心跳（诊断用）：开机头 12s 或"网络未就绪"期间每秒打一行，

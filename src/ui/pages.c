@@ -21,6 +21,7 @@
 #include "proto/transfer.h"
 #include "proto/receive.h"
 #include "net/scan.h"
+#include "core/dlog.h"
 
 /* ---------- 布局常量 ---------- */
 #define LIST_TOP     76                 /* 列表可视区顶 */
@@ -1656,4 +1657,38 @@ void pages_tick(void)
         return;                              /* 接收流程/传输中不打断 */
     }
     open_recv_request(&rp);
+}
+
+/* ================= 开机预热（常用页） =================
+ * 只烤"主页面(设备列表) + 文件选择页 + 设置页(滚顶+滚底含 About)"三个
+ * 高频页：当前语言静态文案按真实字号/字体路由烤进 atlas 后，这三页首开
+ * 与设置页滚到底都零卡。发送/接收/进度等低频页维持首开现烤（已接受）。
+ * 页面画在隐帧上，由 ui_main 的 ui_warm_pass 呈现开屏画面、本函数不呈现。
+ * 数据前提：开机 pages_init 之后、主循环之前调用，多数页空/idle，渲染
+ * 函数对空状态安全。每页记一次耗时供测量。 */
+void pages_warm_all(void)
+{
+    uint64_t t0 = (uint64_t)sceKernelGetSystemTimeWide();
+    uint64_t s = t0, p;
+
+#define WARM_ONE(name, code) do { \
+        code; \
+        p = (uint64_t)sceKernelGetSystemTimeWide(); \
+        dlog("warm %s=%lldms cum=%lldms", name, \
+             (long long)((p - s) / 1000), (long long)((p - t0) / 1000)); \
+        s = p; \
+    } while (0)
+
+    /* 顺序即累积去重后的真实首开成本：设备页 → 文件页 → 设置页顶/底 */
+    WARM_ONE("dev",   g_app.page = PAGE_DEVICES; page_devices_render());
+    WARM_ONE("files", g_app.page = PAGE_FILES;   page_files_render());
+    WARM_ONE("set-top",  g_app.page = PAGE_SETTINGS; set_scroll = 0;
+             page_settings_render());
+    WARM_ONE("set-about", set_scroll = 0x7FFFFFFF;   /* render 首行夹到最大滚动 */
+             page_settings_render());
+    set_scroll = 0;
+#undef WARM_ONE
+
+    dlog("warm total=%lldms", (long long)((s - t0) / 1000));
+    g_app.page = PAGE_DEVICES;       /* 复位到开机页 */
 }
