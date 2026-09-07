@@ -56,4 +56,7 @@ void xfer_cancel(void);
 /* 锁内拷贝当前快照（每帧调用无妨；线程结束时快照保留最后一次状态） */
 void xfer_info(XferInfo *out);
 
+/* 轻量查询：是否正在发送（锁内读 active；receive 侧"发送中拒绝接收"用） */
+bool xfer_active(void);
+
 #endif

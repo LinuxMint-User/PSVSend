@@ -1,7 +1,9 @@
 /* http.c 实现 —— 见 http.h。
- * 单线程 accept + 顺序处理；recv 带超时防挂死；每连接只处理一个请求后关闭
- * （响应带 Connection: close）。除接收大文件 body 是"流式边读边转给 receive 模块"
- * 外，其余请求（info/register/prepare-upload/cancel）头+体都很小，读进内存即可。
+ * accept 线程只做 accept + 分发：每连接开一个 worker 线程并发处理（上限
+ * HTTP_MAX_CONN，满员时新连接立即关闭——宁可见效地拒绝，也不让客户端在 TCP
+ * 队列里干等到超时）；worker 处理完关 fd 自清，收大文件 body 是"流式边读边
+ * 转给 receive 模块"，其余请求头+体都很小读进内存即可。http_stop 关监听让
+ * accept 退出后，会对仍存活的 worker 做有预算的 join，等不到就换代弃管。
  * Vita 的 SceNet socket 收/发在暂无数据时会立刻返回 EWOULDBLOCK(0x80410123)，
  * 不能当错误处理，必须轮询等数据/等窗口。 */
 #include <string.h>
@@ -9,6 +11,7 @@
 #include <stdio.h>
 #include <psp2/net/net.h>
 #include <psp2/kernel/threadmgr/thread.h>
+#include <psp2/kernel/threadmgr/mutex.h>
 #include <sys/time.h>
 #include "config.h"
 #include "json_util.h"
@@ -23,6 +26,9 @@
 #define UPLOAD_IDLE_US      (30 * 1000000LL)  /* 收体时单块读的空闲上限 */
 #define NET_AGAIN(r) ((r) == 0x80410123)
 #define NET_RETRY_DELAY_US 20000    /* 20ms 轮询间隔 */
+#define HTTP_MAX_CONN       8       /* 并发连接 worker 上限（满员立即关新连接） */
+#define HTTP_CONN_STACK     0x40000 /* 每连接 worker 栈：与旧 accept 线程同规格
+                                     * （handle_conn 内 buf+prepare 体/回执 ~100KB） */
 
 static int    g_port = 0;           /* 实际绑定端口（0=未启动） */
 static int    g_lsock = -1;
@@ -30,6 +36,22 @@ static SceUID g_thr = -1;           /* accept 线程（http_stop 要等它退）
 static volatile int g_run = 0;
 static volatile int g_gen = 0;      /* 服务器代次：stop/start 递增，旧线程据此收手 */
 static void (*g_cb)(const char *body, const char *src_ip) = NULL;
+
+/* 每连接一个 worker 的登记槽：accept 线程填好 fd/ip/gen 再启动线程；
+ * worker 自找本槽（tid 匹配）取出参数；http_stop 靠 tid 等仍在跑的 worker。
+ * 槽空 = tid <= 0（0=静态零初始的未用槽，-1=已清/占位中；Vita 线程 UID 恒为正）；
+ * worker 收尾时若代次已变（stop 后旧 worker 迟到），绝不关 fd——那可能是
+ * 新监听/新连接复用走的号；宁可漏一个死 fd。 */
+typedef struct {
+    SceUID tid;                     /* worker 线程；<=0 = 槽空 */
+    int    fd;
+    int    gen;
+    char   ip[16];
+} ConnSlot;
+static ConnSlot g_conns[HTTP_MAX_CONN];
+static SceUID g_conn_mtx = -1;      /* 保护连接登记表 */
+static void conn_lock(void)   { if (g_conn_mtx >= 0) sceKernelLockMutex(g_conn_mtx, 1, NULL); }
+static void conn_unlock(void) { if (g_conn_mtx >= 0) sceKernelUnlockMutex(g_conn_mtx, 1); }
 
 /* ---------- 收/发工具 ---------- */
 static int send_all(int fd, const char *data, int len)
@@ -163,6 +185,7 @@ static bool str_has_ci(const char *s, const char *sub)
 /* ---------- upload 大文件的流式读回调（receive 模块轮询调用） ---------- */
 typedef struct {
     int  fd;
+    int  gen;           /* 创建时的服务器代次：换代后轮询尽早收手 */
     const char *left;   /* 缓冲里已读但未消费的 body */
     int  llen;
     int  chunked;       /* Transfer-Encoding: chunked（dio 无 CL 流式上传） */
@@ -171,6 +194,10 @@ typedef struct {
     unsigned char sbuf[4096];  /* chunked 解码输入暂存 */
     int  s_n, s_pos;
 } UploadCtx;
+
+/* 换代感知：http_stop/restart 后旧 worker 的轮询（头/体读取）应尽快收手，
+ * 让 http_stop 的有预算 join 能等到它，而不是干耗到 recv 超时。 */
+static inline int gen_stale(int my_gen) { return g_gen != my_gen; }
 
 static int hexv(char c)
 {
@@ -199,6 +226,7 @@ static int u_refill(UploadCtx *u)
         for (;;) {
             int r;
             if (recv_abort_pending()) return -1; /* 用户中止 */
+            if (gen_stale(u->gen)) return -1;    /* 换代：http_stop 已叫停 */
             r = sceNetRecv(u->fd, u->sbuf, (unsigned)sizeof u->sbuf, 0);
             if (r > 0) { u->s_n = r; return 1; }
             if (r == 0) return 0;
@@ -298,6 +326,7 @@ static int upload_stream(void *ctx, unsigned char *buf, int max)
     dl = sceKernelGetSystemTimeWide() + UPLOAD_IDLE_US;
     for (;;) {
         if (recv_abort_pending()) return -1; /* 用户中止：让 receive 收尾为取消 */
+        if (gen_stale(u->gen)) return -1;    /* 换代：http_stop 已叫停 */
         int r = sceNetRecv(u->fd, buf, (unsigned)max, 0);
         if (r > 0) return r;
         if (r == 0) return 0;            /* 对端关闭 */
@@ -307,8 +336,8 @@ static int upload_stream(void *ctx, unsigned char *buf, int max)
     }
 }
 
-/* 解析 HTTP 请求并应答一个连接，返回后由调用者关 fd */
-static void handle_conn(int c, const char *rip)
+/* 解析 HTTP 请求并应答一个连接（在独立 worker 线程跑），返回后由 worker 关 fd */
+static void handle_conn(int c, const char *rip, int my_gen)
 {
     char buf[HTTP_MAX_REQ];
     struct timeval tv;
@@ -332,6 +361,10 @@ static void handle_conn(int c, const char *rip)
         /* 收请求直到出现空行（头结束）。注意：Vita 的 recv 无数据时立刻返回
          * EWOULDBLOCK，必须轮询到截止时间；每次收到后扫整个缓冲找结束符。 */
         while (n < HTTP_MAX_REQ - 1) {
+            if (gen_stale(my_gen)) {           /* 换代：服务器已停，不白等 */
+                dlog("http: req loop sees gen change from %s", rip);
+                return;
+            }
             int r = sceNetRecv(c, buf + n, (unsigned)(HTTP_MAX_REQ - 1 - n), 0);
             if (r > 0) {
                 n += r;
@@ -400,6 +433,7 @@ static void handle_conn(int c, const char *rip)
         int had = 0, idle = 0;
         if (want > HTTP_MAX_REQ - 1) want = HTTP_MAX_REQ - 1;
         while (n < want) {
+            if (gen_stale(my_gen)) return;   /* 换代：服务器已停，不白等 */
             int r = sceNetRecv(c, buf + n, (unsigned)(want - n), 0);
             if (r > 0) { n += r; buf[n] = 0; had = 1; idle = 0; continue; }
             if (r == 0 || sceKernelGetSystemTimeWide() >= dl) break;
@@ -498,6 +532,7 @@ static void handle_conn(int c, const char *rip)
         if (cl64 < 0) cl64 = 0;
         memset(&uctx, 0, sizeof uctx);       /* 含 chunked 解码状态 */
         uctx.fd = c;
+        uctx.gen = my_gen;
         uctx.left = left;
         uctx.llen = llen;
         if (cl64 <= 0) {                     /* 无 CL：dio 流式上传 → chunked */
@@ -524,11 +559,108 @@ static void handle_conn(int c, const char *rip)
     http_respond(c, 404, "Not Found", "{\"error\":\"not found\"}");
 }
 
-/* ---------- accept 线程 ----------
- * 注意：g_lsock/g_run/g_gen 都是全局。线程在入口快照自己的监听 fd 与代次：
- *  http_stop 会关旧 fd、g_run=0、g_gen++，唤醒卡在 accept 的本线程退出；
- *  即便 fd 号被后续 http_start 复用，旧线程因代次不符也不会再去 accept，
- *  避免"新旧两线程抢同一监听 fd"。 */
+/* ---------- accept 线程 + 连接 worker ----------
+ * accept 线程只做 accept + 分发（占 g_conns 槽 → 起 worker），不碰协议。
+ * 每个已接受连接由一个 worker 线程独占处理到关 fd；并发连接之间、与
+ * receive 模块的交互由 receive 侧互斥锁串行（见 receive.c 头注），连接
+ * 本身天然互不干扰：
+ *  - 槽满（HTTP_MAX_CONN 个 worker 还活着）→ 新连接立即关闭：宁可见效地
+ *    拒绝，也不让客户端在 TCP 队列里干等到超时——"忙时第二个发送方立刻
+ *    拿 409"就是这个门卫实现的；
+ *  - worker 自找本槽（sceKernelGetThreadId 匹配）取 fd/ip/代次，处理完关
+ *    fd、清槽、线程自删（ExitDeleteThread，无固定 join 者，避免泄漏）；
+ *  - 换代（http_stop/restart）后旧 worker 在收头/收体轮询里感知 gen 变化
+ *    尽早收手；worker 收尾时若代次已变，绝不关 fd——号可能已被新监听或
+ *    新连接复用，宁可漏一个死 fd；
+ *  - http_stop 关监听、join accept 线程后，对有预算地 join 仍在跑的 worker。 */
+static int conn_worker(SceSize args, void *argp)
+{
+    SceUID me = sceKernelGetThreadId();
+    int i, c = -1, my_gen = -1;
+    char ip[16] = "";
+    (void)args; (void)argp;
+
+    conn_lock();
+    for (i = 0; i < HTTP_MAX_CONN; i++) {
+        if (g_conns[i].tid == me) {
+            c = g_conns[i].fd;
+            my_gen = g_conns[i].gen;
+            memcpy(ip, g_conns[i].ip, sizeof ip);
+            break;
+        }
+    }
+    conn_unlock();
+    if (c < 0) {                     /* 兜底：找不到自己的槽（不该发生） */
+        sceKernelExitDeleteThread(0);
+        return 0;
+    }
+    dlog("http: worker %d serves conn from %s (gen %d)",
+         (int)me, ip, my_gen);
+    handle_conn(c, ip, my_gen);
+
+    conn_lock();
+    for (i = 0; i < HTTP_MAX_CONN; i++) {
+        if (g_conns[i].tid == me) {
+            g_conns[i].tid = -1;
+            g_conns[i].fd = -1;
+            g_conns[i].gen = -1;
+            break;
+        }
+    }
+    conn_unlock();
+    if (my_gen == g_gen)             /* 换代后绝不关：号可能已被新代复用 */
+        sceNetSocketClose(c);
+    dlog("http: worker %d done", (int)me);
+    sceKernelExitDeleteThread(0);
+    return 0;
+}
+
+/* 登记并启动一个连接 worker；返回 1=已开，0=满员/失败（调用者应关 fd） */
+static int spawn_conn(int c, const char *ip)
+{
+    int i;
+    SceUID t;
+
+    conn_lock();
+    for (i = 0; i < HTTP_MAX_CONN; i++)
+        if (g_conns[i].tid <= 0) break;     /* <=0 = 空槽（含零初始的未用槽） */
+    if (i >= HTTP_MAX_CONN) {        /* 满员：礼貌拒绝 */
+        conn_unlock();
+        dlog("http: conn from %s refused: %d workers busy", ip, HTTP_MAX_CONN);
+        return 0;
+    }
+    g_conns[i].fd = c;
+    g_conns[i].gen = g_gen;
+    g_conns[i].tid = -1;             /* 先占槽（create 成功前 stop 跳过它） */
+    memcpy(g_conns[i].ip, ip, 16);
+    conn_unlock();
+
+    t = sceKernelCreateThread("psvsend_httpc", conn_worker, 0x40,
+                              HTTP_CONN_STACK, 0, 0, NULL);
+    if (t < 0) {
+        dlog("http: worker create fail 0x%08X from %s", (unsigned)t, ip);
+        conn_lock();
+        g_conns[i].fd = -1;
+        g_conns[i].gen = -1;
+        conn_unlock();
+        return 0;
+    }
+    conn_lock();
+    g_conns[i].tid = t;              /* 登记后再 start，worker 靠 tid 找槽 */
+    conn_unlock();
+    if (sceKernelStartThread(t, 0, NULL) < 0) {
+        dlog("http: worker start fail from %s", ip);
+        conn_lock();
+        g_conns[i].tid = -1;
+        g_conns[i].fd = -1;
+        g_conns[i].gen = -1;
+        conn_unlock();
+        sceKernelDeleteThread(t);
+        return 0;
+    }
+    return 1;
+}
+
 static int http_thr(SceSize args, void *argp)
 {
     int my_gen = g_gen;
@@ -563,9 +695,9 @@ static int http_thr(SceSize args, void *argp)
         if (sceNetInetNtop(SCE_NET_AF_INET, &cli.sin_addr.s_addr,
                            ip, sizeof ip) == NULL)
             snprintf(ip, sizeof ip, "?");
-        dlog("http: conn from %s", ip);
-        handle_conn(c, ip);
-        sceNetSocketClose(c);
+        dlog("http: conn from %s (gen %d)", ip, my_gen);
+        if (!spawn_conn(c, ip))    /* 满员/起线程失败：立即关，不晾队列里 */
+            sceNetSocketClose(c);
     }
     dlog("http: accept thread gen %d exit", my_gen);
     return 0;
@@ -581,6 +713,10 @@ int http_start(void)
     int one = 1, i, s = -1, chosen = 0;
 
     if (g_port > 0) return g_port;   /* 已在跑 */
+
+    if (g_conn_mtx < 0)              /* 连接登记表锁：随服务器首次启动创建，
+                                      * 跨 stop/start 复用（stop 不销毁） */
+        g_conn_mtx = sceKernelCreateMutex("psvsend_conn", 0, 0, NULL);
 
     for (i = 0; i < (int)(sizeof cand / sizeof cand[0]); i++) {
         int r;
@@ -604,7 +740,9 @@ int http_start(void)
         dlog("http: no bindable port");
         return -1;
     }
-    if (sceNetListen(s, 8) < 0) {   /* 收体是逐连接顺序处理的，backlog 留宽点 */
+    if (sceNetListen(s, 8) < 0) {   /* 连接交给独立 worker 并发处理，backlog 8
+                                     * 兜底瞬时并发（超 HTTP_MAX_CONN 的连接会
+                                     * 在 accept 时被立即关闭——礼貌拒绝） */
         sceNetSocketClose(s);
         dlog("http: listen fail");
         return -2;
@@ -658,8 +796,35 @@ int http_alive(void)
     return 1;                              /* 仍在跑（st 为超时/其他错误码） */
 }
 
-/* 停服务器：置停跑标志、换代、关监听 socket 让 accept 立刻出错退出，等线程结束。
- * 等不到（异常，如正卡在慢连接收尾）也把句柄丢掉并换代；旧线程回到循环头时
+/* join 仍在跑的连接 worker：换代感知让它们在 ~20ms 轮询粒度内自退，这里给
+ * 总预算 500ms 逐轮等；等不到的（如卡在 receive 内等 UI 决定）弃管——它们
+ * 处理完会自删线程，收尾时因代次已变也不会去碰 fd。 */
+static void http_join_conns(void)
+{
+    SceLong64 dl = sceKernelGetSystemTimeWide() + 500000LL;
+    for (;;) {
+        SceUID t = -1;
+        SceLong64 rem;
+        conn_lock();
+        for (int i = 0; i < HTTP_MAX_CONN; i++)
+            if (g_conns[i].tid > 0) { t = g_conns[i].tid; break; }  /* 真实线程才 join */
+        conn_unlock();
+        if (t < 0) break;
+        rem = dl - sceKernelGetSystemTimeWide();
+        if (rem <= 0) break;
+        {
+            SceUInt to = rem > 100000 ? 100000 : (SceUInt)rem;
+            int st = sceKernelWaitThreadEnd(t, NULL, &to);
+            if (st == 0)
+                dlog("http: worker %d joined", (int)t);
+            /* 超时/线程已自删：下轮再找（槽空则结束） */
+        }
+    }
+    dlog("http: workers drained");
+}
+
+/* 停服务器：置停跑标志、换代、关监听 socket 让 accept 立刻出错退出，等 accept
+ * 线程与仍存活的连接 worker 结束（有预算，等不到弃管）。旧线程回到循环头时
  * 因代次不符会自行退出，不会碰新启动的监听。 */
 void http_stop(void)
 {
@@ -672,12 +837,13 @@ void http_stop(void)
         g_lsock = -1;
     }
     if (g_thr >= 0) {
-        SceUInt to = 500 * 1000;      /* 最多等 500ms（收体中关 fd 会立刻返回） */
+        SceUInt to = 500 * 1000;      /* 最多等 500ms（关监听后 accept 立即醒） */
         int st = sceKernelWaitThreadEnd(g_thr, NULL, &to);
         if (st < 0)
             dlog("http: wait thread end -> 0x%08X", (unsigned)st);
         g_thr = -1;
     }
+    http_join_conns();               /* 有预算地等仍在跑的连接 worker */
     g_port = 0;
 }
 

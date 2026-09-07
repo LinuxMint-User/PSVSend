@@ -1,8 +1,9 @@
 /* receive.c —— 接收方向实现（LocalSend v2 上传 API 的服务端会话，见 receive.h）。
  *
- * 线程模型：所有 recv_http_* 由 http.c 的 http_thr 单线程顺序调用（prepare 阻塞
- * 等 UI 决定期间 http 线程被占用——这正是"单活动会话"约束的天然实现）。UI 线程
- * 通过 *_pull/_decide/_abort 访问同一份锁内状态。
+ * 线程模型：http.c 为每个连接开独立 worker 线程并发调用 recv_http_*；本模块
+ * 用一个全互斥 g_mtx 保护会话状态，单活动会话（一次只收一个设备）由 prepare 的
+ * "检查+占位原子化"与 upload 的 busy 门卫共同保证——多余的并发连接立刻拿 409，
+ * 不会被静默晾在 TCP 队列里。UI 线程通过 *_pull/_decide/_abort 访问同一份锁内状态。
  *
  * 边界处理（用户约定）：
  *  - 大文件绝不全量入内存：upload 由 http.c 提供流读回调，边收边写 .part 临时文件，
@@ -22,6 +23,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <mbedtls/sha256.h>
 #include "receive.h"
+#include "transfer.h"       /* xfer_active：发送中拒绝接收（礼貌拒绝） */
 #include "json_util.h"
 #include "config.h"
 #include "dlog.h"
@@ -357,16 +359,30 @@ int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz)
     bool pend_accept;
 
     if (respsz > 0) resp[0] = 0;
-    lock();
-    r = (g_phase == PH_ACTIVE);
-    unlock();
-    if (r) return 409;                       /* 已有活动会话（含终态未清场） */
 
     infov = json_get_val(body, "info");
     filesv = json_get_val(body, "files");
     if (!infov || !filesv) return 400;       /* 坏体 */
 
+    /* 发送中拒绝接收：PSV 正在给别的设备传文件（xfer 线程 active）时，本机
+     * 接收侧虽空闲，但 UI 在传输页不会弹确认（pages_tick 不打断），新请求
+     * 只会干挂 60s 超时。不如立刻 409，让对端马上看到"对方正忙"，与接收
+     * 忙碌时的表现一致。锁序：此处先短暂取 transfer 锁、未碰 receive 锁，
+     * 无嵌套；结束后发送状态若翻转，最多多拒/多收一次，对端重试即可。 */
+    if (xfer_active()) {
+        dlog("recv: prepare refused, PSV sending (xfer active)");
+        return 409;
+    }
+
+    /* 检查+占位必须持锁原子完成：http 现在多连接并发，若先查后占分两次
+     * 加锁，两个并发 prepare 可能同时通过检查互相覆盖 g_pend。因此进锁后
+     * 只要不是 PH_NONE（有待决定/活动/终态未清场）就立即 409 礼貌拒绝。 */
     lock();
+    if (g_phase != PH_NONE) {
+        unlock();
+        return 409;
+    }
+    g_phase = PH_PENDING;                    /* 先占位：锁内的并发 prepare 409 */
     g_pend.alias[0] = 0;
     g_pend.type[0] = 0;
     snprintf(g_pend.ip, sizeof g_pend.ip, "%s", ip ? ip : "");
@@ -404,24 +420,25 @@ int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz)
         } while (code == 200 && json_iter_next(&it));
     }
     if (code != 200) {
+        g_phase = PH_NONE;                   /* 撤销占位 */
         unlock();
         return 400;
     }
     if (n == 0) {                            /* 没有要传的文件 */
-        g_phase = PH_NONE;
+        g_phase = PH_NONE;                   /* 撤销占位 */
         unlock();
         return 204;
     }
     g_pend.n = n;
     g_pend_result = 0;
-    g_phase = PH_PENDING;
     dlog("recv: prepare %d files from %s (%s)", n, g_pend.alias, g_pend.ip);
     if (g_pend.overflow)
         dlog("recv: %d more file(s) exceed the cap %d, will be dropped",
              g_pend.overflow, RECV_MAX_FILES);
     unlock();
 
-    /* 等 UI 决定：轮询（http 线程单线程，这里睡着期间不再接别的连接） */
+    /* 等 UI 决定：轮询（本连接占一个 http worker，最长 60s；期间其他连接
+     * 由各自的 worker 并发处理，遇到 PH_PENDING 一律 409，不会踩这份状态） */
     dl = (SceLong64)now_us() + RECV_DECIDE_TIMEOUT_US;
     for (;;) {
         lock();
@@ -570,6 +587,11 @@ int recv_http_upload(const char *query, const char *ip, SceOff total,
         unlock();
         return f->size == 0 ? 200 : 403;
     }
+    if (g_sess.busy) {                       /* 另一文件正在流式收体（http 并发连接）：
+                                              * 单活动会话下不该发生，礼貌拒绝 */
+        unlock();
+        return 409;
+    }
     if (total >= 0 && total != f->size) {    /* Content-Length 与清单不符（无 CL 时 total=-1，读完再验） */
         sess_fail_locked("文件大小与清单不符");
         unlock();
@@ -710,9 +732,17 @@ int recv_http_cancel(const char *query, const char *ip)
     lock();
     if (g_phase == PH_ACTIVE && sid[0] &&
         strcmp(g_sess.session, sid) == 0) {
-        cleanup_parts();
-        sess_terminal(RECV_ST_CANCEL, "发送方取消");
-        dlog("recv: session %s cancelled by sender", g_sess.session);
+        if (g_sess.busy) {
+            /* 正在流式收体（http 并发连接）：直接清场会删掉收体中那个
+             * .part；置中止位，让收体循环在锁内统一收尾（与 UI 取消一致） */
+            g_abort = 1;
+            dlog("recv: session %s cancel by sender during body -> abort",
+                 g_sess.session);
+        } else {
+            cleanup_parts();
+            sess_terminal(RECV_ST_CANCEL, "发送方取消");
+            dlog("recv: session %s cancelled by sender", g_sess.session);
+        }
     }
     unlock();
     return 200;                              /* 协议：cancel 恒回 200 */

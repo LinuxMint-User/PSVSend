@@ -49,6 +49,7 @@
 typedef struct {
     XferInfo   v;
     volatile int  cancel;
+    volatile int  notified;          /* cancel 通知已尝试（每任务一次，memset 清零） */
     SceUID     th;
     char       ip[16];
     int        port;
@@ -121,13 +122,22 @@ static void fail_file(int i, const char *fmt, ...)
     fail("%s", tmp);
 }
 
-/* 取消收尾（终态显示 cancelled） */
+/* 协议 v1 §3.3：cancel 由【发送方】在取消会话时调用，通知接收方清理与显示
+ * "对方已取消"。若只断流不通知，接收方（尤其官方客户端）会把断流判成
+ * "应收 X 实收 Y"的字节错误且不清残留——官方手机端就有这毛病。实现见 conn_open
+ * 之后（依赖连接工具）；尽力通知：会话没建立（session 空）不需要；连不上/超时
+ * 就算了，对方至多按断流报错。*/
+static void cancel_notify_peer(void);
+
+/* 取消收尾（终态显示 cancelled）。cancel 通知已由各传输中取消点在断流前提前发
+ * （见 upload 循环），此处再调一次是兜底（guard 保证每任务最多发一次）。 */
 static void finish_cancelled(void)
 {
     lock();
     g_j.v.cancelled = true;
     unlock();
     fail("cancelled by user");
+    cancel_notify_peer();
 }
 
 /* ---------- 连接抽象：一条 HTTP(S) 连接 ---------- */
@@ -521,6 +531,31 @@ static int conn_open(Conn *c, const char *method_path, SceOff body_len)
     return 0;
 }
 
+/* 尽力向接收方 POST cancel（声明见上）。通知期间临时清取消标志——取消已触发，
+ * 但这条新连接的 send/recv 轮询不能再被 -2 打断；结束后恢复。 */
+static void cancel_notify_peer(void)
+{
+    char path[96];
+    Conn c;
+    char rbuf[256];
+    int code = 0;
+    if (!g_j.session[0]) return;     /* 会话还没建立：无可通知 */
+    if (g_j.notified) return;        /* 每任务只尽力通知一次 */
+    g_j.notified = 1;
+    snprintf(path, sizeof path, "/api/localsend/v2/cancel?sessionId=%s", g_j.session);
+    dlog("xfer: notify receiver cancel (session %s)", g_j.session);
+    g_j.cancel = 0;
+    memset(&c, 0, sizeof c);
+    c.fd = -1;
+    c.tls = g_j.tls;
+    if (conn_open(&c, path, 0) == 0) {
+        read_resp(&c, &code, rbuf, (int)sizeof rbuf, 5000000LL);
+        dlog("xfer: cancel notify -> HTTP %d", code);
+        conn_close(&c);
+    }
+    g_j.cancel = 1;
+}
+
 /* ---------- JSON 拼装/解析 ---------- */
 
 /* 在 doc 中定位 "key":"..." 并把值拷出（值不转义，用于 session/token） */
@@ -661,7 +696,7 @@ static int xfer_thr(SceSize args, void *argp)
     for (i = 0; i < g_j.count; i++) {
         int fd, rd, sr, blen;
         SceOff sent_file = 0;
-        if (g_j.cancel) { finish_cancelled(); return 0; }
+        if (g_j.cancel) { cancel_notify_peer(); finish_cancelled(); return 0; }
         if (g_j.tokens[i][0] == 0) {
             fail_file(i, "no token for %s", g_j.files[i].name);
             return 0;
@@ -689,6 +724,7 @@ static int xfer_thr(SceSize args, void *argp)
             c.tls = g_j.tls;
             sr = conn_open(&c, q, g_j.files[i].size);
             if (sr == -2) {           /* conn_open 取消已自关 */
+                cancel_notify_peer(); /* 对方在等首文件流：先通知，别让它干等 */
                 sceIoClose(fd);
                 finish_cancelled();
                 return 0;
@@ -705,6 +741,8 @@ static int xfer_thr(SceSize args, void *argp)
                 SceOff want = g_j.files[i].size - sent_file;
                 if (want > (SceOff)sizeof chunk) want = sizeof chunk;
                 if (g_j.cancel) {
+                    cancel_notify_peer(); /* 先通知再断流：对方收到 cancel 主动收尾，
+                                           * 不会把随后的连接断流判成字节错误 */
                     conn_close(&c);
                     sceIoClose(fd);
                     finish_cancelled();
@@ -719,6 +757,7 @@ static int xfer_thr(SceSize args, void *argp)
                 }
                 sr = conn_send_all(&c, chunk, rd);
                 if (sr < 0) {
+                    if (sr == -2) cancel_notify_peer(); /* 发送中被取消：断流前通知 */
                     conn_close(&c);
                     sceIoClose(fd);
                     if (sr == -2) finish_cancelled();
@@ -732,6 +771,7 @@ static int xfer_thr(SceSize args, void *argp)
             blen = read_resp(&c, &code, abuf, sizeof abuf, OP_TIMEOUT_US);
             conn_close(&c);
             if (blen == -2) {
+                cancel_notify_peer(); /* body 已发完等回执时取消：收尾前通知 */
                 sceIoClose(fd);
                 finish_cancelled();
                 return 0;
@@ -747,7 +787,7 @@ static int xfer_thr(SceSize args, void *argp)
              (long long)g_j.files[i].size);
         set_file_state(i, 2, g_j.files[i].size);
     }
-    if (g_j.cancel) { finish_cancelled(); return 0; }
+    if (g_j.cancel) { cancel_notify_peer(); finish_cancelled(); return 0; }
 
     lock();
     g_j.v.finished = true;
@@ -841,4 +881,13 @@ void xfer_info(XferInfo *out)
     lock();
     if (out) *out = g_j.v;
     unlock();
+}
+
+bool xfer_active(void)
+{
+    bool a;
+    lock();
+    a = g_j.v.active;
+    unlock();
+    return a;
 }
