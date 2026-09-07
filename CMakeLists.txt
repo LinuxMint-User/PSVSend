@@ -29,6 +29,10 @@ set(APP_VER "${_av_major}.${_av_minor}")
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# 源码按依赖域分子目录（core/net/proto/app/ui），include 以 src/ 为根写
+# 相对全路径（如 "core/dlog.h"、"net/http.h"），故把 src 加入头文件搜索路径。
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # 给代码段(RX)末尾预留 SCE 元数据空间：vita-elf-create 要把模块/导入表塞在
 # 段0结尾与段1(RW)之间的空隙，代码大了会越界报 "segment 1 overlaps"。
 # 工具链自带 linker script 支持 __sce_headroom 符号（64KB 对齐前加空档），
@@ -40,18 +44,18 @@ set(VITA_TITLE  "PSVSend")
 
 add_executable(${PROJECT_NAME}
     src/main.c
-    src/api.c
-    src/config.c
-    src/dlog.c
-    src/discovery.c
-    src/http.c
-    src/i18n.c
-    src/identity.c
-    src/json_util.c
-    src/net.c
-    src/receive.c
-    src/scan.c
-    src/transfer.c
+    src/app/api.c
+    src/core/config.c
+    src/core/dlog.c
+    src/core/i18n.c
+    src/core/json_util.c
+    src/net/discovery.c
+    src/net/http.c
+    src/net/identity.c
+    src/net/net.c
+    src/net/scan.c
+    src/proto/receive.c
+    src/proto/transfer.c
     src/ui/ui_main.c
     src/ui/pages.c
     src/ui/widgets.c

@@ -19,14 +19,14 @@
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/sha256.h>
-#include "config.h"
-#include "json_util.h"
-#include "net.h"
-#include "http.h"
-#include "api.h"
-#include "discovery.h"
-#include "identity.h"
-#include "dlog.h"
+#include "core/config.h"
+#include "core/json_util.h"
+#include "net/net.h"
+#include "net/http.h"
+#include "app/api.h"
+#include "net/discovery.h"
+#include "net/identity.h"
+#include "core/dlog.h"
 
 #define SCAN_PORT       53317          /* 协议默认 HTTP 端口 */
 #define SCAN_CONNECT_US 180000LL       /* 单 IP connect 预算 */

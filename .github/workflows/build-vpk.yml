@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '发布版本号（留空自动读取 src/config.h 的 PSVSEND_APP_VERSION）'
+        description: '发布版本号（留空自动读取 src/core/config.h 的 PSVSEND_APP_VERSION）'
         required: false
         default: ''
   push:

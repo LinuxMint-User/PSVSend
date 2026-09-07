@@ -22,11 +22,11 @@
 #include <psp2/kernel/threadmgr/mutex.h>
 #include <psp2/kernel/processmgr.h>
 #include <mbedtls/sha256.h>
-#include "receive.h"
-#include "transfer.h"       /* xfer_active：发送中拒绝接收（礼貌拒绝） */
-#include "json_util.h"
-#include "config.h"
-#include "dlog.h"
+#include "proto/receive.h"
+#include "proto/transfer.h"       /* xfer_active：发送中拒绝接收（礼貌拒绝） */
+#include "core/json_util.h"
+#include "core/config.h"
+#include "core/dlog.h"
 
 #define RECV_DECIDE_TIMEOUT_US (60 * 1000000LL)  /* prepare 等 UI 决定的上限 */
 #define RECV_IDLE_TIMEOUT_US   (120 * 1000000LL) /* 接受后/文件间没动静 → TIMEOUT */

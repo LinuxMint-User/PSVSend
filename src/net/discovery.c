@@ -13,13 +13,13 @@
 #include <psp2/net/net.h>
 #include <psp2/kernel/threadmgr/thread.h>
 #include <psp2/kernel/threadmgr/mutex.h>
-#include "config.h"
-#include "json_util.h"
-#include "net.h"
-#include "http.h"
-#include "api.h"
-#include "discovery.h"
-#include "dlog.h"
+#include "core/config.h"
+#include "core/json_util.h"
+#include "net/net.h"
+#include "net/http.h"
+#include "app/api.h"
+#include "net/discovery.h"
+#include "core/dlog.h"
 
 #define DISC_ADDR    "224.0.0.167"
 #define DISC_PORT    53317

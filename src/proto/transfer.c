@@ -26,12 +26,12 @@
 #include <mbedtls/sha256.h>
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/pk.h>
-#include "transfer.h"
-#include "config.h"
-#include "identity.h"
-#include "http.h"
-#include "json_util.h"
-#include "dlog.h"
+#include "proto/transfer.h"
+#include "core/config.h"
+#include "net/identity.h"
+#include "net/http.h"
+#include "core/json_util.h"
+#include "core/dlog.h"
 
 #define NET_AGAIN(r) ((r) == 0x80410123)
 #define POLL_US       20000          /* 20ms 轮询间隔 */

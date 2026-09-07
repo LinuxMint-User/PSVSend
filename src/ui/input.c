@@ -5,7 +5,7 @@
 #include <psp2/ctrl.h>
 #include <psp2/touch.h>
 #include <psp2/kernel/threadmgr/thread.h>
-#include "ui.h"
+#include "ui/ui.h"
 
 int g_confirm_key = SCE_CTRL_CROSS;
 int g_back_key    = SCE_CTRL_CIRCLE;

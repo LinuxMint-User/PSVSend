@@ -4,8 +4,8 @@
 #include <string.h>
 #include <math.h>
 #include <vita2d.h>
-#include "ui.h"
-#include "theme.h"
+#include "ui/ui.h"
+#include "ui/theme.h"
 
 /* ---------- 文字 ----------
  * 字符路由：码点 <= 0xFF（ASCII / Latin-1）走拉丁字体，其余（CJK、

@@ -12,13 +12,13 @@
 - **已落地（发送方向）**：UDP 组播发现 / register 入表 → UI 选设备、浏览 ux0 选文件 → `transfer.c` 按对方 announce 的 protocol 走 HTTP 明文或 HTTPS（mbedTLS 3.6.5、锁定 TLS1.2）执行 `prepare-upload` / `upload`，带进度回写与本地取消。HTTPS 连接自动出示内嵌设备身份证书（mTLS，应对 2026 官方 Rust 内核接收端强制客户端证书），并按对方指纹锁定其证书（详见 §3 决策表）。
 - **已落地（接收方向）**：对方 prepare-upload → 自动弹接收确认页（Accept / Setup 逐文件勾选 / Reject）→ upload 由 http.c 提供流读回调、receive.c 边收边写 `ux0:data/psvsend/downloads/`（先 `.part` 收完改名，sha256 可选校验，断流/校验失败删残留，开机清扫遗留）。兼容对方无 Content-Length 的 **chunked 流式上传**（http.c 内嵌解码状态机）；多文件同会话逐 POST upload。取消/放弃/空闲超时等状态经快照接口给 UI 展示结束原因。announce 已声明 `download:true`。
 - **已落地（发现补充）**：Vita 收不了 UDP 组播、也绑不了 53317，设备表主要靠对方主动 register 与 `scan.c` 主动扫描（向 /24 各 IP 的 53317 POST register 拿 member info）。扫描按 **TLS→明文顺序**探测并携带设备身份证书（2026 官方 Rust 内核接收端强制 mTLS 客户端证书），明文兜底兼容纯 HTTP 端；**优先探测历史在线设备**（config `knownIps` 持久化、LRU、上限 24，入表即记录），常用设备实测轮次开始 ~0.7s 内出现。曾修复两处致手动扫描失效的 bug：`s_read_resp` 未把响应 body 移到缓冲区头部（JSON 解析永远失败、found 恒 0）；TLS 探测静默失败。UI 三角键手动触发。
-- 实现边界的完整清单（单会话 409、清单 32 文件/8KB、超时 60s/120s/30s 三档、接收仅明文 HTTP、单线程顺序处理连接、/24 扫描范围等）见 README「边界与已知限制」。
+- 实现边界的完整清单（忙时 409 / 每连接 worker 上限 8、清单 32 文件/8KB、超时 60s/120s/30s 三档、接收仅明文 HTTP、/24 扫描范围等）见 README「边界与已知限制」。
 - **已落地（稳定性，v2.0.0）**：修复待机唤醒 / Wi-Fi 断开恢复后卡「网络未就绪 / 没扫到设备」——watch 看门狗单线程低频轮询 netctl + 全互斥 `initCount=0` 语义修正（发现/扫描/收发/net 各互斥均改为无人先持锁），恢复后 UI 心跳自动续上；另曾用 6s 模拟断网窗口复现，现该调试开关已置 0（net.c `PSVSEND_SIM_DOWN_MS`，需要时 cmake 覆盖）。
 - **已落地（渲染稳定，v2.0.0）**：修复偶发 **GPU render crash**（先兆为界面「三角形空白撕裂」→ 系统判 render gpu crash 重启）。根因：主循环缺 `vita2d_wait_rendering_done()`，每帧 swap 后 GPU 队列无收敛点，渲染/显示队列超前回绕导致撕裂与驱动状态错乱；修复：每帧 swap 后等待渲染完成（ui_main.c）。字体对象另改为启动帧外预载（`font_preload_all`），堵住"渲染中途创建 GPU 纹理"的隐患（非本次根因，作加固保留）。
-- **已落地（界面，v2.0.0）**：中 / 英双语界面（设置页切换，`i18n.c/h`）+ 设置页底部「关于」区（PSVSend 大字 logo、应用版本与 LocalSend 适配说明）。版本号单源维护：手改 `CMakeLists.txt` 的 `project(VERSION)` 与 `config.h` 的 `PSVSEND_APP_VERSION`，SFO `APP_VER` 由 VERSION 自动派生。
+- **已落地（界面，v2.0.0）**：中 / 英双语界面（设置页切换，`i18n.c/h`）+ 设置页底部「关于」区（PSVSend 大字 logo、应用版本与 LocalSend 适配说明）。版本号单源维护：手改 `CMakeLists.txt` 的 `project(VERSION)` 与 `core/config.h` 的 `PSVSEND_APP_VERSION`，SFO `APP_VER` 由 VERSION 自动派生。
 - **已落地（工程，v2.0.0 后）**：GitHub Actions（`.github/workflows/build-vpk.yml`）在官方 vitasdk 2026.08 Docker 镜像内自动构建 VPK：推送 `v*` tag 或 Actions 页手动触发 → 生成 **Releases 草稿**（人工确认后公开）。注意本地与 CI 产物 `eboot.bin` 存在字节差异（本地链接 vdpm prebuilt 静态库，CI 链接镜像内现场编译的同源库），功能等价（真机验证通过）；需字节级可复现则须统一在容器内构建。
 - **未落地**：与 §4/§5 目标架构的规划差项（session.c 拆分、multipart 收件、接收设置页改名/选目录等）仍在路线中；中文字体已落地（见 §5.5），不再在列。
-- 本文按"目标架构"描述，部分命名与实际源码不同（如目标 `http_server.c` / `http_client.c` 实际为 `http.c` / `transfer.c`）；现状与源码布局以 README「目录结构」为准。
+- 本文按"目标架构"描述，部分命名与实际源码不同（如目标 `http_server.c` / `http_client.c` 实际为 `net/http.c` / `proto/transfer.c`）；**现状源码布局以 §4.1 模块树为准**（2026-09-07 起按依赖域分子目录）。
 
 ## 2. 总体架构（前后端分层）
 
@@ -63,15 +63,33 @@
 
 ### 4.1 模块划分（单向依赖，无环）
 
+> 2026-09-07 起源码按依赖域分子目录（纯物理归位，无逻辑改动）；include 一律以
+> `src/` 为根写相对全路径（如 `core/dlog.h`）。分层方向：core ← net/proto ← app ← ui。
+
 ```
 src/
-├── api.h          # 前后端契约：接口 + 回调
-├── net.c          # 网络初始化（加载 SCE_SYSMODULE_NET、sceNetInit、资源池）
-├── discovery.c    # UDP 发现：announce 发送 + 组播监听 + 设备表
-├── http_server.c  # HTTP 服务器：路由 + multipart 解析 + 流式写盘
-├── http_client.c  # HTTP 客户端：register / prepare / upload / cancel
-├── session.c      # 会话管理：状态机 + 文件清单 + 进度
-└── json_util.c    # JSON 生成/解析（封装 SceLibJson 或手写简单版）
+├── main.c         # 入口：启动后端 + UI
+├── app/           # 装配层：api.h/c（前后端契约：接口 + 回调 + Device 快照）
+├── core/          # 无业务依赖的基础设施
+│   ├── config.c/h     # 配置持久化（ux0:data/psvsend/）
+│   ├── dlog.c/h       # 日志（log.txt）
+│   ├── i18n.c/h       # 文案本地化
+│   └── json_util.c/h  # JSON 生成/解析（手写简单版）
+├── net/           # 网络与协议传输层
+│   ├── net.c/h         # 网络初始化（SceSysmodule、sceNetInit、资源池）+ 链路轮询
+│   ├── discovery.c/h   # UDP 发现：announce 发送 + register 入表 + 设备表
+│   ├── scan.c/h        # 主动探测（明文/TLS 双路径，known-IP 优先）
+│   ├── http.c/h        # 迷你 HTTP 服务器（worker 并发 + 礼貌拒绝）与 HTTP 客户端
+│   └── identity.c/h    # TLS 设备身份（自签证书，附 id_cert.inc / id_key.inc）
+├── proto/         # LocalSend 协议会话
+│   ├── receive.c/h     # 接收方向：会话状态机 + 流式写盘 + 用户确认
+│   └── transfer.c/h    # 发送方向：prepare/upload 线程 + 进度回写 + 取消通知
+└── ui/            # 前端（事件驱动 + 状态机）
+    ├── ui_main.c       # 主循环 / 页面机 / 输入与渲染帧
+    ├── pages.c         # 各页面（设备列表/文件浏览/确认/传输/设置）
+    ├── widgets.c       # 控件（列表/按钮/进度条…）
+    ├── input.c         # 按键/触摸 → 动作映射
+    └── theme.c/h       # 主题
 ```
 
 ### 4.2 核心数据结构

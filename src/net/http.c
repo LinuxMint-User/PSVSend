@@ -13,11 +13,11 @@
 #include <psp2/kernel/threadmgr/thread.h>
 #include <psp2/kernel/threadmgr/mutex.h>
 #include <sys/time.h>
-#include "config.h"
-#include "json_util.h"
-#include "http.h"
-#include "receive.h"
-#include "dlog.h"
+#include "core/config.h"
+#include "core/json_util.h"
+#include "net/http.h"
+#include "proto/receive.h"
+#include "core/dlog.h"
 
 #define HTTP_RECV_TIMEOUT_S 3
 #define HTTP_MAX_REQ        32768   /* 请求头+体总读入上限（64 文件 prepare 清单可能 ~20KB） */

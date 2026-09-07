@@ -98,7 +98,7 @@ cmake --build build
 
 ### HTTPS / mTLS 说明
 
-发送端按对方 announce 的 `protocol` 自动选择明文 HTTP 或 HTTPS。2026 版官方 LocalSend（Rust 内核）对无浏览器会话的发送方强制要求**客户端证书**（mTLS），不出示证书直接握手失败（`certificate_required`）。为此 PSVSend 随固件内置一张设备身份证书（自签 RSA-2048，见 `src/id_cert.inc` / `src/id_key.inc`），HTTPS 连接自动出示；同时按对方 announce 的指纹（证书 SHA-256）锁定服务端证书，不依赖 CA 链。接收端只校验设备证书本身有效，无需信任本客户端。
+发送端按对方 announce 的 `protocol` 自动选择明文 HTTP 或 HTTPS。2026 版官方 LocalSend（Rust 内核）对无浏览器会话的发送方强制要求**客户端证书**（mTLS），不出示证书直接握手失败（`certificate_required`）。为此 PSVSend 随固件内置一张设备身份证书（自签 RSA-2048，见 `src/net/id_cert.inc` / `src/net/id_key.inc`），HTTPS 连接自动出示；同时按对方 announce 的指纹（证书 SHA-256）锁定服务端证书，不依赖 CA 链。接收端只校验设备证书本身有效，无需信任本客户端。
 
 ## 边界与已知限制
 
@@ -110,13 +110,13 @@ cmake --build build
 - **Vita 收不了 UDP 组播**：系统保留 53317（bind 报 EACCES），而 LocalSend 组播固定发往 `224.0.0.167:53317`，无法 bind 即无法收包。设备列表靠两条替代路径填充：对方主动 HTTP register（每 ~5s）+ 手动主动扫描（设备列表按 **△**）
 - **主动扫描只覆盖 /24 子网**（假设掩码 255.255.255.0）：非常规子网（/16、/23 等）扫不全。扫描携带设备证书、逐 IP TLS→明文探测（2026 官方端默认 HTTPS，故 TLS 优先，明文兜底兼容纯 HTTP 端），对 HTTPS/mTLS 官方端有效（2026 版 Rust 内核要求出示客户端证书，见上）；**优先探测历史在线设备**（config `knownIps` 持久化，上限 24、LRU 淘汰），常用设备通常在轮次开始后 ~1s、进度极低时即出现；实测整轮约 6~10s（8 并发 worker），界面有进度；每轮会对未在线的 IP 全部空探一遍（无法跳过，扫描期间网络开销较低）
 - **设备表 90s 无动静移除**：对方停止 announce/register 90s 后从列表消失
-- **HTTP 服务器单线程顺序处理**：一次只服务一个 TCP 连接，大文件 upload 期间其它请求（对方的周期 register、下一文件 upload）在 backlog 排队。多文件传输不受影响（对方串行等待应答），但传 >90s 的大文件期间对方 register 应答被延后，其设备条目可能因 90s 过期短暂消失、处理完后又回来——传输本身不受影响
+- **HTTP 服务器每连接独立 worker**：accept 线程只分发，一个连接一个处理线程（上限 8，满员立即关闭新连接）。忙时（本机正在收/发文件）对方的新请求**立即收到 409**（LocalSend 端显示"对方正在处理另一个请求"），不会在 TCP 队列里干等；空闲时 register/prepare 等请求不会被大文件 upload 阻塞。仍为**单活动接收会话**（一次只收一个设备，见下）
 
 ### 接收
 
 - 多文件接收中途取消的竞态已修复（收满优先于取消判断）：正在传的文件若已收满则保留完整、会话以「用户取消」收尾，未收满才清理其残 `.part`；已收完的文件始终保留
 - **接收端只监听明文 HTTP**（候选端口 4567/53318/…，announce 声明 `protocol:http`）；HTTPS 仅用于 PSV 作为发送方时。对方会按 announce 自动走明文
-- **同一时刻只处理一个接收会话**：进行中或结束未清场时，新的 prepare-upload 返回 409
+- **同一时刻只处理一个接收会话**：正在收/已结束未清场时，新的 prepare-upload 返回 409；**PSV 正在发送文件时同样 409**（发送中不收新文件），避免请求被晾到超时
 - **清单上限**：单会话 ≤32 个文件（超出部分被忽略，回执只列前 32 个）；清单 JSON 体 ≤8KB；文件名 ≤192 字符截断
 - **超时三档**：prepare 等界面决定 **60s**（超时回 403）；接受后/文件间空闲 **120s**（判定 TIMEOUT、清理临时文件）；收体中 socket 连续 **30s** 无数据判为断流
 - **sha256 校验仅当对方提供**（prepare 清单里有 64 位 hex 才校验，不符回 422）；多数客户端默认带 sha256
@@ -168,23 +168,20 @@ cmake --build build
 ├── env.sh                      # 随仓库分发
 ├── build.sh                    # 随仓库分发：一键构建脚本
 ├── .github/workflows/          # 随仓库分发：CI 构建 + Release 草稿发布
-├── src/                        # 随仓库分发：源码
-│   ├── main.c                  # 入口
-│   ├── api.c                   # 前后端契约：启动 / 网络巡检 / 设备快照
-│   ├── net.c                   # SceNet 网络初始化
-│   ├── discovery.c             # UDP 组播 announce 发送 + 设备表维护（register 入表在 http.c）
-│   ├── http.c                  # HTTP 服务器：register / info 入表 + prepare-upload / upload / cancel 接收路由
-│   ├── transfer.c              # 发送客户端：prepare-upload / upload（HTTP + HTTPS）
-│   ├── receive.c               # 接收会话：确认/拒绝、流式写盘 downloads/、断流清理
-│   ├── scan.c                  # 主动扫描：向 /24 网段逐 IP HTTP 探测补全设备表
-│   ├── identity.c / id_cert.inc / id_key.inc  # 内嵌设备身份证书（HTTPS mTLS）
-│   ├── config.c / i18n.c / json_util.c / dlog.c
-│   └── ui/                     # vita2d 界面（设备列表 / 文件浏览 / 进度）
+├── src/                        # 随仓库分发：源码（按依赖域分子目录，include 以 src/ 为根）
+│   ├── main.c                  # 入口：启动后端 + UI
+│   ├── app/                    # 装配层：api.c/h（前后端契约：启动 / 网络巡检 / 设备快照）
+│   ├── core/                   # 基础设施：config（配置）/ dlog（日志）/ i18n（文案）/ json_util（JSON）
+│   ├── net/                    # 网络与传输：net（初始化）/ discovery（发现+设备表）/ scan（主动扫描）
+│   │                           #             http（HTTP 服务器+客户端）/ identity（TLS 设备身份，含 id_cert.inc / id_key.inc）
+│   ├── proto/                  # LocalSend 协议会话：transfer（发送）/ receive（接收）
+│   └── ui/                     # vita2d 界面（设备列表 / 文件浏览 / 传输 / 设置）
 ├── sce_sys/                    # 随仓库分发：LiveArea 素材
 │   ├── icon0.png
 │   └── livearea/contents/
-├── docs/                       # 随仓库分发：LocalSend 协议文档副本（来源/权利见 localsend-protocol/ATTRIBUTION.md）
-│   └── localsend-protocol/
+├── docs/                       # 随仓库分发：设计文档与 LocalSend 协议副本
+│   ├── design.md               # 架构 / 决策 / 路线
+│   └── localsend-protocol/     # LocalSend 官方协议文档副本（来源/权利见其 ATTRIBUTION.md）
 ├── tools/                      # 本地克隆：官方示例 / vdpm / vita-parse-core
 │   ├── samples/
 │   ├── vdpm/

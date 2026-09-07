@@ -1,4 +1,4 @@
-#include "theme.h"
+#include "ui/theme.h"
 #include <vita2d.h>
 
 static const Theme themes[THEME_COUNT] = {

@@ -3,11 +3,11 @@
 #include <string.h>
 #include <vita2d.h>
 #include <psp2/kernel/processmgr.h>
-#include "ui.h"
-#include "theme.h"
-#include "../api.h"
-#include "../net.h"
-#include "../dlog.h"
+#include "ui/ui.h"
+#include "ui/theme.h"
+#include "app/api.h"
+#include "net/net.h"
+#include "core/dlog.h"
 
 App g_app;
 extern void pages_init(void);

@@ -12,14 +12,14 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <psp2/kernel/threadmgr/thread.h>
-#include "config.h"
-#include "net.h"
-#include "http.h"
-#include "discovery.h"
-#include "receive.h"
-#include "api.h"
-#include "identity.h"
-#include "dlog.h"
+#include "core/config.h"
+#include "net/net.h"
+#include "net/http.h"
+#include "net/discovery.h"
+#include "proto/receive.h"
+#include "app/api.h"
+#include "net/identity.h"
+#include "core/dlog.h"
 
 #define DISC_RETRY_MS 2000           /* 发现失败后的重试冷却 */
 
@@ -199,7 +199,7 @@ void api_start(void)
     int r;
     config_init();                       /* 先建目录/读配置（dlog 目录依赖它） */
     dlog_init();
-    dlog("== psvsend boot [TAG:d30] ==");
+    dlog("== psvsend boot [TAG:d31] ==");
     {
         /* 版本标记 + 设备身份指纹：确认刷入的固件含 mTLS 客户端证书 */
         char f[65];

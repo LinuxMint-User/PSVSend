@@ -12,15 +12,15 @@
 #include <psp2/io/dirent.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr/thread.h>
-#include "ui.h"
-#include "theme.h"
-#include "../config.h"
-#include "../i18n.h"
-#include "../net.h"
-#include "../api.h"
-#include "../transfer.h"
-#include "../receive.h"
-#include "../scan.h"
+#include "ui/ui.h"
+#include "ui/theme.h"
+#include "core/config.h"
+#include "core/i18n.h"
+#include "net/net.h"
+#include "app/api.h"
+#include "proto/transfer.h"
+#include "proto/receive.h"
+#include "net/scan.h"
 
 /* ---------- 布局常量 ---------- */
 #define LIST_TOP     76                 /* 列表可视区顶 */

@@ -10,8 +10,8 @@
 #include <psp2/net/netctl.h>
 #include <psp2/kernel/threadmgr/mutex.h>
 #include <psp2/kernel/threadmgr/thread.h>
-#include "net.h"
-#include "dlog.h"
+#include "net/net.h"
+#include "core/dlog.h"
 
 /* 调试开关：开机后前 PSVSEND_SIM_DOWN_MS 毫秒内，net_poll 强制报 DISCONNECTED，
  * 模拟"app 启动瞬间 Wi-Fi 尚未就绪、随后自动恢复"（真实场景 = 待机唤醒后立刻

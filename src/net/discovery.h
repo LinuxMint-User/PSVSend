@@ -8,7 +8,7 @@
 #define PSVSEND_DISCOVERY_H
 
 #include <stdbool.h>
-#include "api.h"
+#include "app/api.h"
 
 /* 启动发现（内部创建 socket + announce 线程）；返回 0 成功，负值为错误码 */
 int discovery_start(void);

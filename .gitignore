@@ -6,3 +6,5 @@
 /.vitasdk-tmp/
 # 第三方工具与参考示例（vdpm 包管理器、官方 samples）
 /tools/
+# 待办清单（仅本地跟踪，不入库）
+/docs/TODO.md
