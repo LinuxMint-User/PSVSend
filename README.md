@@ -20,6 +20,7 @@
 - [x] 渲染稳定性：修复偶发 GPU render crash（界面撕裂后崩溃）——每帧等待 GPU 渲染完成（v2.0.0）
 - [x] 中 / 英双语界面（设置页可切换）与设置页底部「关于」区（版本 + 适配 LocalSend 说明，v2.0.0）
 - [x] 启动开屏 + 高频页字形预热：开机先用 LiveArea 壁纸开屏，期间把设备 / 文件 / 设置常用页的字形烤好，切页与滚动不再因首见字形卡顿（v2.0.0 后）
+- [x] 检查更新（v2.1.0）：设置页可手动检查，也可自动定期检查（默认每周，可每天 / 每月 / 关闭）。后台线程先拉 Gitee 镜像仓库的 `src/core/config.h` 版本宏（主源），失败再试 GitHub Releases atom 兜底，与本地版本宏比对。**不新增任何版本文件**：config.h 是唯一版本真源（发版必改、镜像同步自然带上）。自动周期用远端响应 Date 授时判定，PSV 无实时钟也不误判
 
 ## 构建
 
@@ -130,6 +131,14 @@ cmake --build build
 - HTTPS 目标按 announce/扫描记录的证书指纹 pin：对方换证书（指纹随之变化）时需重新发现一次设备才会刷新指纹
 - 发送大文件期间界面取消会中止当前文件与后续排队文件，已完成文件保留
 
+### 更新检查
+
+- 版本真源与主源都是 **Gitee 镜像仓库的 `src/core/config.h`**：拉取后解析 `PSVSEND_APP_VERSION` 宏的字符串值（走 raw.giteeusercontent.com 直取，免 gitee.com/raw 的 302 跳转）；**不新增任何版本文件**——发版要改的就是 config.h 这一个宏，镜像同步自然带上，不存在多源不一致。GitHub Releases atom 仅作主源不可达时的兜底
+- **检出前提**：发布新版后须把 main 同步到 Gitee 镜像（epix-xhan/PSVSend），真机才检得出新版本——release 发布本身不会让 PSV 看到
+- 自动检查默认每周（设置页可改每天 / 每月 / 关闭），检查结果只提醒、不自动下载
+- PSV 无实时钟：自动周期用远端响应头 `Date` 授时，上次检查时间存 config `updateLast`（网络 unix 秒）；开机后每会话只做一次轻量判定，未到周期即静默跳过，到周期才完整检查
+- 同版本或无新版显示「已是最新」；有新版显示版本号并引导到 Releases 下载；网络 / 镜像不可达时报检查失败，不影响使用
+
 ### 界面显示
 
 - **界面内嵌中文字体**（随 VPK 打包到 `app0:/fonts/`，源为 AOSP Droid Sans 与 Droid Sans Fallback Full，Apache-2.0）：ASCII/Latin-1 与通用标点（省略号 U+2026、弯引号等——CJK 字库缺而拉丁字库含）走 Droid Sans，CJK/全角走 Fallback，中英文正常显示；两字库皆缺的生僻字符（emoji、个别扩展区）由 freetype 栅成空框或留空，传输本身不受影响。字形冷启动处理（开机预热）见 [docs/design.md](docs/design.md) §5.5.1
@@ -171,7 +180,7 @@ cmake --build build
 ├── .github/workflows/          # 随仓库分发：CI 构建 + Release 草稿发布
 ├── src/                        # 随仓库分发：源码（按依赖域分子目录，include 以 src/ 为根）
 │   ├── main.c                  # 入口：启动后端 + UI
-│   ├── app/                    # 装配层：api.c/h（前后端契约：启动 / 网络巡检 / 设备快照）
+│   ├── app/                    # 装配层：api.c/h（前后端契约：启动 / 网络巡检 / 设备快照）、update.c/h（更新检查）
 │   ├── core/                   # 基础设施：config（配置）/ dlog（日志）/ i18n（文案）/ json_util（JSON）
 │   ├── net/                    # 网络与传输：net（初始化）/ discovery（发现+设备表）/ scan（主动扫描）
 │   │                           #             http（HTTP 服务器+客户端）/ identity（TLS 设备身份，含 id_cert.inc / id_key.inc）

@@ -17,6 +17,7 @@
 - **已落地（渲染稳定，v2.0.0）**：修复偶发 **GPU render crash**（先兆为界面「三角形空白撕裂」→ 系统判 render gpu crash 重启）。根因：主循环缺 `vita2d_wait_rendering_done()`，每帧 swap 后 GPU 队列无收敛点，渲染/显示队列超前回绕导致撕裂与驱动状态错乱；修复：每帧 swap 后等待渲染完成（ui_main.c）。字体对象另改为启动帧外预载（`font_preload_all`），堵住"渲染中途创建 GPU 纹理"的隐患（非本次根因，作加固保留）。
 - **已落地（界面，v2.0.0）**：中 / 英双语界面（设置页切换，`i18n.c/h`）+ 设置页底部「关于」区（PSVSend 大字 logo、应用版本与 LocalSend 适配说明）。版本号单源维护：手改 `CMakeLists.txt` 的 `project(VERSION)` 与 `core/config.h` 的 `PSVSEND_APP_VERSION`，SFO `APP_VER` 由 VERSION 自动派生。
 - **已落地（工程，v2.0.0 后）**：GitHub Actions（`.github/workflows/build-vpk.yml`）在官方 vitasdk 2026.08 Docker 镜像内自动构建 VPK：推送 `v*` tag 或 Actions 页手动触发 → 生成 **Releases 草稿**（人工确认后公开）。注意本地与 CI 产物 `eboot.bin` 存在字节差异（本地链接 vdpm prebuilt 静态库，CI 链接镜像内现场编译的同源库），功能等价（真机验证通过）；需字节级可复现则须统一在容器内构建。
+- **已落地（更新检查，v2.1.0）**：`app/update.c` 后台线程按序尝试双源——主源拉 **Gitee 镜像仓库**（epix-xhan/PSVSend，只同步 main 分支、不放 Release）的 `src/core/config.h` 版本宏（raw.giteeusercontent.com 直取免 302），兜底 GitHub Releases atom；解析出的版本与本地 `PSVSEND_APP_VERSION` 宏比对定状态。**不新增任何版本文件**：config.h 是客户端唯一版本真源（发版本就要改它，镜像同步自然带新版，杜绝多版本文件不一致）。入口：设置页手动检查 + 自动定期（默认每周，可每天/每月/关）。PSV 无实时钟：自动周期靠远端响应头 `Date` 授时（`update.c` 内纯算术解析 RFC7231；曾误用 `sceKernelGetSystemTimeWide` 的开机计时冒充 unix 时间戳致 upd_last 跨重启错乱，d48 修复），每会话一次轻量判定——未到周期静默跳过，到周期才完整检查。真机全路径验证（d47-d49）：手动检出新版 / 手动已最新 / 自动到期 full-check / 自动静默，均按预期。
 - **未落地**：与 §4/§5 目标架构的规划差项（multipart 收件、接收设置页改名/选目录等）仍在路线中，动态清单见 docs/TODO.md（本地，不入库）。已销账（2026-09-07，理由见 TODO 闭环留痕）：session.c 拆分（会话职责由 proto/receive + proto/transfer 承担，见 §4.1）、自定义字体替换/追加、内存监控调试视图、发送入口外置卡浏览。中文字体已落地（见 §5.5）；字形冷启动处理已定案（开机高频页预热，见 §5.5.1）。
 - 本文按"目标架构"描述，部分命名与实际源码不同（如目标 `http_server.c` / `http_client.c` 实际为 `net/http.c` / `proto/transfer.c`）；**现状源码布局以 §4.1 模块树为准**（2026-09-07 起按依赖域分子目录）。
 
@@ -69,7 +70,7 @@
 ```
 src/
 ├── main.c         # 入口：启动后端 + UI
-├── app/           # 装配层：api.h/c（前后端契约：接口 + 回调 + Device 快照）
+├── app/           # 装配层：api.h/c（前后端契约：接口 + 回调 + Device 快照）、update.h/c（更新检查：双源抓版本宏/atom）
 ├── core/          # 无业务依赖的基础设施
 │   ├── config.c/h     # 配置持久化（ux0:data/psvsend/）
 │   ├── dlog.c/h       # 日志（log.txt）
@@ -258,7 +259,7 @@ src/ui/
 
 ## 6. 配置与存储
 
-- `ux0:data/psvsend/config`（JSON）：alias、confirm_layout（0=美式 / 1=日式）、port、theme
+- `ux0:data/psvsend/config`（JSON，键为驼峰）：alias（设备名）、fingerprint（随机身份串）、port、theme（0=Yaru / 1=OLED）、confirmLayout（0=美式 / 1=日式）、lang（0=跟随系统 / 1=English / 2=中文）、knownIps（历史在线设备 IP，逗号分隔、LRU、上限 24，主动扫描种子）、updateAuto（更新检查：0=关 / 1=每天 / 2=每周默认 / 3=每月）、updateLast（上次检查更新的网络 unix 秒，自动节流）
 - `ux0:data/psvsend/downloads/`：接收文件
 - 首次启动 `sceIoMkdir` 幂等创建（已存在返回 0x80410011，忽略）
 
