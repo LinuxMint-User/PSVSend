@@ -6,6 +6,7 @@
 #include "ui/ui.h"
 #include "ui/theme.h"
 #include "app/api.h"
+#include "app/update.h"
 #include "net/net.h"
 #include "core/dlog.h"
 
@@ -187,6 +188,7 @@ void ui_run(void)
     uint64_t run0 = (uint64_t)sceKernelGetSystemTimeWide() / 1000;
     ui_input_init();           /* 开启触摸采样 */
     pages_init();
+    update_init();             /* 更新检查状态机（自动周期由 config 决定） */
     ui_warm_pass();            /* 开屏先上屏（不依赖字体），再建字体 + 高频页预热 */
 
     while (!g_app.done) {
@@ -206,6 +208,7 @@ void ui_run(void)
         }
         api_tick();          /* announce 节奏（500ms 节流；sendto 只在主线程可靠） */
         pages_tick();        /* 检测新到待决定的接收请求 → 弹接收确认页 */
+        update_tick();       /* 自动检查更新：到周期且网络就绪时后台触发 */
 
         vita2d_start_drawing();
         vita2d_set_clear_color(theme->bg);

@@ -45,6 +45,8 @@ static void cfg_defaults(void)
     g_cfg.confirm_layout = 0;
     g_cfg.lang = 0;                    /* 语言偏好默认跟随系统 */
     g_cfg.known_n = 0;
+    g_cfg.upd_auto = 2;                /* 自动检查更新：默认每周 */
+    g_cfg.upd_last = 0;                /* 从未查过 → 首次联网后自动查一次 */
 }
 
 void config_init(void)
@@ -70,6 +72,8 @@ void config_init(void)
             if (json_get_int(buf, "theme", &v)) g_cfg.theme_id = (int)v;
             if (json_get_int(buf, "confirmLayout", &v)) g_cfg.confirm_layout = (int)v;
             if (json_get_int(buf, "lang", &v)) g_cfg.lang = (int)v;
+            if (json_get_int(buf, "updateAuto", &v)) g_cfg.upd_auto = (int)v;
+            if (json_get_int(buf, "updateLast", &v)) g_cfg.upd_last = (int)v;
             {   /* knownIps: "ip,ip,..."（逗号分隔，最新在前） */
                 char k[512];
                 if (json_get_str(buf, "knownIps", k, sizeof k) && k[0]) {
@@ -97,6 +101,8 @@ void config_init(void)
                                                sizeof g_cfg.fingerprint);
     if (g_cfg.port <= 0 || g_cfg.port > 65535) g_cfg.port = DEFAULT_PORT;
     if (!g_cfg.alias[0]) strncpy(g_cfg.alias, DEFAULT_ALIAS, sizeof g_cfg.alias - 1);
+    if (g_cfg.upd_auto < 0 || g_cfg.upd_auto > 3) g_cfg.upd_auto = 2;
+    if (g_cfg.upd_last < 0) g_cfg.upd_last = 0;
 }
 
 void config_save(void)
@@ -122,10 +128,12 @@ void config_save(void)
                    "  \"theme\": %d,\n"
                    "  \"confirmLayout\": %d,\n"
                    "  \"lang\": %d,\n"
+                   "  \"updateAuto\": %d,\n"
+                   "  \"updateLast\": %d,\n"
                    "  \"knownIps\": \"%s\"\n"
                    "}\n",
                    a, f, g_cfg.port, g_cfg.theme_id, g_cfg.confirm_layout,
-                   g_cfg.lang, k);
+                   g_cfg.lang, g_cfg.upd_auto, g_cfg.upd_last, k);
     cfg_unlock();
     if (len < 0 || len >= (int)sizeof out) return;
     SceUID fd = sceIoOpen(PSVSEND_CONFIG, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC,

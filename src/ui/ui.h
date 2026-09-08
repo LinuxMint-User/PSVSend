@@ -192,6 +192,9 @@ void w_page_header(const char *title);
 void w_page_footer(const char *hint);
 void w_page_footer_segs(const HintSeg *segs, int n);   /* 图标 + 文字的按键提示条 */
 void w_row(Rect r, const char *main_text, const char *sub_text, bool selected);
+/* 同 w_row，但右值文本颜色指定（0=默认：选中 accent_text / 未选 text_dim） */
+void w_row_c(Rect r, const char *main_text, const char *sub_text,
+             uint32_t sub_c, bool selected);
 void w_button(Rect r, const char *label, bool active);
 void w_modal_begin(int content_h);          /* 绘制遮罩 + 弹窗卡片，返回卡片区域置顶布局起点 */
 Rect w_modal_box(int content_h);

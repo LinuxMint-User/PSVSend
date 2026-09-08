@@ -45,6 +45,7 @@ set(VITA_TITLE  "PSVSend")
 add_executable(${PROJECT_NAME}
     src/main.c
     src/app/api.c
+    src/app/update.c
     src/core/config.c
     src/core/dlog.c
     src/core/i18n.c

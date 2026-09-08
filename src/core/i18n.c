@@ -123,6 +123,19 @@ static const TrEntry s_zh[] = {
     { "Editing needs text input - not available yet (TODO).",
       "改名需要文字输入，暂未实现（TODO）。" },
 
+    /* ---- 更新检查（设置页 Update 组） ---- */
+    { "Update", "更新" },
+    { "Check for updates", "检查更新" },
+    { "Auto check", "自动检查" },
+    { "%s available", "新版本 %s 可用" },
+    { "Up to date", "已是最新" },
+    { "Checking...", "检查中…" },
+    { "Check failed", "检查失败" },
+    { "Off", "关闭" },
+    { "Daily", "每天" },
+    { "Weekly", "每周" },
+    { "Monthly", "每月" },
+
     /* ---- 其它 ---- */
     { "unknown", "未知" },
 };

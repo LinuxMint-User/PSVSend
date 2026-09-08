@@ -18,6 +18,7 @@
 #include "core/i18n.h"
 #include "net/net.h"
 #include "app/api.h"
+#include "app/update.h"
 #include "proto/transfer.h"
 #include "proto/receive.h"
 #include "net/scan.h"
@@ -1339,6 +1340,8 @@ enum {
     SET_ITEM_LANG,         /* 显示：界面语言 */
     SET_ITEM_KEY,          /* 操作：确认键布局 */
     SET_ITEM_HOSTNAME,     /* 设备：主机名（改名需文字输入，先占位弹窗） */
+    SET_ITEM_CHECK,        /* 更新：检查更新（动作行：按任意键/点任意半即查） */
+    SET_ITEM_AUTO,         /* 更新：自动检查频率 */
     SET_ITEM_N
 };
 
@@ -1352,9 +1355,13 @@ enum {
     SET_SLOT_HDR_C,        /* 分组：操作 */
     SET_SLOT_KEY,
     SET_SLOT_HINT,
+    SET_SLOT_HDR_UPD,      /* 分组：更新 */
+    SET_SLOT_CHECK,
+    SET_SLOT_AUTO,
     SET_SLOT_HDR_D,        /* 分组：关于（页面最底部） */
     SET_SLOT_ABOUT_A,      /* logo：PSVSend 大字 + 版本号 */
     SET_SLOT_ABOUT_B,      /* 适配说明行 */
+    SET_SLOT_ABOUT_C,      /* 项目仓库地址行（只读提示） */
     SET_SLOT_N
 };
 #define SET_HDR_H   44        /* 分组标题行高（含上方留白） */
@@ -1370,6 +1377,8 @@ static int slot_item(int slot)
     case SET_SLOT_THEME: return SET_ITEM_THEME;
     case SET_SLOT_LANG:  return SET_ITEM_LANG;
     case SET_SLOT_KEY:   return SET_ITEM_KEY;
+    case SET_SLOT_CHECK: return SET_ITEM_CHECK;
+    case SET_SLOT_AUTO:  return SET_ITEM_AUTO;
     }
     return -1;
 }
@@ -1381,6 +1390,8 @@ static int item_slot(int item)
     case SET_ITEM_THEME:    return SET_SLOT_THEME;
     case SET_ITEM_LANG:     return SET_SLOT_LANG;
     case SET_ITEM_KEY:      return SET_SLOT_KEY;
+    case SET_ITEM_CHECK:    return SET_SLOT_CHECK;
+    case SET_ITEM_AUTO:     return SET_SLOT_AUTO;
     }
     return -1;
 }
@@ -1390,6 +1401,7 @@ static int set_row_h(int slot)
     if (slot == SET_SLOT_HINT)   return SET_HINT_H;
     if (slot == SET_SLOT_ABOUT_A) return SET_LOGO_H;
     if (slot == SET_SLOT_ABOUT_B) return SET_ADAPT_H;
+    if (slot == SET_SLOT_ABOUT_C) return SET_ADAPT_H;
     return slot_item(slot) >= 0 ? SET_ROW_H : SET_HDR_H;
 }
 
@@ -1458,13 +1470,23 @@ static void settings_change(int item, int dir)
         g_app.confirm_layout = g_app.confirm_layout ? 0 : 1;
         g_cfg.confirm_layout = g_app.confirm_layout;
         config_save();
+    } else if (item == SET_ITEM_CHECK) {
+        update_check_now();      /* 动作行：左右/确认/点任意半都触发检查（dir 无意义） */
+    } else if (item == SET_ITEM_AUTO) {
+        g_cfg.upd_auto += dir;
+        if (g_cfg.upd_auto < 0) g_cfg.upd_auto = 3;
+        if (g_cfg.upd_auto > 3) g_cfg.upd_auto = 0;
+        config_save();
     }
     /* SET_ITEM_HOSTNAME：改名需要文字输入，未实现（见占位弹窗） */
 }
 
 void page_settings_render(void)
 {
+    static const char *upd_mode_en[] = { "Off", "Daily", "Weekly", "Monthly" };
     char theme_v[64], layout_v[96], lang_v[32];
+    char upd_v[64];
+    int upd_st = update_state();
     int slot;
 
     w_page_header(tr("Settings"));
@@ -1474,6 +1496,19 @@ void page_settings_render(void)
              key_confirm(), key_back(),
              g_app.confirm_layout == 0 ? "US" : "JP");
     snprintf(lang_v, sizeof lang_v, "%s", i18n_lang_name(i18n_lang_pref()));
+    upd_v[0] = 0;
+    switch (upd_st) {
+    case UPD_WORKING:
+        snprintf(upd_v, sizeof upd_v, "%s", tr("Checking...")); break;
+    case UPD_NEW:
+        snprintf(upd_v, sizeof upd_v, tr("%s available"), update_latest());
+        break;
+    case UPD_NONE:
+        snprintf(upd_v, sizeof upd_v, "%s", tr("Up to date")); break;
+    case UPD_FAIL:
+        snprintf(upd_v, sizeof upd_v, "%s", tr("Check failed")); break;
+    default: break;                     /* UPD_IDLE：无右值 */
+    }
 
     vita2d_enable_clipping();
     vita2d_set_clip_rectangle(0, LIST_TOP, SCR_W, LIST_BOTTOM);
@@ -1490,6 +1525,7 @@ void page_settings_render(void)
             case SET_SLOT_HDR_A: txt = tr("Device"); break;
             case SET_SLOT_HDR_B: txt = tr("Display"); break;
             case SET_SLOT_HDR_C: txt = tr("Controls"); break;
+            case SET_SLOT_HDR_UPD: txt = tr("Update"); break;
             case SET_SLOT_HDR_D: txt = tr("About"); break;
             default: break; /* 下方各自 case，绝不落到空绘制 */
             }
@@ -1509,6 +1545,9 @@ void page_settings_render(void)
             if (slot == SET_SLOT_ABOUT_B)
                 w_text(28, top + 12, 0.9f, theme->text_dim, "%s",
                        tr("LocalSend client v1.15+ compatible (protocol v2.0)"));
+            if (slot == SET_SLOT_ABOUT_C)
+                w_text(28, top + 12, 0.9f, theme->text_dim, "%s",
+                       "github.com/LinuxMint-User/PSVSend");
             continue;
         }
         Rect r = { 24, top, SCR_W - 48, SET_ROW_H - 4 };
@@ -1528,6 +1567,19 @@ void page_settings_render(void)
             break;
         case SET_ITEM_KEY:
             w_row(r, tr("Confirm key"), layout_v, item == g_app.set_sel);
+            break;
+        case SET_ITEM_CHECK:
+            /* 动作行：右侧显示检查状态；发现新版时用 accent 强调 */
+            if (upd_st == UPD_NEW)
+                w_row_c(r, tr("Check for updates"), upd_v,
+                        item == g_app.set_sel ? theme->accent_text : theme->accent,
+                        item == g_app.set_sel);
+            else
+                w_row(r, tr("Check for updates"), upd_v, item == g_app.set_sel);
+            break;
+        case SET_ITEM_AUTO:
+            w_row(r, tr("Auto check"), tr(upd_mode_en[g_cfg.upd_auto]),
+                  item == g_app.set_sel);
             break;
         }
     }

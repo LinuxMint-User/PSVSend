@@ -317,20 +317,34 @@ void w_page_footer_segs(const HintSeg *segs, int n)
     }
 }
 
-void w_row(Rect r, const char *main_text, const char *sub_text, bool selected)
+/* w_row 实现（sub_c=0 用默认色；指定则覆盖——"检查更新"行发现新版时用 accent 强调） */
+static void w_row_impl(Rect r, const char *main_text, const char *sub_text,
+                       uint32_t sub_c, bool selected)
 {
     uint32_t card = selected ? theme->accent : theme->card;
     uint32_t main_c = selected ? theme->accent_text : theme->text;
-    uint32_t sub_c  = selected ? theme->accent_text : theme->text_dim;
     w_rect(r, card);
     int mh = 0;
     w_text_w(1.25f, main_text, NULL, &mh);
     w_text_clip(r.x + 24, r.y + (r.h - mh) / 2, 1.25f, main_c, main_text, r.w - 200);
     if (sub_text && *sub_text) {
+        uint32_t sc = sub_c ? sub_c
+                            : (selected ? theme->accent_text : theme->text_dim);
         int sw = 0, sh = 0;
         w_text_w(1.0f, sub_text, &sw, &sh);
-        w_text(r.x + r.w - sw - 24, r.y + (r.h - sh) / 2, 1.0f, sub_c, "%s", sub_text);
+        w_text(r.x + r.w - sw - 24, r.y + (r.h - sh) / 2, 1.0f, sc, "%s", sub_text);
     }
+}
+
+void w_row(Rect r, const char *main_text, const char *sub_text, bool selected)
+{
+    w_row_impl(r, main_text, sub_text, 0, selected);
+}
+
+void w_row_c(Rect r, const char *main_text, const char *sub_text,
+             uint32_t sub_c, bool selected)
+{
+    w_row_impl(r, main_text, sub_text, sub_c, selected);
 }
 
 void w_button(Rect r, const char *label, bool active)
