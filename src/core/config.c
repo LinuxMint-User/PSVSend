@@ -46,7 +46,7 @@ static void cfg_defaults(void)
     g_cfg.lang = 0;                    /* 语言偏好默认跟随系统 */
     g_cfg.known_n = 0;
     g_cfg.upd_auto = 2;                /* 自动检查更新：默认每周 */
-    g_cfg.upd_last = 0;                /* 从未查过 → 首次联网后自动查一次 */
+    g_cfg.upd_last = 0;                /* 从未查过 → 启动联网后自动授时评估即首查 */
 }
 
 void config_init(void)

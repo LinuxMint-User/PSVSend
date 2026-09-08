@@ -14,6 +14,15 @@
  * 版本串与本地 PSVSEND_APP_VERSION 比较定状态（atom 取首个 <entry> 的 title，
  * draft 对外不可见不误报）。
  *
+ * 自动周期判定用"网络时间"：本地没有任何可信墙钟（sceKernelGetSystemTimeWide
+ * 只是开机单调计时，跨重启不可比）。因此 worker 两种模式：
+ *   手动（update_check_now）：直接做完整检查；
+ *   自动（update_tick 每会话触发一次）：先做轻量授时——复用同一批源只收
+ *   响应头 Date（RFC7231 → unix 秒，见 date_to_unix），拿到"当前网络时间"再
+ *   与 config.upd_last 比：超周期（upd_last=0 首次也算）才做完整检查。
+ *   每次拿到可用网络时间就把 upd_last 落盘（授时成功即网络通，完整检查失败
+ *   也算"此刻查过"，防半开网络按周期高频重试）。
+ *
  * TLS 复用 scan/transfer 的 mbedTLS 1.2 出站模式（本工程无 CA 信任库，
  * 一律 VERIFY_NONE/trust-first——只读版本号不执行，MITM 影响仅提示文案，
  * 可接受）。域名解析走 sceNetResolverStartNtoa，timeout/retry 必须 0,0
@@ -55,11 +64,17 @@ static const UpdSrc UPD_SRC[] = {
 
 static volatile int g_st = UPD_IDLE;
 static char g_latest[32];              /* UPD_NEW 时的远端版本串（含 v） */
+/* 手动/自动两种运行模式（决定 worker 先授时判定还是直接查） */
+enum { UPD_MODE_MANUAL = 0, UPD_MODE_AUTO = 1 };
+
+static volatile int g_st_save;             /* worker 覆盖前保存（自动周期内还原） */
 static volatile int g_busy;            /* 一个 worker 在跑（手动/自动共用） */
+static volatile int g_auto_sess;       /* 本会话"自动判定"是否已执行（防每秒重试） */
 static uint64_t g_tick_last_us;        /* update_tick 每秒节流 */
 
+/* 单调时钟（仅做超时预算/节流等会话内计时；"什么时候该自动查"用网络时间，
+ * 见 date_to_unix / upd_run——本地无墙钟也不信本地时钟，跨重启不可比） */
 static uint64_t now_us(void) { return (uint64_t)sceKernelGetSystemTimeWide(); }
-static long now_unix(void) { return (long)(sceKernelGetSystemTimeWide() / 1000000LL); }
 
 /* config upd_auto：0=off 1=每天 2=每周 3=每月 → 周期秒 */
 static long auto_interval(void)
@@ -281,13 +296,65 @@ static int ci_has(const char *a, int n, const char *lit)
     return 0;
 }
 
+/* ---- HTTP 响应头 Date（RFC7231 IMF-fixdate）→ unix 秒 ----
+ * 远端响应头 Date 形如 "Sun, 08 Sep 2026 12:34:56 GMT"。自动检查"距上次
+ * 该不该查"必须用这种网络时间（本地无墙钟，sceKernelGetSystemTimeWide 只是
+ * 开机单调计时，跨重启不可比）。解析失败返回 0。 */
+static int date_month(const char *m)
+{
+    static const char mon[12][4] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    int i;
+    for (i = 0; i < 12; i++)
+        if (m[0] == mon[i][0] && m[1] == mon[i][1] && m[2] == mon[i][2])
+            return i;
+    return -1;
+}
+/* 公历 y/m/d → 距 1970-01-01 的天数（Hinnant days_from_civil 变体，纯算术） */
+static long civil_days(int y, unsigned m, unsigned d)
+{
+    long era;
+    unsigned yoe, doy, doe;
+    y -= (int)(m <= 2);
+    era = (y >= 0 ? y : y - 399) / 400;
+    yoe = (unsigned)(y - (int)(era * 400));
+    doy = (153u * (m + (m > 2 ? 0u : 12u) - 3u) + 2u) / 5u + d - 1u;
+    doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    return era * 146097L + (long)doe - 719468L;
+}
+static long date_to_unix(const char *s)
+{
+    int dd = 0, yy = 0, hh = 0, mm = 0, ss = 0, mo, used = 0;
+    char m3[4] = "";
+    const char *tail;
+    long days;
+    if (!s) return 0;
+    /* "Sun, 06 Nov 1994 08:49:37 GMT"：跳过星期，取 日 月 年 时分秒 GMT */
+    if (sscanf(s, "%*[^,] , %d %3s %d %d:%d:%d GMT%n",
+               &dd, m3, &yy, &hh, &mm, &ss, &used) < 6)
+        return 0;
+    /* 尾校验：%n 记下 GMT 结束位置；其后只许行尾空白/\r（HTTP 行值带 \r）。
+     * 防 "…12:34:56 PST" 这类非 GMT 串被前 6 项转换蒙混通过。 */
+    tail = s + used;
+    while (*tail == ' ' || *tail == '\t' || *tail == '\r') tail++;
+    if (*tail) return 0;
+    mo = date_month(m3);
+    if (mo < 0 || dd < 1 || dd > 31 || yy < 1970 || hh > 23 ||
+        mm > 59 || ss > 60)
+        return 0;
+    days = civil_days(yy, (unsigned)(mo + 1), (unsigned)dd);
+    return days * 86400L + (long)hh * 3600L + (long)mm * 60L + (long)ss;
+}
+
 /* 解析已收齐的 HTTP 头部 win[0..hn)：状态码 + Content-Length + chunked 标记 */
-static void http_parse_hdr(const char *h, int hn, int *st, int *clen, int *chunked)
+static void http_parse_hdr(const char *h, int hn, int *st, int *clen, int *chunked,
+                           char *date, int dsz)
 {
     const char *p = h, *end = h + hn;
     *st = 0;
     *clen = -1;
     *chunked = 0;
+    if (date && dsz > 0) date[0] = 0;
     /* 状态行：找第一个空格后的数字 */
     while (p < end && *p != '\n') {
         if (*p == ' ' && p[1] >= '0' && p[1] <= '9') {
@@ -320,6 +387,10 @@ static void http_parse_hdr(const char *h, int hn, int *st, int *clen, int *chunk
                 *clen = x;
             } else if (ci_eq(p, nlen, "transfer-encoding")) {
                 if (ci_has(v, vlen, "chunked")) *chunked = 1;
+            } else if (ci_eq(p, nlen, "date") && date && dsz > 0) {
+                int cpl = vlen < dsz - 1 ? vlen : dsz - 1;
+                memcpy(date, v, (size_t)cpl);
+                date[cpl] = 0;
             }
         }
         if (!nl) break;
@@ -327,15 +398,20 @@ static void http_parse_hdr(const char *h, int hn, int *st, int *clen, int *chunk
     }
 }
 
-/* ---- 对单个源做一次完整检查 ----
- * 返回 1 = 拿到 HTTP 200 + 按源格式解析成功的响应（tag 可能为空串，
+/* ---- 对单个源做一次连接 ----
+ * 返回 1 = 拿到 HTTP 2xx（hdr_only=0 还需按源格式解析成功；tag 可能为空串，
  *        如 Gitee 空 release 列表 = 权威的"无发布"），用此源定论；
  * 返回 0 = 该源不可用（解析失败/连不上/超时/非 2xx），换下一个源。
+ * hdr_only=1：授时模式，响应头到手（含 2xx + Date 解析进 *date_out）即断，
+ *        不读 body，不校验内容；date_out 为 0 表示没拿到可用时间。
+ * date_out（可空）：2xx 后把响应头 Date 转 unix 秒写进去（授时用）。
  * 内部为一次性独立连接：每源自建 fd + mbedtls 全套，出口统一清理。 */
-static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn)
+static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn,
+                     int hdr_only, long *date_out)
 {
     char win[UPD_WIN];
     char req[384];
+    char date[48];
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
     mbedtls_entropy_context ent;
@@ -347,6 +423,7 @@ static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn)
     int ch_state = 0, ch_left = 0, ch_size = 0, ch_hex = 0, ch_ext = 0;
 
     tag[0] = 0;
+    if (date_out) *date_out = 0;     /* 无 Date/解析失败 = 0 */
     mbedtls_ssl_init(&ssl);
     mbedtls_ssl_config_init(&conf);
     mbedtls_entropy_init(&ent);
@@ -460,11 +537,17 @@ static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn)
                     if (bn >= 4 && win[bn - 4] == '\r' &&
                         win[bn - 3] == '\n' && win[bn - 2] == '\r' &&
                         win[bn - 1] == '\n') {
-                        http_parse_hdr(win, bn, &st, &clen, &chunked);
+                        http_parse_hdr(win, bn, &st, &clen, &chunked,
+                                       date, sizeof date);
                         if (st < 200 || st >= 300) {
                             dlog("upd[%d]: http status %d", idx, st);
                             goto fail;
                         }
+                        if (date_out && date[0] && *date_out == 0) {
+                            long t = date_to_unix(date);
+                            if (t > 0) *date_out = t;
+                        }
+                        if (hdr_only) goto ok;   /* 授时：头到手即断，不读 body */
                         hs = 1;
                         bn = 0;       /* 丢弃头部 */
                     }
@@ -546,6 +629,7 @@ static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn)
         dlog("upd[%d]: %s ok latest=%s", idx, s->host, tag);
     }
 
+ok:
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);
     mbedtls_entropy_free(&ent);
@@ -562,16 +646,50 @@ fail:
     return 0;
 }
 
-/* worker：按源表顺序试，首个可用源定论；全部失败 → FAIL。 */
-static void upd_run(void)
+/* worker：手动 = 直接完整检查；自动 = 先授时（远端 Date→unix 秒）判定
+ * "距上次检查是否到周期"，到才做完整检查。全部失败 → FAIL（自动授时失败
+ * 则静默还原状态，等下次启动再评估）。 */
+static int upd_run(SceSize a1, void *a2)
 {
+    int mode = UPD_MODE_MANUAL;
     char tag[64] = "";
     char src_host[48] = "none";
+    long t_net = 0;                  /* 本 worker 拿到的网络 unix 秒 */
     UpdState fin = UPD_FAIL;
     int i;
 
+    if (a2 && a1 >= (SceSize)sizeof mode)
+        mode = *(const int *)a2;
+
+    if (mode == UPD_MODE_AUTO) {
+        /* 1) 授时：逐个源只收响应头 Date（轻量，无 body） */
+        for (i = 0; i < UPD_SRC_N && t_net == 0; i++)
+            fetch_one(i, &UPD_SRC[i], tag, sizeof tag, 1, &t_net);
+        if (t_net == 0) {
+            dlog("update: auto skip (no reachable time source)");
+            g_st = g_st_save;        /* 未查成，还原状态（UI 不误报） */
+            g_busy = 0;
+            sceKernelExitDeleteThread(0);
+            return 0;
+        }
+        dlog("update: auto time src=%s = %ld", UPD_SRC[i - 1].host, t_net);
+        /* 2) 周期判定：距上次网络检查未到周期 → 静默结束（不完整检查） */
+        if (g_cfg.upd_last &&
+            t_net - (long)g_cfg.upd_last < auto_interval()) {
+            dlog("update: auto within interval last=%ld next>%ld",
+                 (long)g_cfg.upd_last,
+                 (long)g_cfg.upd_last + auto_interval());
+            g_st = g_st_save;
+            g_busy = 0;
+            sceKernelExitDeleteThread(0);
+            return 0;
+        }
+        dlog("update: auto due last=%ld -> full check", (long)g_cfg.upd_last);
+    }
+
+    /* 3) 完整检查：按源表顺序试，首个可用源定论；全失败 → FAIL */
     for (i = 0; i < UPD_SRC_N; i++) {
-        if (fetch_one(i, &UPD_SRC[i], tag, sizeof tag)) {
+        if (fetch_one(i, &UPD_SRC[i], tag, sizeof tag, 0, &t_net)) {
             snprintf(src_host, sizeof src_host, "%s", UPD_SRC[i].host);
             dlog("upd: decided by src[%d] %s tag='%s'", i, UPD_SRC[i].host, tag);
             if (tag[0]) {
@@ -588,20 +706,27 @@ static void upd_run(void)
         }
     }
 
-    g_cfg.upd_last = (int)now_unix();    /* 成败都记：防半开网络按周期高频重试 */
-    config_save();
+    /* 4) 有网络时间才落 upd_last：授时成功网络即通，完整检查失败也算
+     *    "此刻查过"，防半开/解析类问题按周期高频重试；手动且全失败
+     *    （无任何 Date）则不记，用户可立即再点重试。 */
+    if (t_net > 0) {
+        g_cfg.upd_last = (int)t_net;
+        config_save();
+    }
     g_st = fin;
     g_busy = 0;
     dlog("update: done state=%d src=%s%s", fin, src_host,
          fin == UPD_NEW ? g_latest : "");
     sceKernelExitDeleteThread(0);
+    return 0;
 }
 
-static void upd_launch(void)
+static void upd_launch(int mode)
 {
     SceUID th;
     if (g_busy) return;
     g_busy = 1;
+    g_st_save = g_st;                /* 自动周期内/授时失败时还原用 */
     g_st = UPD_WORKING;
     th = sceKernelCreateThread("psvsend_upd", (SceKernelThreadEntry)upd_run,
                                0x40, UPD_STACK, 0, 0, NULL);
@@ -610,7 +735,7 @@ static void upd_launch(void)
         g_busy = 0;
         return;
     }
-    sceKernelStartThread(th, 0, NULL);
+    sceKernelStartThread(th, (SceSize)sizeof mode, &mode);
 }
 
 void update_init(void)
@@ -618,24 +743,25 @@ void update_init(void)
     g_st = UPD_IDLE;
     g_latest[0] = 0;
     g_busy = 0;
+    g_auto_sess = 0;                 /* 每会话一次自动评估 */
+    g_st_save = UPD_IDLE;
     g_tick_last_us = 0;
 }
 
 void update_tick(void)
 {
-    long now, last;
     if (g_tick_last_us && now_us() - g_tick_last_us < 1000000ull) return;
     g_tick_last_us = now_us();
-    if (g_busy || auto_interval() <= 0) return;
-    if (!net_connected()) return;             /* Wi-Fi 未就绪：等下一拍 */
-    last = (long)g_cfg.upd_last;
-    if (last && now_unix() - last < auto_interval()) return;
-    upd_launch();                              /* 周期到（含首次）自动查 */
+    if (g_busy || g_auto_sess) return;
+    if (auto_interval() <= 0) return;      /* 自动检查关闭 */
+    if (!net_connected()) return;          /* Wi-Fi 未就绪：等下一拍再评估 */
+    g_auto_sess = 1;                       /* 本会话自动评估只触发一次 */
+    upd_launch(UPD_MODE_AUTO);             /* 启动 worker：授时→判定→按需查 */
 }
 
 void update_check_now(void)
 {
-    upd_launch();                              /* 手动：无视周期 */
+    upd_launch(UPD_MODE_MANUAL);           /* 手动：直接完整检查，无视周期 */
 }
 
 UpdState update_state(void) { return (UpdState)g_st; }

@@ -29,7 +29,8 @@ typedef struct {
     int  known_n;            /* 历史设备 IP 条数（最近发现优先，作扫描种子） */
     char known_ips[KNOWN_MAX][16]; /* 历史设备 IP，最新在前 */
     int  upd_auto;   /* 自动检查更新：0=关 1=每天 2=每周(默认) 3=每月 */
-    int  upd_last;   /* 上次检查更新 unix 时间戳（自动节流用；0=从未查过） */
+    int  upd_last;   /* 上次检查更新时刻的"网络"unix 时间戳（授时来自远端
+                      * 响应头 Date；自动周期判定用，0=从未成功查过） */
 } Config;
 
 extern Config g_cfg;

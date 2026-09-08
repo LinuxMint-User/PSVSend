@@ -14,7 +14,7 @@ typedef enum {
 } UpdState;
 
 void update_init(void);        /* 状态复位（读 config 节流时间） */
-void update_tick(void);        /* 主循环每帧可调：内部按秒节流 + 自动周期判断 */
+void update_tick(void);        /* 主循环每帧可调：每秒节流；每会话一次自动评估 */
 void update_check_now(void);   /* 手动立即检查（进行中忽略） */
 UpdState update_state(void);
 const char *update_latest(void);   /* UPD_NEW 时的远端版本串（含 v 前缀） */
