@@ -10,7 +10,7 @@ set(VITASDK $ENV{VITASDK})
 include(${VITASDK}/share/vita.toolchain.cmake)
 include(${VITASDK}/share/vita.cmake)
 
-project(psvsend VERSION 2.0.0 LANGUAGES C)
+project(psvsend VERSION 2.1.0 LANGUAGES C)
 
 # SFO APP_VER（格式 xx.xx）由 project VERSION 派生（不足 10 补前导零），
 # 保证 APP_VER / 工程版本 只有 VERSION 一处手改，不会漂移。

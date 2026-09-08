@@ -15,9 +15,9 @@
 #define KNOWN_MAX         24
 
 /* 客户端发布版本（运行时显示 / 设置页"关于"）。
- * 与 CMakeLists.txt 的 project(VERSION 2.0.0) 保持一致——升级版本号时
+ * 与 CMakeLists.txt 的 project(VERSION 2.1.0) 保持一致——升级版本号时
  * 两处一起改，SFO APP_VER 由 CMake 从 VERSION 派生，无需手改。 */
-#define PSVSEND_APP_VERSION "2.0.0"
+#define PSVSEND_APP_VERSION "2.1.0"
 
 typedef struct {
     char alias[64];          /* 设备名，广播给其他 LocalSend 设备 */
