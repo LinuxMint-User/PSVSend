@@ -1,8 +1,9 @@
 /* scan.c 实现 —— 见 scan.h。
- * 探测顺序：对每个候选 IP 先发明文 HTTP register（快：https 服务器收到明文
- * 会立刻关连接），失败再试 TLS（mbedTLS 1.2，trust-first 信任任意叶子证书并
- * 记录其 SHA-256 供后续发送 pin；mTLS 出示内嵌设备身份证书，LocalSend 服务器
- * 强制客户端证书）。拿到 200 + member info 即 discovery_upsert_peer 入表。
+ * 探测顺序：对每个候选 IP 先试 TLS（2026 官方 Rust 内核端默认 HTTPS；mbedTLS
+ * 锁定 1.2，trust-first 信任任意叶子证书并记录其 SHA-256 供后续发送 pin；mTLS
+ * 出示内嵌设备身份证书，服务器强制客户端证书），TLS 失败/超时再发明文 HTTP
+ * register 兜底（https 服务器收到明文会立刻关连接，纯 HTTP 端无 TLS）。拿到
+ * 200 + member info 即 discovery_upsert_peer 入表。
  * Vita 的 socket 默认阻塞，connect 无内置超时，扫不存在的主机会卡死整个线程，
  * 故 connect 前把 fd 置 SCE_NET_SO_NBIO 非阻塞，再用 getpeername 轮询判定。 */
 #define MBEDTLS_ALLOW_PRIVATE_ACCESS

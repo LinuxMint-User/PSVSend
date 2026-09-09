@@ -12,7 +12,7 @@
 - **已落地（发送方向）**：UDP 组播发现 / register 入表 → UI 选设备、浏览 ux0 选文件 → `transfer.c` 按对方 announce 的 protocol 走 HTTP 明文或 HTTPS（mbedTLS 3.6.5、锁定 TLS1.2）执行 `prepare-upload` / `upload`，带进度回写与本地取消。HTTPS 连接自动出示内嵌设备身份证书（mTLS，应对 2026 官方 Rust 内核接收端强制客户端证书），并按对方指纹锁定其证书（详见 §3 决策表）。
 - **已落地（接收方向）**：对方 prepare-upload → 自动弹接收确认页（Accept / Setup 逐文件勾选 / Reject）→ upload 由 http.c 提供流读回调、receive.c 边收边写 `ux0:data/psvsend/downloads/`（先 `.part` 收完改名，sha256 可选校验，断流/校验失败删残留，开机清扫遗留）。兼容对方无 Content-Length 的 **chunked 流式上传**（http.c 内嵌解码状态机）；多文件同会话逐 POST upload。取消/放弃/空闲超时等状态经快照接口给 UI 展示结束原因。announce 已声明 `download:true`。
 - **已落地（发现补充）**：Vita 收不了 UDP 组播、也绑不了 53317，设备表主要靠对方主动 register 与 `scan.c` 主动扫描（向 /24 各 IP 的 53317 POST register 拿 member info）。扫描按 **TLS→明文顺序**探测并携带设备身份证书（2026 官方 Rust 内核接收端强制 mTLS 客户端证书），明文兜底兼容纯 HTTP 端；**优先探测历史在线设备**（config `knownIps` 持久化、LRU、上限 24，入表即记录），常用设备实测轮次开始 ~0.7s 内出现。曾修复两处致手动扫描失效的 bug：`s_read_resp` 未把响应 body 移到缓冲区头部（JSON 解析永远失败、found 恒 0）；TLS 探测静默失败。UI 三角键手动触发。
-- 实现边界的完整清单（忙时 409 / 每连接 worker 上限 8、清单 32 文件/8KB、超时 60s/120s/30s 三档、接收仅明文 HTTP、/24 扫描范围等）见 README「边界与已知限制」。
+- 实现边界的完整清单（忙时 409 / 每连接 worker 上限 8、清单 64 文件/32KB、超时 60s/120s/30s 三档、接收仅明文 HTTP、/24 扫描范围等）见 README「边界与已知限制」。
 - **已落地（稳定性，v2.0.0）**：修复待机唤醒 / Wi-Fi 断开恢复后卡「网络未就绪 / 没扫到设备」——watch 看门狗单线程低频轮询 netctl + 全互斥 `initCount=0` 语义修正（发现/扫描/收发/net 各互斥均改为无人先持锁），恢复后 UI 心跳自动续上；另曾用 6s 模拟断网窗口复现，现该调试开关已置 0（net.c `PSVSEND_SIM_DOWN_MS`，需要时 cmake 覆盖）。
 - **已落地（渲染稳定，v2.0.0）**：修复偶发 **GPU render crash**（先兆为界面「三角形空白撕裂」→ 系统判 render gpu crash 重启）。根因：主循环缺 `vita2d_wait_rendering_done()`，每帧 swap 后 GPU 队列无收敛点，渲染/显示队列超前回绕导致撕裂与驱动状态错乱；修复：每帧 swap 后等待渲染完成（ui_main.c）。字体对象另改为启动帧外预载（`font_preload_all`），堵住"渲染中途创建 GPU 纹理"的隐患（非本次根因，作加固保留）。
 - **已落地（界面，v2.0.0）**：中 / 英双语界面（设置页切换，`i18n.c/h`）+ 设置页底部「关于」区（PSVSend 大字 logo、应用版本与 LocalSend 适配说明）。版本号单源维护：手改 `CMakeLists.txt` 的 `project(VERSION)` 与 `core/config.h` 的 `PSVSEND_APP_VERSION`，SFO `APP_VER` 由 VERSION 自动派生。
@@ -57,7 +57,7 @@
 | TLS 方案 | **mbedtls**（工具链自带 3.6.5），锁定 TLS1.2 | PSV 系统 SceSsl 对 homebrew 不可用；TLS1.3 的证书校验不走 per-cert 回调，指纹 pin 依赖 1.2 |
 | HTTPS 信任模型 | 对端证书按 announce 指纹 SHA-256 **pin**（VERIFY_OPTIONAL + 自管校验回调），不依赖 CA 链 | LAN 内无公开 PKI；协议本身即以 fingerprint 标识设备 |
 | mTLS 客户端身份 | 内置自签 RSA-2048 设备证书（`identity.c` + `id_cert.inc` / `id_key.inc`），对端强制客户端证书时自动出示 | 2026 官方 Rust 内核接收端对非浏览器发送方强制客户端证书，无证书即 `certificate_required` 握手失败 |
-| HTTP/1.1 范围 | **子集**：POST、Content-Length、**chunked 解码**、multipart boundary、query string；响应后关闭连接 | 目标是"兼容 LocalSend"，非"完备 HTTP"。chunked 必须支持（官方 Dart 客户端可能使用）；解析器独立模块、防御式实现（全部读取设上限、不支持格式优雅拒绝 400） |
+| HTTP/1.1 范围 | **子集**：POST、Content-Length、**chunked 解码**、query string；响应后关闭连接 | 目标是"兼容 LocalSend"，非"完备 HTTP"。chunked 必须支持（官方 Dart 客户端可能使用）；**不支持 multipart 编码**（v2 多文件逐 POST 单文件裸流，见 §9）；解析器独立模块、防御式实现（全部读取设上限、不支持格式优雅拒绝 400） |
 | 内存约束 | 按 **256MB** 设计基准（实际预算 365MB 封顶） | 512MB 为**统一内存**（CPU/GPU 共享），系统保留约 147MB，应用可拿最大 365MB（工具箱可调 256/285/333/365） |
 | 文件处理 | **大文件永不整读入内存**，一律流式（收：边收边写盘；发：边读边发） | 内存红线 |
 | 传输分块 | 16~64KB 缓冲 | PSV socket / sceIoRead 的大块缓冲限制 |
@@ -179,7 +179,7 @@ void on_session_done(const Session *s);      // 完成 / 失败
 | 接收请求确认 | 来者名字/平台 + 文件数 + 预览（含取消态） | 接受 / 设置 / 拒绝；发送方取消 → 单个关闭 |
 | 接收设置 | 本次保存目录（可点进目录选择器改本次）+ 逐文件改名（系统键盘 SceIme）/勾选跳过 | 方向键选行、确认勾选、返回继续 |
 | 传输进度 | 会话列表 + 进度条 | 取消 |
-| 设置 | 别名、确认键布局、端口、主题 | — |
+| 设置 | 主题、界面语言、确认键布局、主机名（系统键盘改设备名）、保存目录、检查更新/自动频率 | — |
 
 ### 5.2 架构：事件驱动 + 状态机
 

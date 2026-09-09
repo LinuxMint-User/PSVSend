@@ -69,7 +69,7 @@ jobs:
             VER="${GITHUB_REF_NAME#v}"
           fi
           if [ -z "$VER" ]; then
-            VER="$(sed -n 's/.*PSVSEND_APP_VERSION "\([0-9][0-9.]*\)".*/\1/p' src/config.h | head -1)"
+            VER="$(sed -n 's/.*PSVSEND_APP_VERSION "\([0-9][0-9.]*\)".*/\1/p' src/core/config.h | head -1)"
           fi
           echo "ver=${VER:-unknown}" >> "$GITHUB_OUTPUT"
 
