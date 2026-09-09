@@ -79,9 +79,6 @@ static const TrEntry s_zh[] = {
     { "Toggle", "勾选" },
     { "Back", "返回" },
     { "Rename file", "重命名文件" },
-    { "Editing names is not available yet.", "重命名功能尚未实现。" },
-    { "TODO: system keyboard / built-in input (see design doc).",
-      "TODO：系统键盘/内置输入尚未实现（见设计文档）。" },
 
     /* ---- 传输进度页 ---- */
     { "Transfer failed", "传输失败" },
@@ -125,10 +122,6 @@ static const TrEntry s_zh[] = {
     { "Save here", "存到此处" },
     { "LocalSend client v1.15+ compatible (protocol v2.0)",
       "适配 LocalSend 客户端 v1.15+（协议 v2.0）" },
-    { "This name is shown to other LocalSend devices.",
-      "此名称会显示给其他 LocalSend 设备。" },
-    { "Editing needs text input - not available yet (TODO).",
-      "改名需要文字输入，暂未实现（TODO）。" },
 
     /* ---- 更新检查（设置页 Update 组） ---- */
     { "Update", "更新" },

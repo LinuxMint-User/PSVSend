@@ -1,7 +1,8 @@
 /* 应用配置：存到 ux0:data/psvsend/config（JSON）。
  * 前端(设置页)与后端(发现/将来 HTTP)共享这份运行时配置。
  * alias 为设备名（LocalSend 里称 alias），默认 "PS Vita"；
- * 文字输入方案未定，改名入口暂做壳子，值暂不可编辑。 */
+ * 文字输入用 PSV 系统键盘（app/ime.c）：接收改名与设置页主机名均已接入，
+ * 改名即时生效（alias 各广播点现读，下一轮 announce 自动带新名，无需重启）。 */
 #ifndef PSVSEND_CONFIG_H
 #define PSVSEND_CONFIG_H
 

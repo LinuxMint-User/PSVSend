@@ -73,7 +73,7 @@ typedef struct {
 #define MAX_INF 64
 typedef struct {
     char  name[128];    /* 原始文件名 */
-    char  rname[128];   /* 接收时的保存名（重命名功能 TODO，尚未实现） */
+    char  rname[128];   /* 接收时的保存名：Setup 页系统键盘改名后非空，否则沿用原名 */
     bool  inc;          /* 勾选接收（默认勾上） */
     SceOff size;
 } InFile;
@@ -182,6 +182,10 @@ void page_progress_render(void);
 void page_progress_input(const Input *in);
 void page_settings_render(void);
 void page_settings_input(const Input *in);
+
+/* ---------- 系统键盘（IME）改名事务（pages.c + app/ime.c） ---------- */
+bool page_ime_busy(void);   /* 改名事务进行中：主循环应跳过页面按键/触摸 */
+void page_ime_pump(void);   /* 主循环每帧帧间调用：打开挂起键盘 / 收尾写回 */
 
 /* ---------- 控件绘制（widgets.c） ---------- */
 void w_text(float x, float y, float scale, uint32_t color, const char *fmt, ...);

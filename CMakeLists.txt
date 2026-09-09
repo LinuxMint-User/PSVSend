@@ -46,6 +46,7 @@ add_executable(${PROJECT_NAME}
     src/main.c
     src/app/api.c
     src/app/update.c
+    src/app/ime.c
     src/core/config.c
     src/core/dlog.c
     src/core/i18n.c
@@ -68,7 +69,7 @@ target_link_libraries(${PROJECT_NAME}
     pthread
     vita2d freetype bz2 png jpeg z m
     SceAppMgr_stub SceCommonDialog_stub SceCtrl_stub SceDisplay_stub
-    SceGxm_stub SceIofilemgr_stub SceKernelThreadMgr_stub
+    SceGxm_stub SceIme_stub SceIofilemgr_stub SceKernelThreadMgr_stub
     SceNet_stub SceNetCtl_stub
     ScePgf_stub ScePvf_stub SceSysmodule_stub SceTouch_stub
     SceAppUtil_stub

@@ -211,6 +211,8 @@ void ui_run(void)
         api_tick();          /* announce 节奏（500ms 节流；sendto 只在主线程可靠） */
         pages_tick();        /* 检测新到待决定的接收请求 → 弹接收确认页 */
         update_tick();       /* 自动检查更新：到周期且网络就绪时后台触发 */
+        page_ime_pump();     /* 系统键盘改名事务：帧间打开挂起键盘 / 轮询收尾
+                              * （须非绘制中调用 + 打开期间持续出帧，见 ime.c d56） */
 
         vita2d_start_drawing();
         vita2d_set_clear_color(theme->bg);
@@ -219,14 +221,21 @@ void ui_run(void)
         w_clear();
         render_page();
 
-        Input in;
-        ui_input_poll(&in);
-        if (in.tap || in.up || in.down || in.left || in.right ||
-            in.confirm || in.back || in.menu || in.alt || in.square ||
-            in.drag_start || in.dragging)
-            input_page(&in);
+        if (!page_ime_busy()) {          /* 系统键盘打开期间按键/触摸归键盘，页面输入暂停 */
+            Input in;
+            ui_input_poll(&in);
+            if (in.tap || in.up || in.down || in.left || in.right ||
+                in.confirm || in.back || in.menu || in.alt || in.square ||
+                in.drag_start || in.dragging)
+                input_page(&in);
+        }
 
         vita2d_end_drawing();
+        /* 系统对话框（IME 键盘/消息框等）由应用每帧把 dialog 合成进显示缓冲，
+         * 由 vita2d_common_dialog_update() 完成（内部自检有无 dialog 在运行，
+         * 无则空转）。缺此调用时 dialog 引擎卡在 RUNNING、画面永不出现——
+         * d55-d57 真机"卡死不弹键盘"根因。须在 swap 前、end_drawing 后调用。 */
+        vita2d_common_dialog_update();
         vita2d_swap_buffers();
         vita2d_wait_rendering_done();  /* sceGxmFinish：等 GPU 本帧命令全部执行完再开下一帧。
                                         * 缺此调用时渲染/显示队列长期高速超前回绕，可出现画面

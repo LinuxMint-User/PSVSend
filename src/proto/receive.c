@@ -56,7 +56,8 @@ static struct {
     char ip[16];
     int  n;                  /* 列入清单的文件数（≤ RECV_MAX_FILES） */
     int  overflow;           /* 超上限被丢弃的可用文件数（确认页明示用） */
-    struct { char fileid[160]; char name[192]; SceOff size; char sha256[65]; } f[RECV_MAX_FILES];
+    struct { char fileid[160]; char name[192]; SceOff size; char sha256[65];
+             char rname[192]; } f[RECV_MAX_FILES];
     bool inc[RECV_MAX_FILES];   /* UI 勾选（默认全选） */
 } g_pend;
 
@@ -346,6 +347,22 @@ void recv_set_include(const bool inc[RECV_MAX_FILES])
     unlock();
 }
 
+/* UI 在接受前逐文件指定"保存名"（idx 与 pending.files 下标一致）：
+ * name 为空串 = 保持对方原名；非空 = 以此名落盘（accept 时会再 sanitize +
+ * 冲突排重）。仅在 PH_PENDING 生效，可多次调用覆盖。 */
+void recv_set_name(int idx, const char *name)
+{
+    if (idx < 0 || !name) return;
+    lock();
+    if (g_phase == PH_PENDING && idx < g_pend.n) {
+        if (name[0])
+            snprintf(g_pend.f[idx].rname, sizeof g_pend.f[idx].rname, "%s", name);
+        else
+            g_pend.f[idx].rname[0] = 0;
+    }
+    unlock();
+}
+
 void recv_decide(bool accept)
 {
     lock();
@@ -442,6 +459,7 @@ int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz)
             snprintf(g_pend.f[n].name, sizeof g_pend.f[n].name, "%s", nm);
             g_pend.f[n].size = (SceOff)sz;
             snprintf(g_pend.f[n].sha256, sizeof g_pend.f[n].sha256, "%s", sh);
+            g_pend.f[n].rname[0] = 0;    /* 默认沿用对方文件名；UI 可改（recv_set_name） */
             g_pend.inc[n] = true;
             n++;
         } while (code == 200 && json_iter_next(&it));
@@ -495,7 +513,10 @@ int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz)
             memset(f, 0, sizeof *f);
             snprintf(f->fileid, sizeof f->fileid, "%s", g_pend.f[i].fileid);
             gen_hex(f->token, 16);
-            snprintf(f->name, sizeof f->name, "%s", g_pend.f[i].name);
+            /* 落盘用名：UI 指定的保存名（改名）优先，否则对方原名；alloc_paths
+             * 内会再 sanitize + 冲突排重 */
+            snprintf(f->name, sizeof f->name, "%s",
+                     g_pend.f[i].rname[0] ? g_pend.f[i].rname : g_pend.f[i].name);
             f->size = g_pend.f[i].size;
             snprintf(f->sha256, sizeof f->sha256, "%s", g_pend.f[i].sha256);
             if (f->size == 0) {

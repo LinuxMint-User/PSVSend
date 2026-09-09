@@ -19,6 +19,7 @@
 #include "net/net.h"
 #include "app/api.h"
 #include "app/update.h"
+#include "app/ime.h"
 #include "proto/transfer.h"
 #include "proto/receive.h"
 #include "net/scan.h"
@@ -50,8 +51,9 @@ static int set_press_scroll = 0;
 static int recv_focus = 2;        /* 接收确认焦点：0=Reject 1=Setup 2=Accept */
 static int rs_scroll = 0;         /* 接收设置页文件列表内容偏移 */
 static int rs_press_scroll = 0;
-static bool rename_pop = false;   /* 改名占位弹窗（重命名功能 TODO） */
-static bool host_pop = false;     /* 设置页主机名改名的占位弹窗（文字输入 TODO） */
+/* 接收设置改名已接系统键盘（ime_ask）：rename_pop 保留为恒 false 的清理位，
+ * 避免牵连各页退出时的复位赋值；真正的输入弹窗由 ask_rename() 直接驱动 */
+static bool rename_pop = false;
 /* 目录选择页（PAGE_DIR_PICK）状态：谁打开的（返回页）、临时/持久、目录行索引。
  * 语义：选定的是"当前进入到的目录"（cur_dir），与列表焦点无关。 */
 static PageId dpick_origin = PAGE_SETTINGS;
@@ -839,7 +841,10 @@ static void start_recv(void)
     for (i = 0; i < g_app.inc_count && i < RECV_MAX_FILES; i++) {
         if (!g_app.inc_files[i].inc) continue;
         if (n >= MAX_PICKED) break;
-        snprintf(xf_name[n], sizeof xf_name[0], "%s", g_app.inc_files[i].name);
+        /* 进度页清单显示"保存名"（改名后为新名，否则对方原名） */
+        snprintf(xf_name[n], sizeof xf_name[0], "%s",
+                 g_app.inc_files[i].rname[0]
+                     ? g_app.inc_files[i].rname : g_app.inc_files[i].name);
         xf_size[n] = g_app.inc_files[i].size;
         tot += g_app.inc_files[i].size;
         n++;
@@ -870,6 +875,139 @@ static void start_recv(void)
 #define RSS_STRIDE  60
 #define RS_REN_ID   0x4000             /* 触摸 id：改名按钮 = 基址 + 行号 */
 #define RS_CHK_ID   0x8000             /* 触摸 id：勾选框  = 基址 + 行号 */
+
+/* 系统键盘挂起事务：设置页主机名与接收设置逐文件改名共用同一状态机
+ * （分属不同页面不会同时出现）。busy 供主循环据此跳过页面按键/触摸。 */
+enum {
+    IME_TX_NONE = 0,
+    IME_TX_RENAME,     /* 接收设置：改 inc_files[ime_tx_fi] 的保存名 */
+    IME_TX_HOST,       /* 设置页：改本机设备名 alias（config） */
+};
+/* 接收改名的键盘时限：须赶在 prepare 等 UI 决定窗口（receive.c 的
+ * RECV_DECIDE_TIMEOUT_US = 60s）内完成，窗口一过 pending 清场、改名白做；
+ * 取 50s 略短于窗口，给关键盘后点接受/拒绝留时间。主机名是纯设置项、
+ * 无业务时限，打开时传 0 不限（见 ime.h limit_us）。 */
+#define RN_IME_LIMIT_US (50ll * 1000 * 1000)
+static int  ime_tx = IME_TX_NONE;  /* 当前挂起/打开的事务（NONE=空闲） */
+static int  ime_tx_fi = -1;        /* RENAME 的目标行（HOST 不使用） */
+static char ime_out[128];          /* 键盘结果落点（须存活到 poll 结束，ime 异步写） */
+
+/* 把键盘输入净化后写入 rname 并同步后端（净化规则与后端 sanitize 一致，
+ * 保证行上显示的即落盘名）。无效输入 → 沿用原名。 */
+static void rename_apply(int fi, const char *in)
+{
+    char cur[128];
+    int i, o;
+    bool any = false;
+    if (fi < 0 || fi >= g_app.inc_count) return;
+    for (i = 0, o = 0; in[i] && o < (int)sizeof cur - 1 && i < 159; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c < 0x20 || c == 0x7F || c == '/' || c == '\\' || c == ':' ||
+            c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+            c = '_';
+        cur[o++] = (char)c;
+        if (c != '_') any = true;
+    }
+    while (o > 0 && (cur[o - 1] == ' ' || cur[o - 1] == '.')) o--;
+    cur[o] = 0;
+    if (!any || !cur[0] || strcmp(cur, ".") == 0 || strcmp(cur, "..") == 0) {
+        g_app.inc_files[fi].rname[0] = 0;   /* 净化后无效：沿用原名 */
+        recv_set_name(fi, "");
+        return;
+    }
+    if (strcmp(cur, g_app.inc_files[fi].name) == 0)
+        cur[0] = 0;                         /* 等于原名：无需改名 */
+    snprintf(g_app.inc_files[fi].rname, sizeof g_app.inc_files[fi].rname,
+             "%s", cur);
+    recv_set_name(fi, cur);
+}
+
+/* 请求打开系统键盘改行 fi 的保存名。仅登记，真正的 ime_ask_begin 由主循环
+ * 帧间 page_ime_pump() 执行——不能在本函数调用：它处于 vita2d 绘制批次中，
+ * 对话框在绘制中打开会抢占显示通道导致弹不出（d55 卡死根因之一）。 */
+static void ask_rename(int fi)
+{
+    if (ime_tx != IME_TX_NONE || fi < 0 || fi >= g_app.inc_count) return;
+    ime_tx = IME_TX_RENAME;
+    ime_tx_fi = fi;   /* 初值在 pump 里现取（主线程串行，内容一致） */
+}
+
+/* 主机名净化：剥控制字符、去首尾空白；UTF-8 按完整码点截断到 alias 容量
+ * （放不下整字符即停，绝不切半多字节字符）。结果为空 → 默认名。未变不写盘。 */
+static void host_apply(const char *in)
+{
+    char cur[sizeof g_cfg.alias];
+    int i = 0, o = 0, s;
+
+    while (in[i] && o < (int)sizeof cur - 1) {
+        unsigned char c = (unsigned char)in[i];
+        int nb;
+        if (c < 0x80) nb = 1;
+        else if (c < 0xE0) nb = 2;
+        else if (c < 0xF0) nb = 3;
+        else if (c < 0xF8) nb = 4;
+        else nb = 1;                       /* 非法首字节防御：按单字节保留 */
+        if (c < 0x20 || c == 0x7F) { i++; continue; }   /* 剥离控制字符 */
+        if (o + nb > (int)sizeof cur - 1) break;        /* 放不下整字符 */
+        while (nb--) cur[o++] = in[i++];
+    }
+    cur[o] = 0;
+    for (s = 0; cur[s] == ' '; s++) ;      /* 去首部空白 */
+    while (o > s && cur[o - 1] == ' ') o--;
+    if (o > s)
+        memmove(cur, cur + s, o - s);
+    cur[o - s] = 0;
+    if (!cur[0])
+        snprintf(cur, sizeof cur, "%s", DEFAULT_ALIAS);  /* 空输入 → 默认名 */
+    if (strcmp(cur, g_cfg.alias) == 0) return;
+    snprintf(g_cfg.alias, sizeof g_cfg.alias, "%s", cur);
+    config_save();
+}
+
+/* 请求打开系统键盘改本机设备名（alias）。登记时机同 ask_rename。 */
+static void ask_ime_host(void)
+{
+    if (ime_tx != IME_TX_NONE) return;
+    ime_tx = IME_TX_HOST;
+}
+
+/* 系统键盘改名事务进行中（已登记或已打开）？主循环据此跳过页面按键/触摸。 */
+bool page_ime_busy(void)
+{
+    return ime_tx != IME_TX_NONE;
+}
+
+/* 主循环每帧在"帧间"（非绘制中，参考 mGBA-psp2：init 在渲染循环外、
+ * 对话框打开后循环内每帧 draw→poll→draw）驱动系统键盘：
+ *   - 有登记的请求 → 打开键盘（成功则进入轮询，失败清除请求）；
+ *   - 键盘已打开 → poll 收尾，结束（确认/取消）时按事务写回并复位。 */
+void page_ime_pump(void)
+{
+    int r;
+    if (ime_active()) {
+        r = ime_ask_poll();
+        if (r == 0) return;                 /* 仍在进行：继续出帧渲染 */
+        if (r == 1) {
+            if (ime_tx == IME_TX_RENAME) rename_apply(ime_tx_fi, ime_out);
+            else if (ime_tx == IME_TX_HOST) host_apply(ime_out);
+        }
+        ime_tx = IME_TX_NONE;
+        return;
+    }
+    if (ime_tx == IME_TX_RENAME) {
+        if (ime_ask_begin(tr("Rename file"),
+                          g_app.inc_files[ime_tx_fi].rname[0]
+                              ? g_app.inc_files[ime_tx_fi].rname
+                              : g_app.inc_files[ime_tx_fi].name,
+                          ime_out, sizeof ime_out, RN_IME_LIMIT_US) != 1)
+            ime_tx = IME_TX_NONE;           /* 打开失败：放弃（dlog 已记） */
+    } else if (ime_tx == IME_TX_HOST) {
+        if (ime_ask_begin(tr("Hostname"),
+                          g_cfg.alias[0] ? g_cfg.alias : DEFAULT_ALIAS,
+                          ime_out, sizeof ime_out, 0) != 1)   /* 0=不限时 */
+            ime_tx = IME_TX_NONE;
+    }
+}
 
 static void rs_clamp(void)
 {
@@ -914,7 +1052,7 @@ void page_recv_setup_render(void)
 {
     w_page_header(tr("Receive setup"));
     int rows = 1 + g_app.inc_count;
-    char line[256], sz[16];
+    char sz[16];
     rs_clamp();
     int i;
 
@@ -947,10 +1085,18 @@ void page_recv_setup_render(void)
         bool on = g_app.inc_files[idx].inc;
         uint32_t nc = sel ? theme->text : theme->text_dim;
         w_human_size(g_app.inc_files[idx].size, sz);
-        int th = 0;
-        w_text_w(1.0f, g_app.inc_files[idx].name, NULL, &th);
-        w_text_clip(60, top + (RSS_ROW_H - th) / 2 - 2, 1.0f, nc,
-                    g_app.inc_files[idx].name, 480);
+        if (g_app.inc_files[idx].rname[0]) {
+            /* 已改名：上行小字原名，下行保存名 */
+            w_text_clip(60, top + 4, 0.8f, theme->text_dim,
+                        g_app.inc_files[idx].name, 460);
+            w_text_clip(60, top + 22, 1.0f, nc,
+                        g_app.inc_files[idx].rname, 460);
+        } else {
+            int th = 0;
+            w_text_w(1.0f, g_app.inc_files[idx].name, NULL, &th);
+            w_text_clip(60, top + (RSS_ROW_H - th) / 2 - 2, 1.0f, nc,
+                        g_app.inc_files[idx].name, 460);
+        }
         int sw = 0, sh = 0;
         w_text_w(1.0f, sz, &sw, &sh);
         w_text(696 - sw, top + (RSS_ROW_H - sh) / 2 - 2, 1.0f,
@@ -987,36 +1133,11 @@ void page_recv_setup_render(void)
     segs[ns].icon = HICON_TRIANGLE;   segs[ns++].text = tr("Rename");
     segs[ns].icon = icon_back();      segs[ns++].text = tr("Back");
     w_page_footer_segs(segs, ns);
-
-    /* 改名占位弹窗 */
-    if (rename_pop) {
-        Rect card = w_modal_box(230);
-        int idx = g_app.inc_sel - 1;
-        snprintf(line, sizeof line, "%s",
-                 (idx >= 0 && idx < g_app.inc_count)
-                     ? g_app.inc_files[idx].name : "");
-        w_text(card.x + 40, card.y + 28, 1.3f, theme->text, "%s",
-               tr("Rename file"));
-        w_text_clip(card.x + 40, card.y + 76, 1.0f, theme->text_dim,
-                    line, card.w - 80);
-        w_text(card.x + 40, card.y + 124, 1.0f, theme->text_dim, "%s",
-               tr("Editing names is not available yet."));
-        w_text(card.x + 40, card.y + 158, 1.0f, theme->text_dim, "%s",
-               tr("TODO: system keyboard / built-in input (see design doc)."));
-    }
 }
 
 void page_recv_setup_input(const Input *in)
 {
     int rows = 1 + g_app.inc_count;
-    if (rename_pop) {
-        /* 改名占位弹窗：任意键/点击关闭 */
-        if (in->tap || in->confirm || in->back || in->alt ||
-            in->up || in->down || in->left || in->right ||
-            in->drag_start || in->dragging)
-            rename_pop = false;
-        return;
-    }
     if (in->drag_start || in->dragging) {
         int max_s = rows * RSS_STRIDE - RSS_VIEW;
         if (max_s < 0) max_s = 0;
@@ -1040,7 +1161,7 @@ void page_recv_setup_input(const Input *in)
         if (id >= RS_REN_ID && id < RS_REN_ID + rows) {
             int row = id - RS_REN_ID;
             g_app.inc_sel = row;
-            if (row > 0) rename_pop = true;
+            if (row > 0) ask_rename(row - 1);
             return;
         }
         if (id >= RS_CHK_ID && id < RS_CHK_ID + rows) {
@@ -1075,7 +1196,7 @@ void page_recv_setup_input(const Input *in)
         }
     }
     if (in->alt) {
-        if (g_app.inc_sel > 0) rename_pop = true;
+        if (g_app.inc_sel > 0) ask_rename(g_app.inc_sel - 1);
     }
     if (in->back) {
         rename_pop = false;
@@ -1355,12 +1476,12 @@ void page_progress_input(const Input *in)
  * 设置页行 = 分组标题(不可选) + 设置项。整页像素滚动（模型同设备/文件列表）：
  * 可视区 LIST_TOP..LIST_BOTTOM，内容总高超出时拖动跟手、方向键自动滚到选中项。
  * g_app.set_sel 存设置项 id（SET_ITEM_*）；分组标题不参与选择。
- * 每行触摸分成两半：左半=上一档，右半=下一档（主机名行两半都弹占位）。 */
+ * 每行触摸分成两半：左半=上一档，右半=下一档（主机名行点任意半开键盘改名）。 */
 enum {
     SET_ITEM_THEME = 0,    /* 显示：主题 */
     SET_ITEM_LANG,         /* 显示：界面语言 */
     SET_ITEM_KEY,          /* 操作：确认键布局 */
-    SET_ITEM_HOSTNAME,     /* 设备：主机名（改名需文字输入，先占位弹窗） */
+    SET_ITEM_HOSTNAME,     /* 设备：主机名（改名走系统键盘） */
     SET_ITEM_SAVEDIR,      /* 存储：默认保存目录（动作行：进目录选择器并落盘） */
     SET_ITEM_CHECK,        /* 更新：检查更新（动作行：按任意键/点任意半即查） */
     SET_ITEM_AUTO,         /* 更新：自动检查频率 */
@@ -1504,7 +1625,7 @@ static void settings_change(int item, int dir)
         if (g_cfg.upd_auto > 3) g_cfg.upd_auto = 0;
         config_save();
     }
-    /* SET_ITEM_HOSTNAME：改名需要文字输入，未实现（见占位弹窗） */
+    /* SET_ITEM_HOSTNAME：动作在 input 里走 ask_ime_host（系统键盘），不落档位循环 */
 }
 
 void page_settings_render(void)
@@ -1641,30 +1762,10 @@ void page_settings_render(void)
     segs[ns].icon = icon_confirm();  segs[ns++].text = tr("Change");
     segs[ns].icon = icon_back();     segs[ns++].text = tr("Back");
     w_page_footer_segs(segs, ns);
-
-    /* 主机名编辑占位弹窗（文字输入方案未定，先壳子） */
-    if (host_pop) {
-        Rect card = w_modal_box(230);
-        w_text(card.x + 40, card.y + 28, 1.3f, theme->text, "%s", tr("Hostname"));
-        w_text_clip(card.x + 40, card.y + 76, 1.0f, theme->text_dim,
-                    g_cfg.alias[0] ? g_cfg.alias : DEFAULT_ALIAS, card.w - 80);
-        w_text(card.x + 40, card.y + 124, 1.0f, theme->text_dim, "%s",
-               tr("This name is shown to other LocalSend devices."));
-        w_text(card.x + 40, card.y + 158, 1.0f, theme->text_dim, "%s",
-               tr("Editing needs text input - not available yet (TODO)."));
-    }
 }
 
 void page_settings_input(const Input *in)
 {
-    if (host_pop) {
-        /* 占位弹窗：任意键/点击关闭 */
-        if (in->tap || in->confirm || in->back || in->alt ||
-            in->up || in->down || in->left || in->right ||
-            in->drag_start || in->dragging)
-            host_pop = false;
-        return;
-    }
     if (in->drag_start || in->dragging) {
         int m = set_content_h() - LIST_VIEW_H;
         if (m < 0) m = 0;
@@ -1681,7 +1782,7 @@ void page_settings_input(const Input *in)
             int item = id / 2;
             if (item >= 0 && item < SET_ITEM_N) {
                 g_app.set_sel = item;
-                if (item == SET_ITEM_HOSTNAME) host_pop = true;
+                if (item == SET_ITEM_HOSTNAME) ask_ime_host();
                 else if (item == SET_ITEM_SAVEDIR)
                     open_dir_pick(PAGE_SETTINGS, true, g_cfg.save_dir);
                 else settings_change(item, (id & 1) ? 1 : -1);
@@ -1697,7 +1798,7 @@ void page_settings_input(const Input *in)
     }
     if (in->left || in->right || in->confirm) {
         int item = g_app.set_sel;
-        if (item == SET_ITEM_HOSTNAME) host_pop = true;
+        if (item == SET_ITEM_HOSTNAME) ask_ime_host();
         else if (item == SET_ITEM_SAVEDIR)
             open_dir_pick(PAGE_SETTINGS, true, g_cfg.save_dir);
         else settings_change(item, in->left ? -1 : 1);

@@ -64,6 +64,11 @@ int recv_pending_pull(RecvPending *out);
  * 未勾选的会在接受后被后端标记跳过、不出现在 prepare 响应里）。 */
 void recv_set_include(const bool inc[RECV_MAX_FILES]);
 
+/* UI 在接受前逐文件指定"保存名"（idx 与 pending.files 下标一致）：非空 =
+ * 以此名落盘（后端会再 sanitize + 冲突排重），空串 = 保持对方原名。
+ * 仅 PENDING 生效；不改名的文件不必调用。 */
+void recv_set_name(int idx, const char *name);
+
 /* UI 在接受前设定"本次保存目录"（内存态，仅本会话；NULL/空 → 回退
  * config saveDir 默认）。不持久化，下次会话由 UI 重新给出默认值。 */
 void recv_set_dir(const char *dir);
