@@ -116,6 +116,13 @@ static const TrEntry s_zh[] = {
     { "Tap row halves to change", "点击行左右半边切换当前项" },
     { "Change", "更改" },
     { "About", "关于" },
+
+    /* ---- 存储组 / 目录选择（设置页默认保存目录 & 接收 Setup 本次目录共用） ---- */
+    { "Storage", "存储" },
+    { "Save folder", "保存目录" },
+    { "Choose folder", "选择文件夹" },
+    { "Open", "打开" },
+    { "Save here", "存到此处" },
     { "LocalSend client v1.15+ compatible (protocol v2.0)",
       "适配 LocalSend 客户端 v1.15+（协议 v2.0）" },
     { "This name is shown to other LocalSend devices.",

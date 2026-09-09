@@ -31,6 +31,7 @@
 #define ROW_H        56
 #define ROW_STRIDE   62
 #define WID_FILES_SEND 0x8001
+#define WID_DIRPICK_SAVE 0x9001  /* 目录选择页"存到当前目录"触摸按钮 */
 
 /* 传输页：文件列表区域与总进度布局（发送/接收共用） */
 #define XF_TOP        68
@@ -51,6 +52,14 @@ static int rs_scroll = 0;         /* 接收设置页文件列表内容偏移 */
 static int rs_press_scroll = 0;
 static bool rename_pop = false;   /* 改名占位弹窗（重命名功能 TODO） */
 static bool host_pop = false;     /* 设置页主机名改名的占位弹窗（文字输入 TODO） */
+/* 目录选择页（PAGE_DIR_PICK）状态：谁打开的（返回页）、临时/持久、目录行索引。
+ * 语义：选定的是"当前进入到的目录"（cur_dir），与列表焦点无关。 */
+static PageId dpick_origin = PAGE_SETTINGS;
+static bool   dpick_persist = false;  /* true=写 config saveDir（设置页）；false=写本次 recv_dir */
+static int    dpick_dirs[MAX_FILES];  /* files[] 中目录行下标（渲染/焦点按此索引） */
+static int    dpick_dcount = 0;
+static int    dpick_scroll = 0;
+static int    dpick_press_scroll = 0;
 /* 手动扫描的反馈横幅状态（设备页头与列表之间的一条细字）：
  * 扫描中显示进度，round 结束时边沿检测记下结束时刻，其后约 4s 显示结果 */
 static uint64_t dev_scan_end_us = 0;
@@ -70,6 +79,10 @@ static void start_send(void);
 static void start_recv(void);
 static void goto_devices(void);
 static void open_files(void);
+static void dpick_save(void);
+static void dpick_up(void);
+static void dpick_enter(int dn);
+static void open_dir_pick(PageId origin, bool persist, const char *start_dir);
 
 /* 当前勾选接收的文件数 */
 static int recv_included(void)
@@ -822,6 +835,7 @@ static void start_recv(void)
     for (i = 0; i < g_app.inc_count && i < RECV_MAX_FILES; i++)
         inc[i] = g_app.inc_files[i].inc;
     recv_set_include(inc);
+    recv_set_dir(g_app.recv_dir);   /* 本次保存目录（Setup 里可临时改；默认=config saveDir） */
     for (i = 0; i < g_app.inc_count && i < RECV_MAX_FILES; i++) {
         if (!g_app.inc_files[i].inc) continue;
         if (n >= MAX_PICKED) break;
@@ -916,14 +930,16 @@ void page_recv_setup_render(void)
         w_add(i, r);
 
         if (i == 0) {
-            /* 保存目录行：只读默认值；真实目录选择 TODO */
+            /* 保存目录行：本次目录（默认=config saveDir）。确认键/点击进入
+             * 目录选择器临时改本次目录（内存态，接受时才传给后端生效）。 */
             w_text(60, top + 8, 1.0f, theme->text_dim, "%s", tr("Save to"));
             w_text_clip(60, top + 30, 1.1f, sel ? theme->text : theme->text_dim,
-                        g_app.recv_dir, 700);
-            int tw = 0, th = 0;
-            w_text_w(1.0f, tr("default"), &tw, &th);
-            w_text(r.x + r.w - tw - 24, top + 16, 1.0f, theme->text_dim,
-                   "%s", tr("default"));
+                        g_app.recv_dir, 620);
+            const char *act = tr("Change");
+            int aw = 0, ah = 0;
+            w_text_w(1.0f, act, &aw, &ah);
+            w_text(r.x + r.w - aw - 24, top + 16, 1.0f,
+                   sel ? theme->accent_text : theme->text_dim, "%s", act);
             continue;
         }
 
@@ -1036,7 +1052,10 @@ void page_recv_setup_input(const Input *in)
             }
             return;
         }
-        if (id >= 0 && id < rows) g_app.inc_sel = id;
+        if (id >= 0 && id < rows) {
+            g_app.inc_sel = id;
+            if (id == 0) open_dir_pick(PAGE_RECV_SETUP, false, g_app.recv_dir);
+        }
         return;
     }
     if (in->up && g_app.inc_sel > 0) {
@@ -1051,6 +1070,8 @@ void page_recv_setup_input(const Input *in)
         if (g_app.inc_sel > 0) {
             int fi = g_app.inc_sel - 1;
             g_app.inc_files[fi].inc = !g_app.inc_files[fi].inc;
+        } else {
+            open_dir_pick(PAGE_RECV_SETUP, false, g_app.recv_dir);   /* 目录行 */
         }
     }
     if (in->alt) {
@@ -1340,6 +1361,7 @@ enum {
     SET_ITEM_LANG,         /* 显示：界面语言 */
     SET_ITEM_KEY,          /* 操作：确认键布局 */
     SET_ITEM_HOSTNAME,     /* 设备：主机名（改名需文字输入，先占位弹窗） */
+    SET_ITEM_SAVEDIR,      /* 存储：默认保存目录（动作行：进目录选择器并落盘） */
     SET_ITEM_CHECK,        /* 更新：检查更新（动作行：按任意键/点任意半即查） */
     SET_ITEM_AUTO,         /* 更新：自动检查频率 */
     SET_ITEM_N
@@ -1355,6 +1377,8 @@ enum {
     SET_SLOT_HDR_C,        /* 分组：操作 */
     SET_SLOT_KEY,
     SET_SLOT_HINT,
+    SET_SLOT_HDR_ST,       /* 分组：存储 */
+    SET_SLOT_SAVEDIR,
     SET_SLOT_HDR_UPD,      /* 分组：更新 */
     SET_SLOT_CHECK,
     SET_SLOT_AUTO,
@@ -1377,6 +1401,7 @@ static int slot_item(int slot)
     case SET_SLOT_THEME: return SET_ITEM_THEME;
     case SET_SLOT_LANG:  return SET_ITEM_LANG;
     case SET_SLOT_KEY:   return SET_ITEM_KEY;
+    case SET_SLOT_SAVEDIR: return SET_ITEM_SAVEDIR;
     case SET_SLOT_CHECK: return SET_ITEM_CHECK;
     case SET_SLOT_AUTO:  return SET_ITEM_AUTO;
     }
@@ -1387,6 +1412,7 @@ static int item_slot(int item)
 {
     switch (item) {
     case SET_ITEM_HOSTNAME: return SET_SLOT_HOST;
+    case SET_ITEM_SAVEDIR:  return SET_SLOT_SAVEDIR;
     case SET_ITEM_THEME:    return SET_SLOT_THEME;
     case SET_ITEM_LANG:     return SET_SLOT_LANG;
     case SET_ITEM_KEY:      return SET_SLOT_KEY;
@@ -1525,6 +1551,7 @@ void page_settings_render(void)
             case SET_SLOT_HDR_A: txt = tr("Device"); break;
             case SET_SLOT_HDR_B: txt = tr("Display"); break;
             case SET_SLOT_HDR_C: txt = tr("Controls"); break;
+            case SET_SLOT_HDR_ST: txt = tr("Storage"); break;
             case SET_SLOT_HDR_UPD: txt = tr("Update"); break;
             case SET_SLOT_HDR_D: txt = tr("About"); break;
             default: break; /* 下方各自 case，绝不落到空绘制 */
@@ -1559,6 +1586,17 @@ void page_settings_render(void)
                   g_cfg.alias[0] ? g_cfg.alias : DEFAULT_ALIAS,
                   item == g_app.set_sel);
             break;
+        case SET_ITEM_SAVEDIR: {
+            /* 值可能是长路径：label 一行、路径 clip 下一行（选中=整行反色） */
+            uint32_t card = item == g_app.set_sel ? theme->accent : theme->card;
+            uint32_t tc = item == g_app.set_sel ? theme->accent_text : theme->text;
+            uint32_t dc = item == g_app.set_sel ? theme->accent_text : theme->text_dim;
+            w_rect(r, card);
+            w_text(r.x + 24, r.y + 3, 1.25f, tc, "%s", tr("Save folder"));
+            w_text_clip(r.x + 24, r.y + 31, 1.0f, dc, g_cfg.save_dir,
+                        r.w - 48);
+            break;
+        }
         case SET_ITEM_THEME:
             w_row(r, tr("Theme"), theme_v, item == g_app.set_sel);
             break;
@@ -1644,6 +1682,8 @@ void page_settings_input(const Input *in)
             if (item >= 0 && item < SET_ITEM_N) {
                 g_app.set_sel = item;
                 if (item == SET_ITEM_HOSTNAME) host_pop = true;
+                else if (item == SET_ITEM_SAVEDIR)
+                    open_dir_pick(PAGE_SETTINGS, true, g_cfg.save_dir);
                 else settings_change(item, (id & 1) ? 1 : -1);
             }
         }
@@ -1658,9 +1698,143 @@ void page_settings_input(const Input *in)
     if (in->left || in->right || in->confirm) {
         int item = g_app.set_sel;
         if (item == SET_ITEM_HOSTNAME) host_pop = true;
+        else if (item == SET_ITEM_SAVEDIR)
+            open_dir_pick(PAGE_SETTINGS, true, g_cfg.save_dir);
         else settings_change(item, in->left ? -1 : 1);
     }
     if (in->back) g_app.page = PAGE_DEVICES;
+}
+
+/* ================= 目录选择页 =================
+ * 设置页"默认保存目录"与接收 Setup"本次目录"共用：仅列文件夹，选定目标 =
+ * "当前进入到的目录"（cur_dir），点文件夹进入、方块键或右下按钮确认。 */
+
+/* 从 files[] 重建目录行索引（文件浏览列表可能混有文件，只给目录当候选） */
+static void dpick_build(void)
+{
+    int n = 0, i;
+    for (i = 0; i < g_app.file_count && n < MAX_FILES; i++)
+        if (g_app.files[i].is_dir) dpick_dirs[n++] = i;
+    dpick_dcount = n;
+    if (g_app.file_sel >= n) g_app.file_sel = n > 0 ? n - 1 : 0;
+}
+
+static void open_dir_pick(PageId origin, bool persist, const char *start_dir)
+{
+    dpick_origin = origin;
+    dpick_persist = persist;
+    strncpy(g_app.cur_dir, start_dir, sizeof g_app.cur_dir - 1);
+    g_app.cur_dir[sizeof g_app.cur_dir - 1] = 0;
+    g_app.file_sel = 0;
+    dpick_scroll = 0;
+    files_load();
+    dpick_build();
+    g_app.page = PAGE_DIR_PICK;
+}
+
+static void dpick_enter(int dn)
+{
+    if (dn < 0 || dn >= dpick_dcount) return;
+    enter_dir(g_app.files[dpick_dirs[dn]].name);
+    dpick_build();
+    dpick_scroll = 0;
+}
+
+static void dpick_up(void)
+{
+    size_t len = strlen(g_app.cur_dir);
+    if (len <= 5) {                 /* 已在 ux0:/ 根：回来源页，不改任何目录 */
+        g_app.page = dpick_origin;
+        return;
+    }
+    parent_dir();
+    dpick_build();
+    dpick_scroll = 0;
+}
+
+/* 确认当前目录：persist=写 config saveDir 并落盘；否则只写内存 recv_dir */
+static void dpick_save(void)
+{
+    if (dpick_persist) {
+        snprintf(g_cfg.save_dir, sizeof g_cfg.save_dir, "%s", g_app.cur_dir);
+        config_save();
+    } else {
+        snprintf(g_app.recv_dir, sizeof g_app.recv_dir, "%s", g_app.cur_dir);
+    }
+    if (dpick_origin == PAGE_SETTINGS) g_app.set_sel = SET_ITEM_SAVEDIR;
+    else g_app.inc_sel = 0;         /* 回接收设置页并高亮目录行 */
+    g_app.page = dpick_origin;
+}
+
+void page_dir_pick_render(void)
+{
+    int i;
+    w_page_header(tr("Choose folder"));
+    w_text_clip(28, 56, 1.0f, theme->text_dim, g_app.cur_dir, SCR_W - 56);
+    if (dpick_dcount > 0) {
+        clamp_scroll(&dpick_scroll, dpick_dcount);
+        vita2d_enable_clipping();
+        vita2d_set_clip_rectangle(0, LIST_TOP, SCR_W, LIST_BOTTOM);
+        for (i = dpick_scroll / ROW_STRIDE; i < dpick_dcount; i++) {
+            int top = LIST_TOP - dpick_scroll + i * ROW_STRIDE;
+            if (top >= LIST_BOTTOM) break;
+            Rect r = { 24, top, SCR_W - 48, ROW_H };
+            add_row_hit(i, top);
+            char main[280];
+            snprintf(main, sizeof main, "%s%s",
+                     g_app.files[dpick_dirs[i]].name, dir_yes);
+            w_row(r, main, tr("folder"), i == g_app.file_sel);
+        }
+        vita2d_disable_clipping();
+    } else {
+        w_text(28, LIST_TOP + 8, 1.1f, theme->text_dim, "%s",
+               tr("(empty folder)"));
+    }
+    /* 右下"存到此处"按钮，左侧同行走当前目录路径（即将写入的路径） */
+    Rect bt = { SCR_W - 280, SCR_H - 42, 256, 36 };
+    w_add(WID_DIRPICK_SAVE, bt);
+    w_button(bt, tr("Save here"), true);
+    w_text_clip(24, SCR_H - 38, 1.0f, theme->text_dim,
+                g_app.cur_dir, SCR_W - 296);
+    HintSeg segs[6];
+    int ns = 0;
+    segs[ns].icon = HICON_DPAD;      segs[ns++].text = tr("Choose");
+    segs[ns].icon = icon_confirm();  segs[ns++].text = tr("Open");
+    segs[ns].icon = HICON_SQUARE;    segs[ns++].text = tr("Save here");
+    /* 根目录无"上级"：返回键此时=退出选择（回来源页），提示随层级切换 */
+    segs[ns].icon = icon_back();
+    segs[ns++].text = strlen(g_app.cur_dir) <= 5 ? tr("Back") : tr("Up");
+    w_page_footer_segs(segs, ns);
+}
+
+void page_dir_pick_input(const Input *in)
+{
+    if (dpick_dcount > 0 && (in->drag_start || in->dragging)) {
+        list_drag(in, dpick_dcount, &dpick_scroll, &dpick_press_scroll,
+                  &g_app.file_sel);
+        return;                     /* 拖动期间不处理其它触摸动作 */
+    }
+    if (in->tap) {
+        int id = w_hit(in->tap_x, in->tap_y);
+        if (id == WID_DIRPICK_SAVE) { dpick_save(); return; }
+        if (id >= 0 && id < dpick_dcount) {
+            g_app.file_sel = id;
+            dpick_enter(id);
+        }
+        return;
+    }
+    if (in->up && g_app.file_sel > 0) {
+        g_app.file_sel--;
+        keep_sel_visible(&dpick_scroll, dpick_dcount, g_app.file_sel);
+    }
+    if (in->down && g_app.file_sel < dpick_dcount - 1) {
+        g_app.file_sel++;
+        keep_sel_visible(&dpick_scroll, dpick_dcount, g_app.file_sel);
+    }
+    if (in->confirm && dpick_dcount > 0)
+        dpick_enter(g_app.file_sel);
+    if (in->square) { dpick_save(); return; }
+    if (in->back) dpick_up();
 }
 
 /* ================= 新接收请求自动弹窗 ================= */
@@ -1682,7 +1856,7 @@ static void open_recv_request(const RecvPending *rp)
         g_app.inc_files[i].inc = true;      /* 默认全收，Setup 里可取消勾选 */
         g_app.inc_files[i].size = rp->files[i].size;
     }
-    snprintf(g_app.recv_dir, sizeof g_app.recv_dir, "%s", PSVSEND_DL_DIR);
+    snprintf(g_app.recv_dir, sizeof g_app.recv_dir, "%s", g_cfg.save_dir);
     g_app.inc_sel = 0;
     rs_scroll = 0;
     rename_pop = false;

@@ -2,8 +2,9 @@
  * 对方(发送方)按我们 announce 里的 http 端口 POST 过来：
  *   prepare-upload  文件清单 JSON → 挂起等 UI 接受/拒绝（回 200 {sessionId,files{id:token}}
  *                   或 403；已有活动会话时 409）
- *   upload?sessionId&fileId&token  裸文件字节流 → 边收边写盘 downloads/（临时 .part，
- *                   收完改名；sha256 校验失败 422）
+ *   upload?sessionId&fileId&token  裸文件字节流 → 边收边写盘保存目录（临时 .part，
+ *                   收完改名；sha256 校验失败 422）。保存目录：config saveDir
+ *                   持久默认，UI 可在接受前 recv_set_dir 覆盖为本次目录（内存态）。
  *   cancel?sessionId  发送方放弃会话
  * UI 轮询拉取"待确认请求 / 传输状态"，把勾选集合与接受决定写回；http 线程轮询唤醒。
  * 单活动会话：同一时刻只有一个接收会话，第二个 prepare-upload 回 409。 */
@@ -62,6 +63,10 @@ int recv_pending_pull(RecvPending *out);
 /* UI 在决定前同步"本次勾选接收的文件"（下标与 pending 的 files 一致；
  * 未勾选的会在接受后被后端标记跳过、不出现在 prepare 响应里）。 */
 void recv_set_include(const bool inc[RECV_MAX_FILES]);
+
+/* UI 在接受前设定"本次保存目录"（内存态，仅本会话；NULL/空 → 回退
+ * config saveDir 默认）。不持久化，下次会话由 UI 重新给出默认值。 */
+void recv_set_dir(const char *dir);
 
 /* UI 决定（仅 PENDING 有效）：accept=1 接受（生成 sessionId/token，回 200 全收）
  * / 0 拒绝（回 403）。 */

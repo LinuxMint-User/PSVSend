@@ -28,6 +28,8 @@ typedef struct {
     int  lang;               /* 界面语言偏好：0=跟随系统 1=English 2=中文 */
     int  known_n;            /* 历史设备 IP 条数（最近发现优先，作扫描种子） */
     char known_ips[KNOWN_MAX][16]; /* 历史设备 IP，最新在前 */
+    char save_dir[512];  /* 保存目录（设置页可选，持久化；默认 downloads）。
+                          * 接收前的"本次目录"是内存态临时覆盖，不进 config。 */
     int  upd_auto;   /* 自动检查更新：0=关 1=每天 2=每周(默认) 3=每月 */
     int  upd_last;   /* 上次检查更新时刻的"网络"unix 时间戳（授时来自远端
                       * 响应头 Date；自动周期判定用，0=从未成功查过） */

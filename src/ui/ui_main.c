@@ -118,6 +118,7 @@ static void render_page(void)
     case PAGE_SEND_CONFIRM:  page_send_confirm_render(); break;
     case PAGE_RECV_CONFIRM:  page_recv_confirm_render(); break;
     case PAGE_RECV_SETUP:    page_recv_setup_render(); break;
+    case PAGE_DIR_PICK:      page_dir_pick_render(); break;
     case PAGE_PROGRESS:      page_progress_render(); break;
     case PAGE_SETTINGS:      page_settings_render(); break;
     default: break;
@@ -132,6 +133,7 @@ static void input_page(const Input *in)
     case PAGE_SEND_CONFIRM:  page_send_confirm_input(in); break;
     case PAGE_RECV_CONFIRM:  page_recv_confirm_input(in); break;
     case PAGE_RECV_SETUP:    page_recv_setup_input(in); break;
+    case PAGE_DIR_PICK:      page_dir_pick_input(in); break;
     case PAGE_PROGRESS:      page_progress_input(in); break;
     case PAGE_SETTINGS:      page_settings_input(in); break;
     default: break;

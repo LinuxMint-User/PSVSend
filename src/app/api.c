@@ -199,7 +199,7 @@ void api_start(void)
     int r;
     config_init();                       /* 先建目录/读配置（dlog 目录依赖它） */
     dlog_init();
-    dlog("== psvsend boot [TAG:d49] ==");
+    dlog("== psvsend boot [TAG:d54] ==");
     {
         /* 版本标记 + 设备身份指纹：确认刷入的固件含 mTLS 客户端证书 */
         char f[65];

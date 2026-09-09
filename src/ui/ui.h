@@ -84,6 +84,7 @@ typedef enum {
     PAGE_SEND_CONFIRM, /* 发送确认 */
     PAGE_RECV_CONFIRM, /* 接收请求确认 */
     PAGE_RECV_SETUP,   /* 接收设置：本次保存目录 + 逐文件勾选/改名 */
+    PAGE_DIR_PICK,     /* 目录选择（设置页默认保存目录 / 接收本次目录共用） */
     PAGE_PROGRESS,     /* 传输进度 */
     PAGE_SETTINGS,     /* 设置 */
     PAGE_COUNT
@@ -133,7 +134,7 @@ typedef struct {
     InFile  inc_files[MAX_INF];
     int     inc_count;
     int     inc_sel;       /* 接收设置页焦点：0=目录行，1..=文件行 */
-    char    recv_dir[64];  /* 本次保存目录（暂固定默认值；目录选择 TODO） */
+    char    recv_dir[512]; /* 本次保存目录（新请求来时=config saveDir；Setup 页可临时改） */
     bool    recv_cancel;   /* 发送方已取消请求 */
     int     recv_overflow; /* 发送方文件数超出上限被丢弃的个数（确认页提示） */
 
@@ -175,6 +176,8 @@ void page_recv_confirm_render(void);
 void page_recv_confirm_input(const Input *in);
 void page_recv_setup_render(void);
 void page_recv_setup_input(const Input *in);
+void page_dir_pick_render(void);
+void page_dir_pick_input(const Input *in);
 void page_progress_render(void);
 void page_progress_input(const Input *in);
 void page_settings_render(void);

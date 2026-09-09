@@ -9,7 +9,7 @@
 #include "json_util.h"
 #include <psp2/kernel/threadmgr/mutex.h>
 
-Config g_cfg = { DEFAULT_ALIAS, "", DEFAULT_PORT, 0, 0, 0, 0, {{0}} };
+Config g_cfg = { 0 };          /* 默认值见 cfg_defaults()（逐字段赋值，防结构体顺序耦合） */
 static SceUID g_mtx = -1;          /* 保护 g_cfg：UI 改设置 / 发现·扫描记 IP 并发 */
 static uint64_t g_last_save_us = 0;
 
@@ -47,6 +47,8 @@ static void cfg_defaults(void)
     g_cfg.known_n = 0;
     g_cfg.upd_auto = 2;                /* 自动检查更新：默认每周 */
     g_cfg.upd_last = 0;                /* 从未查过 → 启动联网后自动授时评估即首查 */
+    strncpy(g_cfg.save_dir, PSVSEND_DL_DIR, sizeof g_cfg.save_dir - 1);
+    g_cfg.save_dir[sizeof g_cfg.save_dir - 1] = 0;
 }
 
 void config_init(void)
@@ -74,6 +76,7 @@ void config_init(void)
             if (json_get_int(buf, "lang", &v)) g_cfg.lang = (int)v;
             if (json_get_int(buf, "updateAuto", &v)) g_cfg.upd_auto = (int)v;
             if (json_get_int(buf, "updateLast", &v)) g_cfg.upd_last = (int)v;
+            json_get_str(buf, "saveDir", g_cfg.save_dir, sizeof g_cfg.save_dir);
             {   /* knownIps: "ip,ip,..."（逗号分隔，最新在前） */
                 char k[512];
                 if (json_get_str(buf, "knownIps", k, sizeof k) && k[0]) {
@@ -103,18 +106,30 @@ void config_init(void)
     if (!g_cfg.alias[0]) strncpy(g_cfg.alias, DEFAULT_ALIAS, sizeof g_cfg.alias - 1);
     if (g_cfg.upd_auto < 0 || g_cfg.upd_auto > 3) g_cfg.upd_auto = 2;
     if (g_cfg.upd_last < 0) g_cfg.upd_last = 0;
+    /* saveDir：去尾斜杠（但保留 ux0:/ 根的自带斜杠，勿剥成 "ux0:"）；
+     * 空/非法（非 ux0: 开头或不足 ux0:/）回退默认 downloads */
+    {
+        size_t sl = strlen(g_cfg.save_dir);
+        while (sl > 5 && g_cfg.save_dir[sl - 1] == '/') g_cfg.save_dir[--sl] = 0;
+        if (sl < 5 || strncmp(g_cfg.save_dir, "ux0:", 4) != 0) {
+            strncpy(g_cfg.save_dir, PSVSEND_DL_DIR, sizeof g_cfg.save_dir - 1);
+            g_cfg.save_dir[sizeof g_cfg.save_dir - 1] = 0;
+        }
+    }
 }
 
 void config_save(void)
 {
     char a[2 * sizeof g_cfg.alias];
     char f[2 * sizeof g_cfg.fingerprint];
+    char d[2 * sizeof g_cfg.save_dir];
     char k[KNOWN_MAX * 17];        /* "ip,ip,...,ip" 最长 = 24*(15+1)-1 */
-    char out[2048];
+    char out[4096];
     int len, i;
     cfg_lock();
     json_escape(g_cfg.alias, a, sizeof a);
     json_escape(g_cfg.fingerprint, f, sizeof f);
+    json_escape(g_cfg.save_dir, d, sizeof d);
     k[0] = 0;
     for (i = 0; i < g_cfg.known_n; i++) {
         if (i) strncat(k, ",", sizeof k - strlen(k) - 1);
@@ -130,10 +145,11 @@ void config_save(void)
                    "  \"lang\": %d,\n"
                    "  \"updateAuto\": %d,\n"
                    "  \"updateLast\": %d,\n"
+                   "  \"saveDir\": \"%s\",\n"
                    "  \"knownIps\": \"%s\"\n"
                    "}\n",
                    a, f, g_cfg.port, g_cfg.theme_id, g_cfg.confirm_layout,
-                   g_cfg.lang, g_cfg.upd_auto, g_cfg.upd_last, k);
+                   g_cfg.lang, g_cfg.upd_auto, g_cfg.upd_last, d, k);
     cfg_unlock();
     if (len < 0 || len >= (int)sizeof out) return;
     SceUID fd = sceIoOpen(PSVSEND_CONFIG, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC,

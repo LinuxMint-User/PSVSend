@@ -18,7 +18,8 @@
 - **已落地（界面，v2.0.0）**：中 / 英双语界面（设置页切换，`i18n.c/h`）+ 设置页底部「关于」区（PSVSend 大字 logo、应用版本与 LocalSend 适配说明）。版本号单源维护：手改 `CMakeLists.txt` 的 `project(VERSION)` 与 `core/config.h` 的 `PSVSEND_APP_VERSION`，SFO `APP_VER` 由 VERSION 自动派生。
 - **已落地（工程，v2.0.0 后）**：GitHub Actions（`.github/workflows/build-vpk.yml`）在官方 vitasdk 2026.08 Docker 镜像内自动构建 VPK：推送 `v*` tag 或 Actions 页手动触发 → 生成 **Releases 草稿**（人工确认后公开）。注意本地与 CI 产物 `eboot.bin` 存在字节差异（本地链接 vdpm prebuilt 静态库，CI 链接镜像内现场编译的同源库），功能等价（真机验证通过）；需字节级可复现则须统一在容器内构建。
 - **已落地（更新检查，v2.1.0）**：`app/update.c` 后台线程按序尝试双源——主源拉 **Gitee 镜像仓库**（epix-xhan/PSVSend，只同步 main 分支、不放 Release）的 `src/core/config.h` 版本宏（raw.giteeusercontent.com 直取免 302），兜底 GitHub Releases atom；解析出的版本与本地 `PSVSEND_APP_VERSION` 宏比对定状态。**不新增任何版本文件**：config.h 是客户端唯一版本真源（发版本就要改它，镜像同步自然带新版，杜绝多版本文件不一致）。入口：设置页手动检查 + 自动定期（默认每周，可每天/每月/关）。PSV 无实时钟：自动周期靠远端响应头 `Date` 授时（`update.c` 内纯算术解析 RFC7231；曾误用 `sceKernelGetSystemTimeWide` 的开机计时冒充 unix 时间戳致 upd_last 跨重启错乱，d48 修复），每会话一次轻量判定——未到周期静默跳过，到周期才完整检查。真机全路径验证（d47-d49）：手动检出新版 / 手动已最新 / 自动到期 full-check / 自动静默，均按预期。
-- **未落地**：与 §4/§5 目标架构的规划差项（multipart 收件、接收设置页改名/选目录等）仍在路线中，动态清单见 docs/TODO.md（本地，不入库）。已销账（2026-09-07，理由见 TODO 闭环留痕）：session.c 拆分（会话职责由 proto/receive + proto/transfer 承担，见 §4.1）、自定义字体替换/追加、内存监控调试视图、发送入口外置卡浏览。中文字体已落地（见 §5.5）；字形冷启动处理已定案（开机高频页预热，见 §5.5.1）。
+- **已落地（保存目录可选，v2.1.0 后）**：接收不再钉死 downloads——config 新增 `saveDir`（默认 `ux0:data/psvsend/downloads`，JSON 读回去尾斜杠、非法回退默认），设置页新增“存储”组“保存目录”行，进目录选择器选定即写 config 并落盘（**持久**）；接收 Setup 页目录行由只读默认改为可点，进同一选择器改**本次**目录（内存 `g_app.recv_dir`，仅当次会话、新请求回默认），Accept 前 `recv_set_dir` 喂给后端。目录选择器复用文件浏览页 ux0 目录树（仅列文件夹、点入、方块/右下键 = 存到当前目录），与文件浏览一样只浏览 ux0 单分区、无新建目录入口。曾因 ui_main `render_page` 漏配 `PAGE_DIR_PICK` case 出现整页白屏且看似卡死（d50-d53 用逐秒心跳 + 阶段打点定位，d54 修复并清理诊断日志）。真机全路径验证 d50-d54。
+- **未落地**：与 §4/§5 目标架构的规划差项（multipart 收件、接收设置页改名输入等）仍在路线中，动态清单见 docs/TODO.md（本地，不入库）。已销账（2026-09-07，理由见 TODO 闭环留痕）：session.c 拆分（会话职责由 proto/receive + proto/transfer 承担，见 §4.1）、自定义字体替换/追加、内存监控调试视图、发送入口外置卡浏览。中文字体已落地（见 §5.5）；字形冷启动处理已定案（开机高频页预热，见 §5.5.1）。
 - 本文按"目标架构"描述，部分命名与实际源码不同（如目标 `http_server.c` / `http_client.c` 实际为 `net/http.c` / `proto/transfer.c`）；**现状源码布局以 §4.1 模块树为准**（2026-09-07 起按依赖域分子目录）。
 
 ## 2. 总体架构（前后端分层）
@@ -148,7 +149,7 @@ void on_session_done(const Session *s);      // 完成 / 失败
 - `prepare-upload` → 生成 sessionId，为每文件分配 fileId + token，返回 `{sessionId, files:[{id, token, fileName, size}]}`；同时向 UI 抛"待确认"事件
 - `upload?sessionId&fileId&token` → 校验会话与 token 匹配 → 流式写盘（先临时名，完成后重命名；同名加序号避免覆盖）
 - 安全底线：只收"prepare 过"的 fileId+token，否则 400；拒绝时回 401/403
-- 接收文件写入 `ux0:data/psvsend/downloads/`
+- 接收文件写入运行时保存目录（默认 `ux0:data/psvsend/downloads/`，UI 可选：config `saveDir` 持久 / 接收 Setup `recv_dir` 仅本次，见 §1「实现现状」）
 
 ### 4.6 HTTP 客户端要点
 
@@ -174,7 +175,7 @@ void on_session_done(const Session *s);      // 完成 / 失败
 | 文件浏览 | ux0: 目录树，多选文件 | 进入 / 勾选 |
 | 发送确认 | 目标设备 + 文件清单 + 总大小 | 确认 / 返回 |
 | 接收请求确认 | 来者名字/平台 + 文件数 + 预览（含取消态） | 接受 / 设置 / 拒绝；发送方取消 → 单个关闭 |
-| 接收设置 | 本次保存目录（只读默认）+ 逐文件改名(占位)/勾选跳过 | 方向键选行、确认勾选、返回继续 |
+| 接收设置 | 本次保存目录（可点进目录选择器改本次）+ 逐文件改名(占位)/勾选跳过 | 方向键选行、确认勾选、返回继续 |
 | 传输进度 | 会话列表 + 进度条 | 取消 |
 | 设置 | 别名、确认键布局、端口、主题 | — |
 
@@ -259,8 +260,8 @@ src/ui/
 
 ## 6. 配置与存储
 
-- `ux0:data/psvsend/config`（JSON，键为驼峰）：alias（设备名）、fingerprint（随机身份串）、port、theme（0=Yaru / 1=OLED）、confirmLayout（0=美式 / 1=日式）、lang（0=跟随系统 / 1=English / 2=中文）、knownIps（历史在线设备 IP，逗号分隔、LRU、上限 24，主动扫描种子）、updateAuto（更新检查：0=关 / 1=每天 / 2=每周默认 / 3=每月）、updateLast（上次检查更新的网络 unix 秒，自动节流）
-- `ux0:data/psvsend/downloads/`：接收文件
+- `ux0:data/psvsend/config`（JSON，键为驼峰）：alias（设备名）、fingerprint（随机身份串）、port、theme（0=Yaru / 1=OLED）、confirmLayout（0=美式 / 1=日式）、lang（0=跟随系统 / 1=English / 2=中文）、knownIps（历史在线设备 IP，逗号分隔、LRU、上限 24，主动扫描种子）、updateAuto（更新检查：0=关 / 1=每天 / 2=每周默认 / 3=每月）、updateLast（上次检查更新的网络 unix 秒，自动节流）、saveDir（默认接收目录，默认 `ux0:data/psvsend/downloads`；读回去尾斜杠、非法回退默认）
+- `ux0:data/psvsend/downloads/`：接收文件的默认目录（config `saveDir` 可改；设置页持久改、接收 Setup 临时改本次）
 - 首次启动 `sceIoMkdir` 幂等创建（已存在返回 0x80410011，忽略）
 
 ## 7. 开发路线
@@ -286,7 +287,7 @@ src/ui/
 - [ ] 自定义主题色盘的实现时机（先 OLED/Yaru，色盘后置）
 - [x] HTTP 解析兼容清单最终确认：**chunked 已落地**——http.c 对无 Content-Length 的请求按 `Transfer-Encoding: chunked` 走 chunked 解码（upload_stream/chunked_stream），dio/官方客户端流式上传真机验证；大文件 upload 一律不进内存。2026-09-07 确认
 - [ ] 接收设置页：文件重命名输入（接 PSV 系统键盘 SceIme，或自绘内置键盘；当前仅占位弹窗）
-- [ ] 接收设置页：本次保存目录选择（目录浏览/预设；需确认 ux0 目录权限；当前固定 `ux0:data/psvsend/`）
+- [x] 接收设置页：本次保存目录选择：已落地（2026-09-09，见 §1「实现现状」）——接收 Setup 目录行可点进 ux0 目录选择器改本次目录（内存 recv_dir），设置页「保存目录」持久改默认（config `saveDir`）；仅 ux0 单分区、无新建目录入口
 - [ ] 接收页"验证"功能（LocalSend 的验证码/校验交互）当前不做，等真实协议接入后再定
 - [x] 多文件接收中途取消的竞态：已修复（收满优先于取消判断）——正在传的文件若已收满则以「用户取消」收尾并保留完整，未收满才清理其残 `.part`；前 N-1 个完整文件始终保留（细节见 README「边界 / 接收」）
 - [x] GPU render crash（界面撕裂后偶发崩溃）：已修复——根因为主循环缺 `vita2d_wait_rendering_done()`（GPU 队列无逐帧收敛点），2026-09 真机多轮复测通过（细节见 §1「实现现状」渲染稳定条目与 README「当前状态」）

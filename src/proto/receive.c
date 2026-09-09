@@ -41,8 +41,8 @@ typedef struct {
     char fileid[160];     /* 对方文件 ID（upload query 用） */
     char token[72];       /* 我方签发给对方的令牌 */
     char name[192];       /* 落盘用名（已 sanitize + 冲突排重） */
-    char final[300];      /* 正式路径（收完改名到这儿） */
-    char part[300];       /* 临时路径（.part） */
+    char final[800];      /* 正式路径（收完改名到这儿；目录可长，缓冲随目录放宽） */
+    char part[800];       /* 临时路径（.part） */
     SceOff size;          /* 期望字节数 */
     SceOff got;           /* 已收字节（锁保护） */
     char sha256[65];      /* 期望 sha256（准备报文里给了才校验，空串=不校验） */
@@ -82,6 +82,9 @@ static int  g_pend_result = 0;      /* 0=未决 1=接受 2=拒绝 3=超时 */
 static volatile int g_abort = 0;    /* 用户中止请求（http 收体循环轮询） */
 static SceUID g_mtx = -1;
 static unsigned char g_buf[RECV_CHUNK];
+/* 本会话保存目录：accept 前由 UI 用 recv_set_dir 设定（临时、不入 config）；
+ * 启动清扫等默认场景在 recv_init 里回退 config saveDir。 */
+static char g_dir[512];
 
 static void lock(void)   { if (g_mtx >= 0) sceKernelLockMutex(g_mtx, 1, NULL); }
 static void unlock(void) { if (g_mtx >= 0) sceKernelUnlockMutex(g_mtx, 1); }
@@ -158,7 +161,7 @@ static void alloc_paths(const char *raw, char *final, int fn,
     for (;;) {
         if (k == 0) snprintf(cand, sizeof cand, "%s%s", base, ext);
         else        snprintf(cand, sizeof cand, "%s (%d)%s", base, k, ext);
-        snprintf(final, fn, PSVSEND_DL_DIR "/%s", cand);
+        snprintf(final, fn, "%s/%s", g_dir, cand);
         if (sceIoGetstat(final, &st) < 0) {         /* 磁盘上不存在 */
             for (t = 0; t < prev_n; t++)            /* 本会话也没占用 */
                 if (prev[t].final[0] &&
@@ -168,7 +171,7 @@ static void alloc_paths(const char *raw, char *final, int fn,
         if (++k > 999) {                            /* 兜底：保底名字 */
             snprintf(cand, sizeof cand, "file-%llx%s",
                      (unsigned long long)now_us(), ext);
-            snprintf(final, fn, PSVSEND_DL_DIR "/%s", cand);
+            snprintf(final, fn, "%s/%s", g_dir, cand);
             break;
         }
     }
@@ -255,6 +258,28 @@ static void query_get(const char *q, const char *key, char *out, int outsz)
 
 /* ---------- 后端入口 ---------- */
 
+/* UI 在接受前设定"本次保存目录"：仅本次会话生效（内存态，不写 config）。
+ * dir 为 NULL/空 → 回退默认（config saveDir）。目录须在 ux0: 下且存在。
+ * 调用先于 recv_decide，与后端组装会话间由 g_mtx 同步，无并发风险。 */
+void recv_set_dir(const char *dir)
+{
+    size_t sl;
+    if (dir && dir[0]) {
+        sl = strlen(dir);
+        if (sl >= sizeof g_dir) sl = sizeof g_dir - 1;
+        memcpy(g_dir, dir, sl);
+        while (sl > 5 && g_dir[sl - 1] == '/') sl--;   /* 去尾斜杠（ux0:/ 根自带斜杠保留） */
+        g_dir[sl] = 0;
+        if (sl < 5 || strncmp(g_dir, "ux0:", 4) != 0) {
+            snprintf(g_dir, sizeof g_dir, "%s", PSVSEND_DL_DIR);
+            return;
+        }
+        dlog("recv: dir set %s", g_dir);
+    } else {
+        snprintf(g_dir, sizeof g_dir, "%s", g_cfg.save_dir);
+    }
+}
+
 void recv_init(void)
 {
     SceUID d;
@@ -264,19 +289,21 @@ void recv_init(void)
     if (g_mtx < 0)
         g_mtx = sceKernelCreateMutex("psvsend_recv", 0, 0, NULL);
     if (g_mtx < 0) return;
+    if (!g_dir[0]) snprintf(g_dir, sizeof g_dir, "%s", g_cfg.save_dir);
     lock();
     g_phase = PH_NONE;
     g_abort = 0;
     unlock();
-    /* 清扫上次异常退出残留的 .part（接收中断只会留下 .part，不会出正式文件） */
-    d = sceIoDopen(PSVSEND_DL_DIR);
+    /* 清扫上次异常退出残留的 .part（接收中断只会留下 .part，不会出正式文件；
+     * 只扫当前默认/设置目录——临时目录里的崩溃残留是孤儿 .part，不追扫） */
+    d = sceIoDopen(g_dir);
     if (d >= 0) {
         memset(&de, 0, sizeof de);
         while (sceIoDread(d, &de) > 0) {
             size_t l = strlen(de.d_name);
             if (l > sl &&
                 strcmp(de.d_name + l - sl, RECV_PART_SUFFIX) == 0) {
-                snprintf(p, sizeof p, PSVSEND_DL_DIR "/%s", de.d_name);
+                snprintf(p, sizeof p, "%s/%s", g_dir, de.d_name);
                 sceIoRemove(p);
                 dlog("recv: init removed stale %s", de.d_name);
             }
