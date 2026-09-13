@@ -43,6 +43,18 @@ static const TrEntry s_zh[] = {
     { "Scan", "扫描" },
     { "SELECT Settings", "SELECT 设置" },
 
+    /* ---- 发送主页两栏（设备栏 / 已选文件栏） ---- */
+    { "Devices (%d)", "设备（%d）" },
+    { "Selected files (%d)", "已选文件（%d）" },
+    { "Select files", "选择文件" },
+    { "Select files first", "请先选择文件" },
+    { "Switch", "切换" },
+    { "Remove", "移除" },
+    { "Remove all", "全部删除" },
+    { "Select all", "全选" },
+    { "Deselect all", "取消全选" },
+    { "%d selected", "已选 %d 个" },
+
     /* ---- 文件浏览 / 发送确认 ---- */
     { "Send to %s", "发送到 %s" },
     { "folder", "文件夹" },

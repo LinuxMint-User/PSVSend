@@ -47,7 +47,9 @@ typedef enum {
     HICON_COUNT
 } HintIcon;
 
-typedef struct { HintIcon icon; const char *text; } HintSeg;  /* text 可空：只画图标 */
+/* 一段按键提示。dim=true：该动作当前不可用（画成灰字灰图标，避免误导）。
+ * 注意：HintSeg 数组请用 `= { 0 }` 初始化，否则 dim 是未初始化值。 */
+typedef struct { HintIcon icon; const char *text; bool dim; } HintSeg;  /* text 可空：只画图标 */
 
 void w_clear(void);                  /* 每帧开始清空命中表 */
 void w_add(int id, Rect r);          /* 页面绘制时注册可触摸区域 */
@@ -107,6 +109,10 @@ typedef struct {
     int    dev_sel;
     int    dev_target;                  /* 发送流程选择的目标（快照下标） */
 
+    /* 发送主页两栏（设备栏 / 已选文件栏） */
+    int    pane_focus;                  /* 焦点栏：0=设备 1=文件（与左右位置无关） */
+    int    pane_swap;                   /* 布局：0=设备在左 1=文件在左（设置项） */
+
     /* 文件浏览 */
     char    cur_dir[512];
     FsEntry files[MAX_FILES];
@@ -114,6 +120,7 @@ typedef struct {
     int     file_sel;
     PickedFile picked[MAX_PICKED];
     int     picked_count;
+    int     picked_sel;                 /* 已选文件栏的选中行（picked 下标） */
     SceOff  picked_total;
 
     /* 传输（mock 进度） */
@@ -203,9 +210,9 @@ void w_row(Rect r, const char *main_text, const char *sub_text, bool selected);
 void w_row_c(Rect r, const char *main_text, const char *sub_text,
              uint32_t sub_c, bool selected);
 void w_button(Rect r, const char *label, bool active);
+void w_icon_cross(float cx, float cy, float r, uint32_t c);  /* 独立"✕"图标（列表行尾删除按钮） */
 void w_modal_begin(int content_h);          /* 绘制遮罩 + 弹窗卡片，返回卡片区域置顶布局起点 */
 Rect w_modal_box(int content_h);
 void w_human_size(SceOff size, char *out);
-void w_clear_picked(void);
 
 #endif

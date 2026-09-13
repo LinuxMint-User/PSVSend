@@ -23,9 +23,10 @@ static int xf_press_scroll = 0;
 
 void goto_devices(void)
 {
-    w_clear_picked();
     g_app.prog_running = false;
     g_app.dev_sel = g_app.dev_target;
+    /* 已选文件保留：回到主页可接着发给另一台设备；焦点按有无文件定 */
+    pane_focus_default();
     g_app.page = PAGE_DEVICES;
 }
 
@@ -208,7 +209,7 @@ void page_progress_render(void)
         w_text(40, 456, 1.0f, theme->text_dim, "%s", st);
     }
 
-    HintSeg segs[6];
+    HintSeg segs[6] = { 0 };
     int ns = 0;
     segs[ns].icon = icon_confirm();
     segs[ns++].text = g_app.prog_running ? tr("Cancel") : tr("Done");

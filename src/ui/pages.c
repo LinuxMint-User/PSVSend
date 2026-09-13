@@ -35,6 +35,11 @@ void pages_init(void)
     g_app.dev_count = 0;
     g_app.dev_sel = 0;
     g_app.dev_target = 0;
+    g_app.pane_focus = 1;   /* 开机无文件：焦点落文件栏（先选文件再挑设备） */
+    g_app.pane_swap = 0;    /* 两栏布局：0=设备在左（第 2 刀接配置项） */
+    g_app.picked_count = 0;
+    g_app.picked_sel = 0;
+    g_app.picked_total = 0;
     for (i = 0; i < MAX_DEVICES; i++) {
         g_app.dev_alias[i][0] = 0;
         g_app.dev_sub[i][0] = 0;

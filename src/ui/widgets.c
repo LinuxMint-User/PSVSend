@@ -152,13 +152,14 @@ static const char *utf8_skip(const char *p)
 void w_text_clip(float x, float y, float scale, uint32_t color,
                  const char *text, int max_w)
 {
-    char buf[512];
+    char buf[512] = {0};      /* 必须初始化：一个字都放不下时不能把未初始化内容画出去 */
+    char tmp[520];
     int cur_w = 0;
     const char *p = text;
     int n = 0;
     while (*p) {
         const char *next = utf8_skip(p);
-        char tmp[512];
+        if (n + (int)(next - p) >= (int)sizeof buf) break;   /* 文本过长：截断 */
         memcpy(tmp, buf, n);
         memcpy(tmp + n, p, next - p);
         tmp[n + (next - p)] = 0;
@@ -171,7 +172,7 @@ void w_text_clip(float x, float y, float scale, uint32_t color,
         cur_w = w;
         p = next;
     }
-    if (cur_w > 0 || n == 0)
+    if (cur_w > 0)        /* 放不下任何一个字形 → 不画（原"n==0 也画"会输出垃圾） */
         w_text(x, y, scale, color, "%s", buf);
 }
 
@@ -234,13 +235,18 @@ static void thick_seg(float x0, float y0, float x1, float y1, uint32_t c)
     vita2d_draw_line(x0 - ox, y0 - oy, x1 - ox, y1 - oy, c);
 }
 
-static void w_icon(HintIcon ic, float cx, float cy)
+/* "✕"图标：以 (cx,cy) 为中心、半径 r 的两条斜线（页脚提示与列表行尾删除共用） */
+void w_icon_cross(float cx, float cy, float r, uint32_t c)
 {
-    uint32_t c = theme->text;
+    thick_seg(cx - r, cy - r, cx + r, cy + r, c);
+    thick_seg(cx - r, cy + r, cx + r, cy - r, c);
+}
+
+static void w_icon(HintIcon ic, float cx, float cy, uint32_t c)
+{
     switch (ic) {
     case HICON_CROSS:
-        thick_seg(cx - 8, cy - 8, cx + 8, cy + 8, c);
-        thick_seg(cx - 8, cy + 8, cx + 8, cy - 8, c);
+        w_icon_cross(cx, cy, 8.0f, c);
         break;
     case HICON_CIRCLE:
         vita2d_draw_fill_circle(cx, cy, 9.0f, c);
@@ -301,14 +307,17 @@ void w_page_footer_segs(const HintSeg *segs, int n)
     for (i = 0; i < n; i++) {
         int has_icon = segs[i].icon != HICON_NONE;
         int adv = 0;
+        /* dim 段：图标/文字都用 border 灰，表示该动作当前不可用 */
+        uint32_t ic_c = segs[i].dim ? theme->border : theme->text;
+        uint32_t tx_c = segs[i].dim ? theme->border : theme->text_dim;
         if (has_icon) {
-            w_icon(segs[i].icon, x + 11, cy);
+            w_icon(segs[i].icon, x + 11, cy, ic_c);
             adv = 26;
         }
         if (segs[i].text && segs[i].text[0]) {
             int tw = 0, th = 0;
             w_text_w(1.0f, segs[i].text, &tw, &th);
-            w_text(x + adv, f.y + 12, 1.0f, theme->text_dim, "%s", segs[i].text);
+            w_text(x + adv, f.y + 12, 1.0f, tx_c, "%s", segs[i].text);
             x += adv + tw;
         } else {
             x += adv ? adv : 0;
@@ -382,10 +391,4 @@ void w_human_size(SceOff size, char *out)
         snprintf(out, 16, "%.1f MB", (double)size / (1024 * 1024));
     else
         snprintf(out, 16, "%.2f GB", (double)size / (1024.0 * 1024 * 1024));
-}
-
-void w_clear_picked(void)
-{
-    g_app.picked_count = 0;
-    g_app.picked_total = 0;
 }

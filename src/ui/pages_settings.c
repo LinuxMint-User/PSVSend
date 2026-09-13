@@ -302,7 +302,7 @@ void page_settings_render(void)
         }
     }
 
-    HintSeg segs[6];
+    HintSeg segs[6] = { 0 };
     int ns = 0;
     segs[ns].icon = HICON_DPAD;      segs[ns++].text = tr("Choose");
     segs[ns].icon = icon_confirm();  segs[ns++].text = tr("Change");
@@ -449,10 +449,14 @@ void page_dir_pick_render(void)
     w_button(bt, tr("Save here"), true);
     w_text_clip(24, SCR_H - 38, 1.0f, theme->text_dim,
                 g_app.cur_dir, SCR_W - 296);
-    HintSeg segs[6];
+    HintSeg segs[6] = { 0 };
     int ns = 0;
-    segs[ns].icon = HICON_DPAD;      segs[ns++].text = tr("Choose");
-    segs[ns].icon = icon_confirm();  segs[ns++].text = tr("Open");
+    /* 空目录里没有可选项：选择/打开灰掉 */
+    bool has = dpick_dcount > 0;
+    segs[ns].icon = HICON_DPAD;      segs[ns].dim = !has;
+    segs[ns++].text = tr("Choose");
+    segs[ns].icon = icon_confirm();  segs[ns].dim = !has;
+    segs[ns++].text = tr("Open");
     segs[ns].icon = HICON_SQUARE;    segs[ns++].text = tr("Save here");
     /* 根目录无"上级"：返回键此时=退出选择（回来源页），提示随层级切换 */
     segs[ns].icon = icon_back();

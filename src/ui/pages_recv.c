@@ -77,7 +77,7 @@ void page_recv_confirm_render(void)
         Rect close = { SCR_W / 2 - 100, 444, 200, 48 };
         w_add(2, close);
         w_button(close, tr("Close"), true);
-        HintSeg segs[2];
+        HintSeg segs[2] = { 0 };
         int ns = 0;
         segs[ns].icon = icon_confirm(); segs[ns++].text = tr("Close");
         w_page_footer_segs(segs, ns);
@@ -165,7 +165,7 @@ void page_recv_confirm_render(void)
                theme->text_dim, "%s", s_accept);
     }
 
-    HintSeg segs[6];
+    HintSeg segs[6] = { 0 };
     int ns = 0;
     segs[ns].icon = HICON_DPAD;       segs[ns++].text = tr("Switch");
     segs[ns].icon = icon_confirm();   segs[ns++].text = s_accept;
@@ -526,7 +526,7 @@ void page_recv_setup_render(void)
         }
     }
 
-    HintSeg segs[8];
+    HintSeg segs[8] = { 0 };
     int ns = 0;
     segs[ns].icon = HICON_DPAD;       segs[ns++].text = tr("Choose");
     segs[ns].icon = icon_confirm();   segs[ns++].text = tr("Toggle");
