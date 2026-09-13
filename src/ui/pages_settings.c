@@ -229,7 +229,7 @@ void page_settings_render(void)
 
     w_page_header(tr("Settings"));
     set_clamp_scroll();
-    snprintf(theme_v, sizeof theme_v, "%s", theme_names[g_cfg.theme_id]);
+    snprintf(theme_v, sizeof theme_v, "%s", tr(theme_names[g_cfg.theme_id]));
     /* 外观行：OLED 无浅色变体，恒显"深色（固定）" */
     if (g_app.theme_id == THEME_OLED)
         snprintf(light_v, sizeof light_v, "%s", tr("Dark (fixed)"));
