@@ -386,13 +386,13 @@ void recv_abort(void)
 }
 
 /* http 层收体轮询用：有未决的"用户中止"请求就尽快收尾（无锁读 volatile） */
-bool recv_abort_pending(void)
+static bool recv_abort_pending(void)
 {
     return g_abort != 0;
 }
 
 /* prepare-upload：解析 → 挂起等 UI（≤60s）→ 回 HTTP 码并填 resp（200 时 JSON） */
-int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz)
+static int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz)
 {
     const char *infov, *filesv, *p;
     JsonIter it;
@@ -598,8 +598,8 @@ static void sess_fail_locked(const char *err)
 
 /* upload：校验 query + 来源 IP → 经 fn 流式收 total 字节写盘。
  * fn 每次返回 ≤ max；0=对端关闭/空闲超时，<0=socket 错误。 */
-int recv_http_upload(const char *query, const char *ip, SceOff total,
-                     recv_stream_fn fn, void *ctx)
+static int recv_http_upload(const char *query, const char *ip, int64_t total,
+                            http_stream_fn fn, void *ctx)
 {
     char sid[64], fid[170], tok[72];
     SceOff free_space;
@@ -772,7 +772,7 @@ int recv_http_upload(const char *query, const char *ip, SceOff total,
     return 200;
 }
 
-int recv_http_cancel(const char *query, const char *ip)
+static int recv_http_cancel(const char *query, const char *ip)
 {
     char sid[64];
     (void)ip;
@@ -847,4 +847,17 @@ void recv_clear(void)
     g_phase = PH_NONE;
     g_abort = 0;
     unlock();
+}
+
+/* ---------- 注册给 http 层的接收侧处理集（依赖倒置，类型见 net/http.h） ---------- */
+static const HttpRecvOps s_http_ops = {
+    recv_http_prepare,      /* prepare：清单 → 挂起等 UI 决定 */
+    recv_http_upload,       /* upload ：经 http 层流回调边收边写盘 */
+    recv_http_cancel,       /* cancel ：发送方放弃会话 */
+    recv_abort_pending,     /* abort_pending：用户中止查询 */
+};
+
+const HttpRecvOps *recv_http_ops(void)
+{
+    return &s_http_ops;
 }

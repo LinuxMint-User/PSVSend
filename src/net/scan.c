@@ -24,7 +24,7 @@
 #include "core/json_util.h"
 #include "net/net.h"
 #include "net/http.h"
-#include "app/api.h"
+#include "net/device.h"
 #include "net/discovery.h"
 #include "net/identity.h"
 #include "core/dlog.h"

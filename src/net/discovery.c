@@ -17,7 +17,7 @@
 #include "core/json_util.h"
 #include "net/net.h"
 #include "net/http.h"
-#include "app/api.h"
+#include "net/device.h"
 #include "net/discovery.h"
 #include "core/dlog.h"
 
@@ -31,7 +31,7 @@ typedef struct {
     uint64_t last_ms;
 } Entry;
 
-static Entry  g_devs[API_MAX_DEVICES];
+static Entry  g_devs[DEVICE_MAX];
 static int    g_count = 0;
 static SceUID g_mtx = -1;          /* 保护设备表 */
 static SceUID g_send_mtx = -1;     /* 保护发送 socket */
@@ -63,7 +63,7 @@ static void table_upsert(const Device *dev)
         g_devs[i].d = *dev;
         g_devs[i].last_ms = now;
     } else {
-        if (g_count < API_MAX_DEVICES) {
+        if (g_count < DEVICE_MAX) {
             g_devs[g_count].d = *dev;
             g_devs[g_count].last_ms = now;
             g_count++;

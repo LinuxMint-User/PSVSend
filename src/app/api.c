@@ -203,7 +203,7 @@ void api_start(void)
     int r;
     config_init();                       /* 先建目录/读配置（dlog 目录依赖它） */
     dlog_init();
-    dlog("== psvsend boot [TAG:d65] ==");
+    dlog("== psvsend boot [TAG:d66] ==");
     {
         /* 版本标记 + 设备身份指纹：确认刷入的固件含 mTLS 客户端证书 */
         char f[65];
@@ -214,6 +214,7 @@ void api_start(void)
     }
 
     http_set_register_cb(discovery_peer_registered);   /* 对方 register → 设备表 */
+    http_set_recv_ops(recv_http_ops());   /* 接收侧路由实现注册给 http 层（依赖倒置） */
     recv_init();                         /* 接收模块：建锁 + 清扫残留 *.part */
 
     r = net_start();

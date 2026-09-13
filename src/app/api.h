@@ -5,20 +5,7 @@
 #define PSVSEND_API_H
 
 #include <stdbool.h>
-
-#define API_MAX_DEVICES 32     /* 与 UI 的 MAX_DEVICES 保持一致 */
-
-/* 一台被发现的 LocalSend 设备（发现消息里的关键字段） */
-typedef struct {
-    char ip[16];             /* 发送方 IP（announce 来源） */
-    int  port;               /* 该设备 HTTP 服务端口 */
-    char alias[64];          /* 设备名 */
-    char model[64];          /* 设备型号（可空） */
-    char dtype[16];          /* 平台类型 mobile/desktop/web/... */
-    char fingerprint[96];    /* 身份串/HTTPS 证书 SHA-256（hex，防自发现 + TLS pin） */
-    char protocol[8];        /* http / https */
-    bool download;           /* 是否开了下载 API（能否主动收） */
-} Device;
+#include "net/device.h"        /* Device / DEVICE_MAX（类型住 net 层，见 device.h） */
 
 /* 启动后端：config_init + net_start + discovery_start（各模块内部幂等）。
  * 后台线程自理：api_watch（500ms 巡检重试）+ http（收对方 register/info）。

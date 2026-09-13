@@ -14,6 +14,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <psp2/types.h>
+#include "net/http.h"      /* HttpRecvOps / http_stream_fn（注册给 http 层的处理集） */
 
 #define RECV_MAX_FILES 64       /* 单次接收会话文件数上限（超出的在确认页明示丢弃） */
 
@@ -87,26 +88,17 @@ int recv_status_pull(RecvStatus *out);
 /* 接收会话结束展示完毕，清场回空闲 */
 void recv_clear(void);
 
-/* ---- http.c 调用（http 连接线程上下文） ---- */
+/* ---- HTTP 路由实现集（注册给 net/http.c，类型见 http.h 的 HttpRecvOps） ---- */
 
-/* http 层收体轮询时查"用户是否请求中止"（无锁读 volatile；返回 1 后应尽快收尾） */
-bool recv_abort_pending(void);
-
-/* prepare-upload：解析清单 → PENDING 阻塞等 UI 决定（最多 60s）→ 填 resp 返回 HTTP
- * 码（200=resp 为 JSON；403 拒绝/超时；400 坏体；409 已有活动会话） */
-int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz);
-
-/* 流式读回调（http.c 提供）：阻塞轮询读，最多 max 字节，返回实际字节数；
- * 0=对端关闭或空闲超时；<0 socket 错误 */
-typedef int (*recv_stream_fn)(void *ctx, unsigned char *buf, int max);
-
-/* upload：校验 query(sessionId/fileId/token)+来源 IP → 经 fn 读 total 字节流式写盘。
- * 返回 HTTP 码（200 / 400 缺参 / 403 会话或 token 不符 / 409 会话已被取消 /
- *  422 sha256 不符 / 500 写盘等内部错）。 */
-int recv_http_upload(const char *query, const char *ip, SceOff total,
-                     recv_stream_fn fn, void *ctx);
-
-/* cancel：发送方放弃 → 200（清理进行中的临时文件；已完成文件保留） */
-int recv_http_cancel(const char *query, const char *ip);
+/* 返回接收侧处理集：组合层（app/api.c）在 api_start 时注册给 http 层。
+ * 各成员语义见 http.h；实现要点：
+ *  - prepare：解析清单 → 挂起等 UI 决定（最多 60s）→ 填 resp 返 HTTP 码
+ *             （200=resp 为 JSON；403 拒绝/超时；400 坏体；409 已有活动会话）
+ *  - upload：校验 query(sessionId/fileId/token)+来源 IP → 经流回调边收边写盘
+ *             （200 / 400 缺参 / 403 会话或 token 不符 / 409 已取消 /
+ *              422 sha256 不符 / 500 写盘等内部错）
+ *  - cancel：发送方放弃 → 200（清理进行中的临时文件；已完成文件保留）
+ *  - abort_pending：http 层收体轮询时查"用户是否请求中止"（无锁读 volatile） */
+const HttpRecvOps *recv_http_ops(void);
 
 #endif

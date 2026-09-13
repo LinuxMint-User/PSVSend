@@ -16,7 +16,6 @@
 #include "core/config.h"
 #include "core/json_util.h"
 #include "net/http.h"
-#include "proto/receive.h"
 #include "core/dlog.h"
 
 #define HTTP_RECV_TIMEOUT_S 3
@@ -36,6 +35,9 @@ static SceUID g_thr = -1;           /* accept 线程（http_stop 要等它退）
 static volatile int g_run = 0;
 static volatile int g_gen = 0;      /* 服务器代次：stop/start 递增，旧线程据此收手 */
 static void (*g_cb)(const char *body, const char *src_ip) = NULL;
+/* 接收侧处理集（proto/receive.c 实现，app/api.c 启动时注册）：http 层不认
+ * 协议语义，只按路由把请求转给它——避免 net 层反向依赖 proto 层。 */
+static const HttpRecvOps *g_recv = NULL;
 
 /* 每连接一个 worker 的登记槽：accept 线程填好 fd/ip/gen 再启动线程；
  * worker 自找本槽（tid 匹配）取出参数；http_stop 靠 tid 等仍在跑的 worker。
@@ -96,6 +98,22 @@ static const char *reason_of(int code)
     case 500: return "Internal Server Error";
     default:  return "Error";
     }
+}
+
+/* 接收侧处理集是否可用（组合层 api_start 注册前为 NULL；正常不会发生） */
+static bool recv_ops_ready(void)
+{
+    if (g_recv && g_recv->prepare && g_recv->upload && g_recv->cancel &&
+        g_recv->abort_pending)
+        return true;
+    dlog("http: recv ops not registered");
+    return false;
+}
+
+/* 用户是否已请求中止本次上传（收体轮询用；未注册处理集时视为否） */
+static bool recv_abort_q(void)
+{
+    return g_recv && g_recv->abort_pending && g_recv->abort_pending();
 }
 
 static void member_info_json(char *out, int outsz)
@@ -225,7 +243,7 @@ static int u_refill(UploadCtx *u)
         SceLong64 dl = sceKernelGetSystemTimeWide() + UPLOAD_IDLE_US;
         for (;;) {
             int r;
-            if (recv_abort_pending()) return -1; /* 用户中止 */
+            if (recv_abort_q()) return -1;       /* 用户中止 */
             if (gen_stale(u->gen)) return -1;    /* 换代：http_stop 已叫停 */
             r = sceNetRecv(u->fd, u->sbuf, (unsigned)sizeof u->sbuf, 0);
             if (r > 0) { u->s_n = r; return 1; }
@@ -325,7 +343,7 @@ static int upload_stream(void *ctx, unsigned char *buf, int max)
     }
     dl = sceKernelGetSystemTimeWide() + UPLOAD_IDLE_US;
     for (;;) {
-        if (recv_abort_pending()) return -1; /* 用户中止：让 receive 收尾为取消 */
+        if (recv_abort_q()) return -1;       /* 用户中止：让 receive 收尾为取消 */
         if (gen_stale(u->gen)) return -1;    /* 换代：http_stop 已叫停 */
         int r = sceNetRecv(u->fd, buf, (unsigned)max, 0);
         if (r > 0) return r;
@@ -506,8 +524,12 @@ static void handle_conn(int c, const char *rip, int my_gen)
             http_respond(c, 400, "Bad Request", "");
             return;
         }
+        if (!recv_ops_ready()) {
+            http_respond(c, 500, "Internal Server Error", "");
+            return;
+        }
         {
-            int code = recv_http_prepare(body, rip, resp, (int)sizeof resp);
+            int code = g_recv->prepare(body, rip, resp, (int)sizeof resp);
             dlog("http: prepare -> %d", code);
             http_respond(c, code, reason_of(code), resp);
         }
@@ -540,11 +562,15 @@ static void handle_conn(int c, const char *rip, int my_gen)
             hdr_copy(buf, he, "transfer-encoding", te, sizeof te);
             if (str_has_ci(te, "chunked")) uctx.chunked = 1;
         }
+        if (!recv_ops_ready()) {
+            http_respond(c, 500, "Internal Server Error", "");
+            return;
+        }
         if (uctx.chunked) {
             dlog("http: upload chunked (no content-length)");
-            code = recv_http_upload(query, rip, -1, upload_stream, &uctx);
+            code = g_recv->upload(query, rip, -1, upload_stream, &uctx);
         } else {
-            code = recv_http_upload(query, rip, cl64, upload_stream, &uctx);
+            code = g_recv->upload(query, rip, cl64, upload_stream, &uctx);
         }
         dlog("http: upload -> %d", code);
         http_respond(c, code, reason_of(code), "");
@@ -552,7 +578,7 @@ static void handle_conn(int c, const char *rip, int my_gen)
     }
     if (strcmp(method, "POST") == 0 &&
         strcmp(route, "/api/localsend/v2/cancel") == 0) {
-        int code = recv_http_cancel(query, rip);
+        int code = recv_ops_ready() ? g_recv->cancel(query, rip) : 500;
         http_respond(c, code, reason_of(code), "");
         return;
     }
@@ -857,4 +883,10 @@ int http_restart(void)
 void http_set_register_cb(void (*cb)(const char *body, const char *src_ip))
 {
     g_cb = cb;
+}
+
+void http_set_recv_ops(const HttpRecvOps *ops)
+{
+    g_recv = ops;
+    dlog("http: recv ops %s", ops ? "registered" : "cleared");
 }

@@ -189,8 +189,8 @@ void pages_init(void)
  * 设备增删/超时消失都由发现线程更新，这里只做显示用的镜像。 */
 static void dev_sync(void)
 {
-    Device tmp[API_MAX_DEVICES];
-    int n = api_device_snapshot(tmp, API_MAX_DEVICES);
+    Device tmp[DEVICE_MAX];
+    int n = api_device_snapshot(tmp, DEVICE_MAX);
     int i;
     if (n > MAX_DEVICES) n = MAX_DEVICES;
     for (i = 0; i < n; i++) {
