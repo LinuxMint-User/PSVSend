@@ -79,8 +79,8 @@ void page_recv_confirm_render(void)
         w_button(close, tr("Close"), true);
         HintSeg segs[2] = { 0 };
         int ns = 0;
-        segs[ns].icon  = icon_confirm();
-        segs[ns].icon2 = icon_back();   /* 确认/返回都能关闭 → 合并成「确认/返回 关闭」 */
+        segs[ns].key  = HKEY_CONFIRM;
+        segs[ns].key2 = HKEY_BACK;   /* 确认/返回都能关闭 → 合并成「确认/返回 关闭」 */
         segs[ns++].text = tr("Close");
         w_page_footer_segs(segs, ns);
         return;
@@ -167,22 +167,21 @@ void page_recv_confirm_render(void)
                theme->text_dim, "%s", s_accept);
     }
 
-    /* 页脚：固定提示（切换 / 返回 Reject）靠左，跟随焦点的确认段靠右——否则焦点
-     * 一动就把左边的提示推来推去。确认段文案不再固定写 Accept（那会在焦点压到别的
-     * 按钮上时撒谎）；焦点落在 Reject 上时它与返回键同动作 → 合并成「确认/返回
-     * Reject」，两个键都显示，文案不重复。 */
+    /* 页脚：只声明本页用到的键，位置交给 hintbar 按默认键序排。确认段文案不写死
+     * Accept（那会在焦点压到别的按钮上时撒谎）；焦点落在 Reject 上时它与返回键
+     * 同动作 → 合并成「确认/返回 Reject」，两个键都显示，文案不重复。 */
     HintSeg segs[6] = { 0 };
     int ns = 0;
-    segs[ns].icon = HICON_DPAD;  segs[ns].dir_off = HDIR_VERT;
+    segs[ns].key = HKEY_DPAD;  segs[ns].dir_off = HDIR_VERT;
     segs[ns++].text = tr("Switch");
     if (recv_focus == 0) {
-        segs[ns].icon  = icon_confirm();
-        segs[ns].icon2 = icon_back();
+        segs[ns].key  = HKEY_CONFIRM;
+        segs[ns].key2 = HKEY_BACK;
         segs[ns++].text = s_reject;
     } else {
-        segs[ns].icon = icon_confirm();
+        segs[ns].key = HKEY_CONFIRM;
         segs[ns++].text = recv_focus == 1 ? s_setup : s_accept;
-        segs[ns].icon = icon_back();  segs[ns++].text = s_reject;
+        segs[ns].key = HKEY_BACK;  segs[ns++].text = s_reject;
     }
     w_page_footer_segs(segs, ns);
 }
@@ -544,16 +543,16 @@ void page_recv_setup_render(void)
     uint8_t off = HDIR_HORZ;
     if (g_app.inc_sel <= 0)          off |= HDIR_UP;
     if (g_app.inc_sel >= rows - 1)   off |= HDIR_DOWN;
-    segs[ns].icon = HICON_DPAD;       segs[ns].dir_off = off;
+    segs[ns].key = HKEY_DPAD;         segs[ns].dir_off = off;
     segs[ns++].text = tr("Choose");
-    /* 提示随焦点行变：目录行 ○=进目录选择器、△ 无响应；文件行才是
-     * ○=切勾选、△=改名（此前写死 Toggle/Rename，焦点在目录行时与
+    /* 提示随焦点行变：目录行确认键=进目录选择器、三角键无响应；文件行才是
+     * 确认键=切勾选、三角键=改名（此前写死 Toggle/Rename，焦点在目录行时与
      * 实际按键对不上） */
-    segs[ns].icon = icon_confirm();
+    segs[ns].key = HKEY_CONFIRM;
     segs[ns++].text = g_app.inc_sel > 0 ? tr("Toggle") : tr("Change folder");
-    segs[ns].icon = icon_back();      segs[ns++].text = tr("Back");
+    segs[ns].key = HKEY_BACK;         segs[ns++].text = tr("Back");
     if (g_app.inc_sel > 0) {
-        segs[ns].icon = HICON_TRIANGLE; segs[ns++].text = tr("Rename");
+        segs[ns].key = HKEY_TRIANGLE; segs[ns++].text = tr("Rename");
     }
     w_page_footer_segs(segs, ns);
 }

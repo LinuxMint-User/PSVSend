@@ -65,6 +65,7 @@ add_executable(${PROJECT_NAME}
     src/ui/pages_recv.c
     src/ui/pages_settings.c
     src/ui/widgets.c
+    src/ui/hintbar.c
     src/ui/input.c
     src/ui/theme.c
 )

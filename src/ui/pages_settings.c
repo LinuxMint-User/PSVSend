@@ -353,19 +353,19 @@ void page_settings_render(void)
     int sl = item_slot(g_app.set_sel);
     if (sl < 0 || slot_step(sl, -1) == sl) off |= HDIR_UP;
     if (sl < 0 || slot_step(sl, 1) == sl)  off |= HDIR_DOWN;
-    segs[ns].icon = HICON_DPAD;      segs[ns].dir_off = off;
+    segs[ns].key = HKEY_DPAD;        segs[ns].dir_off = off;
     segs[ns++].text = tr("Choose");
     if (g_app.set_sel == SET_ITEM_KEY) {
-        segs[ns].icon = HICON_DPAD;  segs[ns].dir_off = HDIR_VERT;
+        segs[ns].key = HKEY_DPAD;    segs[ns].dir_off = HDIR_VERT;
         segs[ns++].text = tr("Switch");
     } else {
-        segs[ns].icon = icon_confirm();
+        segs[ns].key = HKEY_CONFIRM;
         /* OLED 下"外观"行不可改：确认键那一段画灰，与行值"深色（固定）"一致 */
         segs[ns].dim = (g_app.set_sel == SET_ITEM_LIGHT &&
                         g_app.theme_id == THEME_OLED);
         segs[ns++].text = tr("Change");
     }
-    segs[ns].icon = icon_back();     segs[ns++].text = tr("Back");
+    segs[ns].key = HKEY_BACK;        segs[ns++].text = tr("Back");
     w_page_footer_segs(segs, ns);
 }
 
@@ -523,16 +523,15 @@ void page_dir_pick_render(void)
     uint8_t off = HDIR_HORZ;
     if (g_app.file_sel <= 0)                off |= HDIR_UP;
     if (g_app.file_sel >= dpick_dcount - 1) off |= HDIR_DOWN;
-    segs[ns].icon = HICON_DPAD;      segs[ns].dim = !has;
+    segs[ns].key = HKEY_DPAD;        segs[ns].dim = !has;
     segs[ns].dir_off = off;          segs[ns++].text = tr("Choose");
-    segs[ns].icon = icon_confirm();  segs[ns].dim = !has;
+    segs[ns].key = HKEY_CONFIRM;     segs[ns].dim = !has;
     segs[ns++].text = tr("Open");
-    /* ✗ = 回上一层目录（ux0:/ 根时=退出选择）；要直接退出按方块。
-     * 位置按默认键序（… ○、✗、□、△）——它动作恒定，不算"可变"段 */
-    segs[ns].icon = icon_back();
+    /* ✗ = 回上一层目录（ux0:/ 根时=退出选择）；要直接退出按方块 */
+    segs[ns].key = HKEY_BACK;
     segs[ns++].text = strlen(g_app.cur_dir) <= 5 ? tr("Back") : tr("Up");
-    segs[ns].icon = HICON_SQUARE;    segs[ns++].text = tr("Exit");
-    segs[ns].icon = HICON_TRIANGLE;  segs[ns++].text = tr("Save here");
+    segs[ns].key = HKEY_SQUARE;      segs[ns++].text = tr("Exit");
+    segs[ns].key = HKEY_TRIANGLE;    segs[ns++].text = tr("Save here");
     w_page_footer_segs(segs, ns);
 }
 

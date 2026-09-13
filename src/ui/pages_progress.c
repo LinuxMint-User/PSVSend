@@ -211,8 +211,8 @@ void page_progress_render(void)
 
     HintSeg segs[6] = { 0 };
     int ns = 0;
-    segs[ns].icon = HICON_TRIANGLE;  segs[ns++].text = tr("Advanced");  /* 固定 → 靠左 */
-    segs[ns].icon = icon_confirm();
+    segs[ns].key = HKEY_TRIANGLE;  segs[ns++].text = tr("Advanced");  /* 固定 → 靠左 */
+    segs[ns].key = HKEY_CONFIRM;   segs[ns].varies = true;
     segs[ns++].text = g_app.prog_running ? tr("Cancel") : tr("Done");   /* 会变 → 靠右 */
     w_page_footer_segs(segs, ns);
 

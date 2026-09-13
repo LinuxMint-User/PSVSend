@@ -362,14 +362,14 @@ void page_devices_render(void)
     dev_pane_render(&dev, g_app.pane_focus == 0);
     pick_pane_render(&fil, g_app.pane_focus == 1);
 
-    /* 页脚排序：固定不变的靠左（设置/切换/选文件），随焦点栏变的靠右（确认、三角）。
-     * 变动的文案只会推自己右侧的东西，左边固定提示就不会跟着左右乱跳。 */
+    /* 页脚只声明"本页有哪些键 + 文案 + 状态"，顺序交给 hintbar 排
+     * （默认键序 + 固定靠左、可变靠右）。确认/三角两段随焦点栏变 → 可变段靠右。 */
     HintSeg segs[6] = { 0 };
     int ns = 0;
-    segs[ns].icon = HICON_NONE;       segs[ns++].text = tr("SELECT Settings");
+    segs[ns].key = HKEY_SELECT;       segs[ns++].text = tr("SELECT Settings");
     /* 十字键两条：左右切栏（两栏恒可切），上下在焦点栏内移动选中
      * （选到该栏首/末项时对应臂画灰，读起来就是"到头了"） */
-    segs[ns].icon = HICON_DPAD;       segs[ns].dir_off = HDIR_VERT;
+    segs[ns].key = HKEY_DPAD;         segs[ns].dir_off = HDIR_VERT;
     segs[ns++].text = tr("Switch");
     {
         int cnt = g_app.pane_focus == 0 ? g_app.dev_count : g_app.picked_count;
@@ -377,11 +377,11 @@ void page_devices_render(void)
         uint8_t off = HDIR_HORZ;
         if (sel <= 0)       off |= HDIR_UP;
         if (sel >= cnt - 1) off |= HDIR_DOWN;
-        segs[ns].icon = HICON_DPAD;   segs[ns].dir_off = off;
+        segs[ns].key = HKEY_DPAD;     segs[ns].dir_off = off;
         segs[ns++].text = tr("Choose");
     }
-    segs[ns].icon = HICON_SQUARE;     segs[ns++].text = tr("Select files");
-    segs[ns].icon = icon_confirm();
+    segs[ns].key = HKEY_SQUARE;       segs[ns++].text = tr("Select files");
+    segs[ns].key = HKEY_CONFIRM;      segs[ns].varies = true;
     /* 确认键语义随焦点栏变化：设备栏=发送（一台设备都没有则灰掉）；
      * 文件栏有文件=移除该项，空栏=去选文件 */
     if (g_app.pane_focus == 0) {
@@ -390,7 +390,7 @@ void page_devices_render(void)
     } else {
         segs[ns++].text = g_app.picked_count > 0 ? tr("Remove") : tr("Select files");
     }
-    segs[ns].icon = HICON_TRIANGLE;
+    segs[ns].key = HKEY_TRIANGLE;     segs[ns].varies = true;
     /* 三角键语义随焦点栏变化：设备栏=扫描网段，文件栏=清空已选（无已选则灰掉） */
     if (g_app.pane_focus == 0) {
         segs[ns++].text = tr("Scan");
@@ -672,23 +672,23 @@ void page_files_render(void)
                tr("(empty folder)"));
     HintSeg segs[6] = { 0 };
     int ns = 0;
-    /* 固定提示靠左、随层级/全选状态变的靠右（变动的只推自己右侧，不推左边）。
-     * 空目录里没有可选项：选择/打开/全选都灰掉 */
+    /* 只声明本页用到的键，顺序由 hintbar 排。空目录里没有可选项：
+     * 选择/打开/全选都灰掉 */
     bool has = count > 0;
     /* 上下选文件：选到首/末行时把方向键对应臂画灰 */
     uint8_t off = HDIR_HORZ;
     if (g_app.file_sel <= 0)         off |= HDIR_UP;
     if (g_app.file_sel >= count - 1) off |= HDIR_DOWN;
-    segs[ns].icon = HICON_DPAD;       segs[ns].dim = !has;
+    segs[ns].key = HKEY_DPAD;         segs[ns].dim = !has;
     segs[ns].dir_off = off;           segs[ns++].text = tr("Choose");
-    segs[ns].icon = icon_confirm();   segs[ns].dim = !has;
+    segs[ns].key = HKEY_CONFIRM;      segs[ns].dim = !has;
     segs[ns++].text = tr("Open/Pick");
-    /* ✗ 排在 □ 前：按默认键序（… ○、✗、□、△）。它动作恒定（回上级，
-     * 根目录时退回设备页），只是文案随层级换词，不算"可变"段 */
-    segs[ns].icon = icon_back();
+    /* ✗ = 回上层目录；到根目录时退回设备页，只是文案换词 */
+    segs[ns].key = HKEY_BACK;
     segs[ns++].text = strlen(g_app.cur_dir) <= 5 ? tr("Back") : tr("Up");
-    segs[ns].icon = HICON_SQUARE;     segs[ns++].text = tr("Done");
-    segs[ns].icon = HICON_TRIANGLE;   segs[ns].dim = !has;
+    segs[ns].key = HKEY_SQUARE;       segs[ns++].text = tr("Done");
+    segs[ns].key = HKEY_TRIANGLE;     segs[ns].dim = !has;
+    segs[ns].varies = true;           /* 全选↔取消全选：随状态变 → 靠右 */
     segs[ns++].text = all_files_picked() ? tr("Deselect all") : tr("Select all");
     w_page_footer_segs(segs, ns);
     /* 右下角"完成"触摸按钮（与方块键同义）：保留已选回主页 */
@@ -826,8 +826,8 @@ void page_send_wait_render(void)
     w_button(btn, ended ? tr("Done") : tr("Cancel"), true);   /* 唯一动作，焦点态 */
     HintSeg segs[2] = { 0 };
     int ns = 0;
-    segs[ns].icon  = icon_confirm();
-    segs[ns].icon2 = icon_back();   /* 确认/返回都退出本页 → 合并成「确认/返回 …」 */
+    segs[ns].key  = HKEY_CONFIRM;
+    segs[ns].key2 = HKEY_BACK;   /* 确认/返回都退出本页 → 合并成「确认/返回 …」 */
     segs[ns++].text = ended ? tr("Done") : tr("Cancel");
     w_page_footer_segs(segs, ns);
 }

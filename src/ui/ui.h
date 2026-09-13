@@ -34,39 +34,8 @@ typedef struct {
 /* ---------- 控件：注册命中区域供触摸 ---------- */
 typedef struct { int x, y, w, h; } Rect;
 
-/* 底部提示用的按键图标 */
-typedef enum {
-    HICON_NONE = 0, /* 无图标；取 0 使 HintSeg 数组 `= { 0 }` 零初始化即为"无图标" */
-    HICON_CROSS,    /* X 键 */
-    HICON_CIRCLE,   /* O 键 */
-    HICON_TRIANGLE, /* 三角键 */
-    HICON_SQUARE,   /* 方块键 */
-    HICON_START,    /* START */
-    HICON_DPAD,     /* 方向键（十字）：按 HintSeg.dir_off 分亮臂/灰臂 */
-    HICON_COUNT
-} HintIcon;
-
-/* 方向键提示的"灭臂"掩码位（HintSeg.dir_off）：标出当前按不动的方向，画成灰臂。
- * 0 = 四向全亮（默认）——把"全亮"取作 0，使 `= { 0 }` 零初始化安全：
- * 页面忘了设也只是多亮几臂，不会凭空把方向键画暗。 */
-#define HDIR_UP    0x1
-#define HDIR_DOWN  0x2
-#define HDIR_LEFT  0x4
-#define HDIR_RIGHT 0x8
-#define HDIR_VERT  (HDIR_UP | HDIR_DOWN)
-#define HDIR_HORZ  (HDIR_LEFT | HDIR_RIGHT)
-
-/* 一段按键提示。dim=true：该动作当前不可用（画成灰字灰图标，避免误导）。
- * icon2 != HICON_NONE：该段是"两个键同一个动作"，画成「icon / icon2 文案」，
- * 两个键都显示出来，动作文案只写一次。
- * dir_off 仅对 HICON_DPAD 有意义，见上方 HDIR_* 说明。
- * 注意：HintSeg 数组请用 `= { 0 }` 初始化，否则各字段是未初始化值。 */
-typedef struct {
-    HintIcon icon, icon2;
-    const char *text;   /* 可空：只画图标 */
-    bool dim;
-    uint8_t dir_off;    /* 方向键灰掉的方向（0 = 全亮） */
-} HintSeg;
+/* 底部按键提示条（HintKey/HintSeg/w_page_footer_segs）见 ui/hintbar.h */
+#include "ui/hintbar.h"
 
 void w_clear(void);                  /* 每帧开始清空命中表 */
 void w_add(int id, Rect r);          /* 页面绘制时注册可触摸区域 */
@@ -222,14 +191,11 @@ void w_rect(Rect r, uint32_t color);
 void w_rect_outline(Rect r, uint32_t color);
 void w_bar(Rect r, uint32_t bg, uint32_t fg, int pct);
 void w_page_header(const char *title);
-void w_page_footer(const char *hint);
-void w_page_footer_segs(const HintSeg *segs, int n);   /* 图标 + 文字的按键提示条 */
 void w_row(Rect r, const char *main_text, const char *sub_text, bool selected);
 /* 同 w_row，但右值文本颜色指定（0=默认：选中 accent_text / 未选 text_dim） */
 void w_row_c(Rect r, const char *main_text, const char *sub_text,
              uint32_t sub_c, bool selected);
 void w_button(Rect r, const char *label, bool active);
-void w_icon_cross(float cx, float cy, float r, uint32_t c);  /* 独立"✕"图标（列表行尾删除按钮） */
 void w_modal_begin(int content_h);          /* 绘制遮罩 + 弹窗卡片，返回卡片区域置顶布局起点 */
 Rect w_modal_box(int content_h);
 void w_human_size(SceOff size, char *out);

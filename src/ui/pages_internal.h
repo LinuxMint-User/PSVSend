@@ -47,10 +47,6 @@
 static inline const char *key_confirm(void) { return g_app.confirm_layout == 0 ? "X" : "O"; }
 static inline const char *key_back(void)    { return g_app.confirm_layout == 0 ? "O" : "X"; }
 
-/* 确认/返回键在当前布局下的图形图标 */
-static inline HintIcon icon_confirm(void) { return g_app.confirm_layout == 0 ? HICON_CROSS : HICON_CIRCLE; }
-static inline HintIcon icon_back(void)    { return g_app.confirm_layout == 0 ? HICON_CIRCLE : HICON_CROSS; }
-
 static inline int list_max_scroll(int count)
 {
     int m = count * ROW_STRIDE - LIST_VIEW_H;
