@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include "net/device.h"        /* Device / DEVICE_MAX（类型住 net 层，见 device.h） */
 #include "proto/transfer.h"    /* XferFile / XferInfo / XFER_MAX_FILES：发送契约数据类型 */
+#include "proto/receive.h"     /* RecvPending / RecvStatus / RECV_ST_*：接收契约数据类型 */
 
 /* 启动后端：config_init + net_start + discovery_start（各模块内部幂等）。
  * 后台线程自理：api_watch（500ms 巡检重试）+ http（收对方 register/info）。
@@ -57,5 +58,26 @@ int  api_send_start(const char *ip, int port, const char *proto, const char *fp,
 void api_send_cancel(void);
 /* 锁内拷贝当前发送快照（每帧可调；线程结束后保留最后一次状态） */
 void api_send_info(XferInfo *out);
+
+/* ---- UI 门面：接收（proto/receive.c） ----
+ * 接收数据类型（RecvPending/RecvStatus/RECV_ST_ 枚举/RECV_MAX_FILES）随本契约
+ * 暴露，UI 不再直接 include proto/receive.h。以下均为薄转发。 */
+
+/* 有"等待决定"的接收请求？1=有并拷贝 out（out==NULL 时仅探测） */
+int  api_recv_pending_pull(RecvPending *out);
+/* 同步"本次勾选接收的文件"（下标与 pending 一致） */
+void api_recv_set_include(const bool inc[RECV_MAX_FILES]);
+/* 接受前逐文件指定"保存名"（idx 与 pending 一致；空串=保持原名） */
+void api_recv_set_name(int idx, const char *name);
+/* 接受前设定"本次保存目录"（内存态；NULL/空 → 回退 config 默认） */
+void api_recv_set_dir(const char *dir);
+/* 决定（仅 PENDING 有效）：accept=1 接受 / 0 拒绝 */
+void api_recv_decide(bool accept);
+/* 用户中止进行中的接收 */
+void api_recv_abort(void);
+/* 轮询接收会话状态；1=有会话（含终态）0=空闲 */
+int  api_recv_status_pull(RecvStatus *out);
+/* 会话结束展示完毕，清场回空闲 */
+void api_recv_clear(void);
 
 #endif

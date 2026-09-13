@@ -12,7 +12,6 @@
 #include "ui/theme.h"
 #include "core/i18n.h"
 #include "app/api.h"
-#include "proto/receive.h"
 
 /* 传输页：文件列表区域与总进度布局（发送/接收共用） */
 #define XF_TOP        68
@@ -77,7 +76,7 @@ void page_progress_render(void)
          * （Accept 刚点、http 线程未醒的几帧）用 start_recv 捕获的清单兜底。 */
         RecvStatus rs;
         memset(&rs, 0, sizeof rs);
-        bool has = recv_status_pull(&rs) == 1;
+        bool has = api_recv_status_pull(&rs) == 1;
         if (has) {
             xf_count = rs.count > MAX_PICKED ? MAX_PICKED : rs.count;
             for (i = 0; i < xf_count; i++) {
@@ -123,7 +122,7 @@ void page_progress_render(void)
                 if (xf_size[i] == 0) fin++;
             }
             msg = tr("Waiting for sender to start...");
-            if (recv_pending_pull(NULL) == 0 &&
+            if (api_recv_pending_pull(NULL) == 0 &&
                 (uint64_t)sceKernelGetSystemTimeWide() - g_app.prog_start >
                     2000000ULL) {
                 g_app.prog_running = false;
@@ -236,7 +235,7 @@ void page_progress_render(void)
 /* 离开进度页：接收方向先清场（终态/取消后让后端回空闲，不然一直占着会话） */
 static void progress_leave(void)
 {
-    if (g_app.prog_dir == 1) recv_clear();
+    if (g_app.prog_dir == 1) api_recv_clear();
     goto_devices();
 }
 
@@ -266,7 +265,7 @@ void page_progress_input(const Input *in)
         if (id == 1) {   /* 主按钮：传输中取消，否则退出 */
             if (g_app.prog_running) {
                 if (g_app.prog_dir == 0) api_send_cancel();
-                else recv_abort();
+                else api_recv_abort();
             } else {
                 progress_leave();
             }
@@ -278,7 +277,7 @@ void page_progress_input(const Input *in)
     if (in->confirm || in->back) {
         if (g_app.prog_running) {
             if (g_app.prog_dir == 0) api_send_cancel();
-            else recv_abort();
+            else api_recv_abort();
         } else {
             progress_leave();
         }

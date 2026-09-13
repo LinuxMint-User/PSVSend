@@ -205,7 +205,7 @@ void api_start(void)
     int r;
     config_init();                       /* 先建目录/读配置（dlog 目录依赖它） */
     dlog_init();
-    dlog("== psvsend boot [TAG:d75] ==");
+    dlog("== psvsend boot [TAG:d76] ==");
     {
         /* 版本标记 + 设备身份指纹：确认刷入的固件含 mTLS 客户端证书 */
         char f[65];
@@ -309,4 +309,45 @@ void api_send_cancel(void)
 void api_send_info(XferInfo *out)
 {
     xfer_info(out);
+}
+
+/* ---- UI 门面：接收（均为薄转发，见 api.h） ---- */
+int api_recv_pending_pull(RecvPending *out)
+{
+    return recv_pending_pull(out);
+}
+
+void api_recv_set_include(const bool inc[RECV_MAX_FILES])
+{
+    recv_set_include(inc);
+}
+
+void api_recv_set_name(int idx, const char *name)
+{
+    recv_set_name(idx, name);
+}
+
+void api_recv_set_dir(const char *dir)
+{
+    recv_set_dir(dir);
+}
+
+void api_recv_decide(bool accept)
+{
+    recv_decide(accept);
+}
+
+void api_recv_abort(void)
+{
+    recv_abort();
+}
+
+int api_recv_status_pull(RecvStatus *out)
+{
+    return recv_status_pull(out);
+}
+
+void api_recv_clear(void)
+{
+    recv_clear();
 }

@@ -13,7 +13,7 @@
 #include "core/config.h"
 #include "core/i18n.h"
 #include "app/ime.h"
-#include "proto/receive.h"
+#include "app/api.h"
 
 /* 接收确认焦点：0=Reject 1=Setup 2=Accept */
 static int recv_focus = 2;
@@ -41,7 +41,7 @@ static uint64_t g_recv_supp_ms = 0;  /* 决定后抑制重弹到：毫秒时间�
 /* 拒绝当前请求并离开接收流程（后端回 403，发送方会看到拒绝） */
 static void recv_reject_close(void)
 {
-    recv_clear();                    /* PENDING → 唤醒 http 线程按拒绝处理 */
+    api_recv_clear();                /* PENDING → 唤醒 http 线程按拒绝处理 */
     g_recv_supp_ms = (uint64_t)sceKernelGetSystemTimeWide() / 1000 + 2000;
     rename_pop = false;
     goto_devices();
@@ -66,7 +66,7 @@ void page_recv_confirm_render(void)
     Rect card = { 24, 80, SCR_W - 48, 320 };
 
     /* 请求还在等 UI 决定吗？不在了（超时被后端作废）→ 只给关闭，不再给决定按钮 */
-    g_recv_expired = recv_pending_pull(NULL) == 0;
+    g_recv_expired = api_recv_pending_pull(NULL) == 0;
     if (g_recv_expired) {
         w_rect(card, theme->card);
         w_text(48, 120, 1.5f, theme->text, "%s", g_app.recv_alias);
@@ -230,14 +230,14 @@ static void start_recv(void)
     bool inc[RECV_MAX_FILES];
     int i, n = 0;
     SceOff tot = 0;
-    if (recv_pending_pull(NULL) != 1) {   /* 已过期（竞态防护，正常不会到） */
+    if (api_recv_pending_pull(NULL) != 1) {   /* 已过期（竞态防护，正常不会到） */
         recv_close();
         return;
     }
     for (i = 0; i < g_app.inc_count && i < RECV_MAX_FILES; i++)
         inc[i] = g_app.inc_files[i].inc;
-    recv_set_include(inc);
-    recv_set_dir(g_app.recv_dir);   /* 本次保存目录（Setup 里可临时改；默认=config saveDir） */
+    api_recv_set_include(inc);
+    api_recv_set_dir(g_app.recv_dir);   /* 本次保存目录（Setup 里可临时改；默认=config saveDir） */
     for (i = 0; i < g_app.inc_count && i < RECV_MAX_FILES; i++) {
         if (!g_app.inc_files[i].inc) continue;
         if (n >= MAX_PICKED) break;
@@ -263,7 +263,7 @@ static void start_recv(void)
     g_app.prog_running = true;
     g_app.prog_start = sceKernelGetSystemTimeWide();
     rename_pop = false;
-    recv_decide(true);               /* 唤醒后端：组会话、回 200 给发送方 */
+    api_recv_decide(true);           /* 唤醒后端：组会话、回 200 给发送方 */
     g_app.page = PAGE_PROGRESS;
 }
 
@@ -312,14 +312,14 @@ static void rename_apply(int fi, const char *in)
     cur[o] = 0;
     if (!any || !cur[0] || strcmp(cur, ".") == 0 || strcmp(cur, "..") == 0) {
         g_app.inc_files[fi].rname[0] = 0;   /* 净化后无效：沿用原名 */
-        recv_set_name(fi, "");
+        api_recv_set_name(fi, "");
         return;
     }
     if (strcmp(cur, g_app.inc_files[fi].name) == 0)
         cur[0] = 0;                         /* 等于原名：无需改名 */
     snprintf(g_app.inc_files[fi].rname, sizeof g_app.inc_files[fi].rname,
              "%s", cur);
-    recv_set_name(fi, cur);
+    api_recv_set_name(fi, cur);
 }
 
 /* 请求打开系统键盘改行 fi 的保存名。仅登记，真正的 ime_ask_begin 由主循环
@@ -640,7 +640,7 @@ void pages_tick(void)
     RecvPending rp;
     uint64_t now_ms = (uint64_t)sceKernelGetSystemTimeWide() / 1000;
     if (now_ms < g_recv_supp_ms) return;     /* 决定后的抑制窗内不弹 */
-    if (recv_pending_pull(&rp) != 1) return; /* 无"待决定"请求 */
+    if (api_recv_pending_pull(&rp) != 1) return; /* 无"待决定"请求 */
     switch (g_app.page) {
     case PAGE_DEVICES:
     case PAGE_FILES:
