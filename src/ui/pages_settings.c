@@ -197,7 +197,7 @@ static void settings_change(int item, int dir)
         config_save();
     } else if (item == SET_ITEM_LANG) {
         int p = i18n_lang_pref() + dir;
-        if (p < I18N_LANG_AUTO) p = I18N_LANG_ZH;      /* 0↔1↔2 循环 */
+        if (p < I18N_LANG_AUTO) p = I18N_LANG_COUNT - 1;   /* 语言项首尾循环 */
         if (p >= I18N_LANG_COUNT) p = I18N_LANG_AUTO;
         i18n_set_lang(p);          /* 写 cfg + 存盘 + 重解析：立即生效 */
     } else if (item == SET_ITEM_KEY) {
