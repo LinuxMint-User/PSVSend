@@ -541,8 +541,12 @@ static int conn_open(Conn *c, const char *method_path, SceOff body_len)
             }
             if (sceNetGetsockopt(c->fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_ERROR,
                                  &so, &sl) == 0 && so != 0) {
+                /* SO_ERROR 存的是裸 errno（61 = ECONNREFUSED），补上 SCE 网络错误基址
+                 * 0x80410100，与 sceNetXxx 直接返回的编码（0x804101xx）统一，免得
+                 * 日志里同一类错误出现两种写法、以后调试要换算。已带基址的按位或也
+                 * 不变（0x8041013D | 0x80410100 == 0x8041013D）。 */
                 dlog("xfer: connect %s:%d fail 0x%08X",
-                     g_j.ip, g_j.port, (unsigned)so);
+                     g_j.ip, g_j.port, (unsigned)so | 0x80410100u);
                 break;
             }
             if (sceNetGetpeername(c->fd, (SceNetSockaddr *)&p, &plen) == 0) {
