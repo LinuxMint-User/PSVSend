@@ -180,9 +180,9 @@ void page_recv_confirm_render(void)
         segs[ns].icon2 = icon_back();
         segs[ns++].text = s_reject;
     } else {
-        segs[ns].icon = icon_back();  segs[ns++].text = s_reject;
         segs[ns].icon = icon_confirm();
         segs[ns++].text = recv_focus == 1 ? s_setup : s_accept;
+        segs[ns].icon = icon_back();  segs[ns++].text = s_reject;
     }
     w_page_footer_segs(segs, ns);
 }
@@ -546,9 +546,15 @@ void page_recv_setup_render(void)
     if (g_app.inc_sel >= rows - 1)   off |= HDIR_DOWN;
     segs[ns].icon = HICON_DPAD;       segs[ns].dir_off = off;
     segs[ns++].text = tr("Choose");
-    segs[ns].icon = icon_confirm();   segs[ns++].text = tr("Toggle");
-    segs[ns].icon = HICON_TRIANGLE;   segs[ns++].text = tr("Rename");
+    /* 提示随焦点行变：目录行 ○=进目录选择器、△ 无响应；文件行才是
+     * ○=切勾选、△=改名（此前写死 Toggle/Rename，焦点在目录行时与
+     * 实际按键对不上） */
+    segs[ns].icon = icon_confirm();
+    segs[ns++].text = g_app.inc_sel > 0 ? tr("Toggle") : tr("Change folder");
     segs[ns].icon = icon_back();      segs[ns++].text = tr("Back");
+    if (g_app.inc_sel > 0) {
+        segs[ns].icon = HICON_TRIANGLE; segs[ns++].text = tr("Rename");
+    }
     w_page_footer_segs(segs, ns);
 }
 

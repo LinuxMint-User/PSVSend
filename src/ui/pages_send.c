@@ -683,10 +683,11 @@ void page_files_render(void)
     segs[ns].dir_off = off;           segs[ns++].text = tr("Choose");
     segs[ns].icon = icon_confirm();   segs[ns].dim = !has;
     segs[ns++].text = tr("Open/Pick");
-    segs[ns].icon = HICON_SQUARE;     segs[ns++].text = tr("Done");
-    /* 根目录无"上级"：返回键此时=退回设备页（与选择保存路径页一致地换标签） */
+    /* ✗ 排在 □ 前：按默认键序（… ○、✗、□、△）。它动作恒定（回上级，
+     * 根目录时退回设备页），只是文案随层级换词，不算"可变"段 */
     segs[ns].icon = icon_back();
     segs[ns++].text = strlen(g_app.cur_dir) <= 5 ? tr("Back") : tr("Up");
+    segs[ns].icon = HICON_SQUARE;     segs[ns++].text = tr("Done");
     segs[ns].icon = HICON_TRIANGLE;   segs[ns].dim = !has;
     segs[ns++].text = all_files_picked() ? tr("Deselect all") : tr("Select all");
     w_page_footer_segs(segs, ns);

@@ -143,6 +143,7 @@ static const TrEntry s_zh[] = {
     { "Open", "打开" },
     { "Save here", "存到此处" },
     { "Exit", "退出" },
+    { "Change folder", "更改目录" },
     { "LocalSend client v1.15+ compatible (protocol v2.0)",
       "适配 LocalSend 客户端 v1.15+（协议 v2.0）" },
 

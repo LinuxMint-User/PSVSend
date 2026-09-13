@@ -527,11 +527,12 @@ void page_dir_pick_render(void)
     segs[ns].dir_off = off;          segs[ns++].text = tr("Choose");
     segs[ns].icon = icon_confirm();  segs[ns].dim = !has;
     segs[ns++].text = tr("Open");
-    segs[ns].icon = HICON_TRIANGLE;  segs[ns++].text = tr("Save here");
-    segs[ns].icon = HICON_SQUARE;    segs[ns++].text = tr("Exit");
-    /* ✗ = 回上一层目录（在 ux0:/ 根时=退出选择）；要直接退出按方块 */
+    /* ✗ = 回上一层目录（ux0:/ 根时=退出选择）；要直接退出按方块。
+     * 位置按默认键序（… ○、✗、□、△）——它动作恒定，不算"可变"段 */
     segs[ns].icon = icon_back();
     segs[ns++].text = strlen(g_app.cur_dir) <= 5 ? tr("Back") : tr("Up");
+    segs[ns].icon = HICON_SQUARE;    segs[ns++].text = tr("Exit");
+    segs[ns].icon = HICON_TRIANGLE;  segs[ns++].text = tr("Save here");
     w_page_footer_segs(segs, ns);
 }
 
