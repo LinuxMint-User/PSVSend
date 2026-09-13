@@ -142,8 +142,15 @@ static void dev_strip(void)
         if (d < 0 || d > t) d = 0;
         dev_scan_was = 1;
         dev_scan_end_us = 0;          /* 新一轮开始，旧的结果提示作废 */
-        snprintf(st, sizeof st, tr("Scanning... %d/%d hosts, %d found"),
-                 d, t, f);
+        /* 分母是 /24 上限、不是"必须探完才能用"的门槛：设备入表即可选、可发，
+         * 扫描只是后台补全列表。已有设备时明说可继续，免得用户对着 12/254 干等
+         * （设备通常 ~0.7s 就出现）；一台未有时不出现该句，那时它只是空话。 */
+        if (f > 0)
+            snprintf(st, sizeof st,
+                     tr("Scanning... %d of %d possible hosts, %d found, you could proceed"),
+                     d, t, f);
+        else
+            snprintf(st, sizeof st, tr("Scanning... %d of %d possible hosts"), d, t);
         w_text(28, 56, 0.9f, theme->text_dim, "%s", st);
     } else if (dev_scan_was) {        /* round 结束边沿：记时刻与结果 */
         dev_scan_was = 0;

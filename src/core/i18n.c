@@ -28,8 +28,10 @@ typedef struct {
  * 否则查不到 → 中文界面里该条回退成英文。 */
 static const TrEntry s_zh[] = {
     /* ---- 设备页 / 手动扫描横幅 ---- */
-    { "Scanning... %d/%d hosts, %d found",
-      "扫描中… %d/%d 台主机，已发现 %d 台" },
+    { "Scanning... %d of %d possible hosts, %d found, you could proceed",
+      "扫描中…已探测 %d/%d 个可能的主机，找到 %d 台，可继续操作" },
+    { "Scanning... %d of %d possible hosts",
+      "扫描中…已探测 %d/%d 个可能的主机" },
     { "Scan complete, %d device%s found", "扫描完成，发现 %d 台设备" },
     { "Scan complete, no devices", "扫描完成，未发现设备" },
     { "Network not ready.", "网络未就绪。" },
