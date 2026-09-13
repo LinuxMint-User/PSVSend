@@ -55,36 +55,6 @@ static SceUID g_conn_mtx = -1;      /* 保护连接登记表 */
 static void conn_lock(void)   { if (g_conn_mtx >= 0) sceKernelLockMutex(g_conn_mtx, 1, NULL); }
 static void conn_unlock(void) { if (g_conn_mtx >= 0) sceKernelUnlockMutex(g_conn_mtx, 1); }
 
-/* ---------- 收/发工具 ---------- */
-static int send_all(int fd, const char *data, int len)
-{
-    int off = 0;
-    SceLong64 dl = sceKernelGetSystemTimeWide() + 2000000LL; /* 2s */
-    while (off < len) {
-        int r = sceNetSend(fd, data + off, (unsigned)(len - off), 0);
-        if (r > 0) { off += r; continue; }
-        if (r == 0 || sceKernelGetSystemTimeWide() >= dl) return -1;
-        if (!NET_AGAIN(r)) return -1;
-        sceKernelDelayThread(NET_RETRY_DELAY_US); /* 发窗口没空，等会儿再试 */
-    }
-    return 0;
-}
-
-static void http_respond(int fd, int code, const char *reason,
-                         const char *body)
-{
-    char hdr[256];
-    int blen = (int)strlen(body);
-    snprintf(hdr, sizeof hdr,
-             "HTTP/1.1 %d %s\r\n"
-             "Content-Type: application/json\r\n"
-             "Content-Length: %d\r\n"
-             "Connection: close\r\n\r\n",
-             code, reason, blen);
-    send_all(fd, hdr, (int)strlen(hdr));
-    send_all(fd, body, blen);
-}
-
 static const char *reason_of(int code)
 {
     switch (code) {
@@ -200,10 +170,17 @@ static bool str_has_ci(const char *s, const char *sub)
     return false;
 }
 
+/* ---------- 连接读写抽象 ----------
+ * 连接现在就是裸 fd；收发都经 conn_read/conn_write（定义见下）。将来 TLS 化
+ * 时把 mbedTLS 上下文挂进 Conn、在这两个函数里分派即可，调用点不必再改。 */
+typedef struct {
+    int fd;
+    int gen;        /* 所属服务器代次：换代后轮询尽早收手（见 gen_stale） */
+} Conn;
+
 /* ---------- upload 大文件的流式读回调（receive 模块轮询调用） ---------- */
 typedef struct {
-    int  fd;
-    int  gen;           /* 创建时的服务器代次：换代后轮询尽早收手 */
+    Conn conn;          /* 连接：读经 conn_read（换代/中止由它统一感知） */
     const char *left;   /* 缓冲里已读但未消费的 body */
     int  llen;
     int  chunked;       /* Transfer-Encoding: chunked（dio 无 CL 流式上传） */
@@ -217,6 +194,59 @@ typedef struct {
  * 让 http_stop 的有预算 join 能等到它，而不是干耗到 recv 超时。 */
 static inline int gen_stale(int my_gen) { return g_gen != my_gen; }
 
+/* ---------- 连接读写与响应工具（Conn 定义见上） ---------- */
+
+/* 全发 len 字节：20ms 轮询重试窗口，2s 内发不完即失败。0=成功 -1=失败 */
+static int conn_write(Conn *c, const char *data, int len)
+{
+    int off = 0;
+    SceLong64 dl = sceKernelGetSystemTimeWide() + 2000000LL; /* 2s */
+    while (off < len) {
+        int r = sceNetSend(c->fd, data + off, (unsigned)(len - off), 0);
+        if (r > 0) { off += r; continue; }
+        if (r == 0 || sceKernelGetSystemTimeWide() >= dl) return -1;
+        if (!NET_AGAIN(r)) return -1;
+        sceKernelDelayThread(NET_RETRY_DELAY_US); /* 发窗口没空，等会儿再试 */
+    }
+    return 0;
+}
+
+/* 读最多 max 字节：Vita recv 无数据立刻返回 EWOULDBLOCK，故 20ms 轮询到
+ * deadline（绝对时间，由调用者定"总截止"还是"单次空闲上限"）。
+ * 返回 >0=实读字节数 0=对端关闭 -1=出错/换代 -2=空闲超时
+ * flags：CONN_F_ABORTABLE → 轮询里查"用户已请求中止"（收大文件体专用） */
+#define CONN_F_ABORTABLE 1u
+static int conn_read(Conn *c, void *buf, int max, SceLong64 deadline,
+                     unsigned flags)
+{
+    for (;;) {
+        int r;
+        if (gen_stale(c->gen)) return -1;                   /* 换代：收手 */
+        if ((flags & CONN_F_ABORTABLE) && recv_abort_q()) return -1;
+        r = sceNetRecv(c->fd, buf, (unsigned)max, 0);
+        if (r > 0) return r;
+        if (r == 0) return 0;
+        if (!NET_AGAIN(r)) { dlog("http: recv err 0x%08X", (unsigned)r); return -1; }
+        if (sceKernelGetSystemTimeWide() >= deadline) return -2;
+        sceKernelDelayThread(NET_RETRY_DELAY_US);
+    }
+}
+
+static void http_respond(Conn *c, int code, const char *reason,
+                         const char *body)
+{
+    char hdr[256];
+    int blen = (int)strlen(body);
+    snprintf(hdr, sizeof hdr,
+             "HTTP/1.1 %d %s\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %d\r\n"
+             "Connection: close\r\n\r\n",
+             code, reason, blen);
+    conn_write(c, hdr, (int)strlen(hdr));
+    conn_write(c, body, blen);
+}
+
 static int hexv(char c)
 {
     if (c >= '0' && c <= '9') return c - '0';
@@ -229,6 +259,7 @@ static int hexv(char c)
  * 返回 1=有新数据 0=对端关闭 -1=错 -2=空闲超时 */
 static int u_refill(UploadCtx *u)
 {
+    int r;
     if (u->s_pos < u->s_n) return 1;
     u->s_pos = u->s_n = 0;
     if (u->llen > 0) {
@@ -239,20 +270,11 @@ static int u_refill(UploadCtx *u)
         u->s_n = k;
         return 1;
     }
-    {
-        SceLong64 dl = sceKernelGetSystemTimeWide() + UPLOAD_IDLE_US;
-        for (;;) {
-            int r;
-            if (recv_abort_q()) return -1;       /* 用户中止 */
-            if (gen_stale(u->gen)) return -1;    /* 换代：http_stop 已叫停 */
-            r = sceNetRecv(u->fd, u->sbuf, (unsigned)sizeof u->sbuf, 0);
-            if (r > 0) { u->s_n = r; return 1; }
-            if (r == 0) return 0;
-            if (!NET_AGAIN(r)) return -1;
-            if (sceKernelGetSystemTimeWide() >= dl) return -2;
-            sceKernelDelayThread(NET_RETRY_DELAY_US);
-        }
-    }
+    r = conn_read(&u->conn, u->sbuf, (int)sizeof u->sbuf,
+                  sceKernelGetSystemTimeWide() + UPLOAD_IDLE_US,
+                  CONN_F_ABORTABLE);
+    if (r > 0) { u->s_n = r; return 1; }
+    return r;            /* 0=对端关闭 -1=错/换代/中止 -2=空闲超时 */
 }
 
 /* chunked: 读一行（去 \r\n）。返回 1=成功 0=EOF -1=错 */
@@ -332,7 +354,7 @@ static int chunked_stream(void *ctx, unsigned char *out, int max)
 static int upload_stream(void *ctx, unsigned char *buf, int max)
 {
     UploadCtx *u = ctx;
-    SceLong64 dl;
+    int r;
     if (u->chunked) return chunked_stream(u, buf, max);
     if (u->llen > 0) {                   /* 先消费缓冲里的残留 body */
         int k = u->llen > max ? max : u->llen;
@@ -341,21 +363,17 @@ static int upload_stream(void *ctx, unsigned char *buf, int max)
         u->llen -= k;
         return k;
     }
-    dl = sceKernelGetSystemTimeWide() + UPLOAD_IDLE_US;
-    for (;;) {
-        if (recv_abort_q()) return -1;       /* 用户中止：让 receive 收尾为取消 */
-        if (gen_stale(u->gen)) return -1;    /* 换代：http_stop 已叫停 */
-        int r = sceNetRecv(u->fd, buf, (unsigned)max, 0);
-        if (r > 0) return r;
-        if (r == 0) return 0;            /* 对端关闭 */
-        if (!NET_AGAIN(r)) { dlog("http: upload recv err 0x%08X", (unsigned)r); return -1; }
-        if (sceKernelGetSystemTimeWide() >= dl) { dlog("http: upload idle timeout"); return 0; }
-        sceKernelDelayThread(NET_RETRY_DELAY_US);
-    }
+    r = conn_read(&u->conn, buf, max,
+                  sceKernelGetSystemTimeWide() + UPLOAD_IDLE_US,
+                  CONN_F_ABORTABLE);
+    if (r > 0) return r;
+    if (r == 0) return 0;                                    /* 对端关闭 */
+    if (r == -2) { dlog("http: upload idle timeout"); return 0; }
+    return -1;    /* 错/换代/用户中止：让 receive 收尾为取消 */
 }
 
 /* 解析 HTTP 请求并应答一个连接（在独立 worker 线程跑），返回后由 worker 关 fd */
-static void handle_conn(int c, const char *rip, int my_gen)
+static void handle_conn(Conn *cn, const char *rip, int my_gen)
 {
     char buf[HTTP_MAX_REQ];
     struct timeval tv;
@@ -370,20 +388,14 @@ static void handle_conn(int c, const char *rip, int my_gen)
 
     tv.tv_sec = HTTP_RECV_TIMEOUT_S;
     tv.tv_usec = 0;
-    sceNetSetsockopt(c, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO,
+    sceNetSetsockopt(cn->fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO,
                      &tv, sizeof tv);
     {
+        /* 收请求头直到出现空行（头结束）：总截止 3s，认到即停。 */
         SceLong64 dl = sceKernelGetSystemTimeWide()
                      + (SceLong64)HTTP_RECV_TIMEOUT_S * 1000000LL;
-
-        /* 收请求直到出现空行（头结束）。注意：Vita 的 recv 无数据时立刻返回
-         * EWOULDBLOCK，必须轮询到截止时间；每次收到后扫整个缓冲找结束符。 */
         while (n < HTTP_MAX_REQ - 1) {
-            if (gen_stale(my_gen)) {           /* 换代：服务器已停，不白等 */
-                dlog("http: req loop sees gen change from %s", rip);
-                return;
-            }
-            int r = sceNetRecv(c, buf + n, (unsigned)(HTTP_MAX_REQ - 1 - n), 0);
+            int r = conn_read(cn, buf + n, HTTP_MAX_REQ - 1 - n, dl, 0);
             if (r > 0) {
                 n += r;
                 buf[n] = 0;
@@ -391,17 +403,15 @@ static void handle_conn(int c, const char *rip, int my_gen)
                     if (buf[i] == '\r' && buf[i + 1] == '\n' &&
                         buf[i + 2] == '\r' && buf[i + 3] == '\n') he = i;
                 if (he >= 0) break;
-            } else if (r == 0 || sceKernelGetSystemTimeWide() >= dl) {
-                dlog("http: recv stop r=0x%08X n=%d from %s",
-                     (unsigned)r, n, rip);
-                break;
-            } else if (!NET_AGAIN(r)) {
-                dlog("http: recv err r=0x%08X n=%d from %s",
-                     (unsigned)r, n, rip);
-                break;
-            } else {
-                sceKernelDelayThread(NET_RETRY_DELAY_US);
+                continue;
             }
+            if (r == 0 || r == -2)
+                dlog("http: recv stop r=%d n=%d from %s", r, n, rip);
+            else if (gen_stale(my_gen))
+                dlog("http: req loop sees gen change from %s", rip);
+            else
+                dlog("http: recv err n=%d from %s", n, rip);
+            break;
         }
     }
     if (he < 0) {
@@ -445,20 +455,21 @@ static void handle_conn(int c, const char *rip, int my_gen)
      *   数据后再出现空窗"来判定 body 结束，不能因为无 CL 就判 400；
      * - upload 是大文件流，绝不进 buf，走下面的流式回调。 */
     if (strcmp(route, "/api/localsend/v2/upload") != 0) {
+        /* 已收过数据后只再等 ~400ms 空窗（判定 body 完）；未收过则等到
+         * 总截止（3s），但"无 CL 且还没收到任何体"时不空等，直接走。 */
         SceLong64 dl = sceKernelGetSystemTimeWide()
                      + (SceLong64)HTTP_RECV_TIMEOUT_S * 1000000LL;
         int want = cl64 > 0 ? (int)(he + 4 + cl64) : HTTP_MAX_REQ - 1;
-        int had = 0, idle = 0;
+        int had = 0;
         if (want > HTTP_MAX_REQ - 1) want = HTTP_MAX_REQ - 1;
         while (n < want) {
-            if (gen_stale(my_gen)) return;   /* 换代：服务器已停，不白等 */
-            int r = sceNetRecv(c, buf + n, (unsigned)(want - n), 0);
-            if (r > 0) { n += r; buf[n] = 0; had = 1; idle = 0; continue; }
-            if (r == 0 || sceKernelGetSystemTimeWide() >= dl) break;
-            if (!NET_AGAIN(r)) break;
-            if (had && ++idle > 20) break;    /* 收过数据后 ~100ms 没再来 → 完 */
+            SceLong64 lim;
+            int r;
             if (!had && cl64 <= 0) break;      /* 明确无体（无 CL）不空等 */
-            sceKernelDelayThread(NET_RETRY_DELAY_US);
+            lim = had ? sceKernelGetSystemTimeWide() + 400000LL : dl;
+            r = conn_read(cn, buf + n, want - n, lim, 0);
+            if (r > 0) { n += r; buf[n] = 0; had = 1; continue; }
+            break;                             /* 关闭/空窗超时/换代：补读结束 */
         }
     }
 
@@ -475,7 +486,7 @@ static void handle_conn(int c, const char *rip, int my_gen)
         strcmp(route, "/api/localsend/v2/info") == 0) {
         char out[HTTP_MAX_BODY];
         member_info_json(out, sizeof out);
-        http_respond(c, 200, "OK", out);
+        http_respond(cn, 200, "OK", out);
         return;
     }
     if (strcmp(method, "POST") == 0 &&
@@ -494,7 +505,7 @@ static void handle_conn(int c, const char *rip, int my_gen)
         {
             char out[HTTP_MAX_BODY];
             member_info_json(out, sizeof out);
-            http_respond(c, 200, "OK", out);
+            http_respond(cn, 200, "OK", out);
         }
         return;
     }
@@ -521,17 +532,17 @@ static void handle_conn(int c, const char *rip, int my_gen)
         if (cl64 > 0 && (SceLong64)got < cl64) {  /* 声称有体但没读齐 → 400 */
             dlog("http: prepare body short cl=%lld got=%d from %s",
                  (long long)cl64, got, rip);
-            http_respond(c, 400, "Bad Request", "");
+            http_respond(cn, 400, "Bad Request", "");
             return;
         }
         if (!recv_ops_ready()) {
-            http_respond(c, 500, "Internal Server Error", "");
+            http_respond(cn, 500, "Internal Server Error", "");
             return;
         }
         {
             int code = g_recv->prepare(body, rip, resp, (int)sizeof resp);
             dlog("http: prepare -> %d", code);
-            http_respond(c, code, reason_of(code), resp);
+            http_respond(cn, code, reason_of(code), resp);
         }
         return;
     }
@@ -553,8 +564,7 @@ static void handle_conn(int c, const char *rip, int my_gen)
         }
         if (cl64 < 0) cl64 = 0;
         memset(&uctx, 0, sizeof uctx);       /* 含 chunked 解码状态 */
-        uctx.fd = c;
-        uctx.gen = my_gen;
+        uctx.conn = *cn;                     /* fd + 所属代次 */
         uctx.left = left;
         uctx.llen = llen;
         if (cl64 <= 0) {                     /* 无 CL：dio 流式上传 → chunked */
@@ -563,7 +573,7 @@ static void handle_conn(int c, const char *rip, int my_gen)
             if (str_has_ci(te, "chunked")) uctx.chunked = 1;
         }
         if (!recv_ops_ready()) {
-            http_respond(c, 500, "Internal Server Error", "");
+            http_respond(cn, 500, "Internal Server Error", "");
             return;
         }
         if (uctx.chunked) {
@@ -573,16 +583,16 @@ static void handle_conn(int c, const char *rip, int my_gen)
             code = g_recv->upload(query, rip, cl64, upload_stream, &uctx);
         }
         dlog("http: upload -> %d", code);
-        http_respond(c, code, reason_of(code), "");
+        http_respond(cn, code, reason_of(code), "");
         return;
     }
     if (strcmp(method, "POST") == 0 &&
         strcmp(route, "/api/localsend/v2/cancel") == 0) {
         int code = recv_ops_ready() ? g_recv->cancel(query, rip) : 500;
-        http_respond(c, code, reason_of(code), "");
+        http_respond(cn, code, reason_of(code), "");
         return;
     }
-    http_respond(c, 404, "Not Found", "{\"error\":\"not found\"}");
+    http_respond(cn, 404, "Not Found", "{\"error\":\"not found\"}");
 }
 
 /* ---------- accept 线程 + 连接 worker ----------
@@ -620,9 +630,14 @@ static int conn_worker(SceSize args, void *argp)
         sceKernelExitDeleteThread(0);
         return 0;
     }
-    dlog("http: worker %d serves conn from %s (gen %d)",
-         (int)me, ip, my_gen);
-    handle_conn(c, ip, my_gen);
+    {
+        Conn cn;                     /* 本连接的读写句柄（TLS 化时在此挂上下文） */
+        cn.fd = c;
+        cn.gen = my_gen;
+        dlog("http: worker %d serves conn from %s (gen %d)",
+             (int)me, ip, my_gen);
+        handle_conn(&cn, ip, my_gen);
+    }
 
     conn_lock();
     for (i = 0; i < HTTP_MAX_CONN; i++) {
