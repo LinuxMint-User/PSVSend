@@ -1,6 +1,6 @@
 /* 页面：接收确认 / 接收设置（自 pages.c 拆出；纯搬移，行为不变）。
  * 含系统键盘"改名/改主机名"挂起事务（page_ime_pump）与"新接收请求自动弹窗"
- * （pages_tick/open_recv_request）。进度页本身在 pages.c（收发共用）。 */
+ * （pages_tick/open_recv_request）。进度页在 pages_progress.c（收发共用）。 */
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>

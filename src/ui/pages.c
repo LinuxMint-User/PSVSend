@@ -1,6 +1,6 @@
 /* 页面共享状态与开机流程。
  * 具体页面按职责分文件：
- *   pages_send.c      设备列表 / 文件浏览 / 发送确认
+ *   pages_send.c      发送主页（设备栏 + 已选文件栏）/ 文件浏览 / 发送等待
  *   pages_progress.c  进度页（发送/接收共用）
  *   pages_recv.c      接收确认 / 接收设置（含系统键盘改名）
  *   pages_settings.c  设置 / 目录选择
