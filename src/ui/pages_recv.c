@@ -173,7 +173,8 @@ void page_recv_confirm_render(void)
      * Reject」，两个键都显示，文案不重复。 */
     HintSeg segs[6] = { 0 };
     int ns = 0;
-    segs[ns].icon = HICON_DPAD;       segs[ns++].text = tr("Switch");
+    segs[ns].icon = HICON_DPAD;  segs[ns].dir_off = HDIR_VERT;
+    segs[ns++].text = tr("Switch");
     if (recv_focus == 0) {
         segs[ns].icon  = icon_confirm();
         segs[ns].icon2 = icon_back();
@@ -541,7 +542,12 @@ void page_recv_setup_render(void)
 
     HintSeg segs[8] = { 0 };
     int ns = 0;
-    segs[ns].icon = HICON_DPAD;       segs[ns++].text = tr("Choose");
+    /* 上下选行：选到首/末行时把方向键对应臂画灰 */
+    uint8_t off = HDIR_HORZ;
+    if (g_app.inc_sel <= 0)          off |= HDIR_UP;
+    if (g_app.inc_sel >= rows - 1)   off |= HDIR_DOWN;
+    segs[ns].icon = HICON_DPAD;       segs[ns].dir_off = off;
+    segs[ns++].text = tr("Choose");
     segs[ns].icon = icon_confirm();   segs[ns++].text = tr("Toggle");
     segs[ns].icon = HICON_TRIANGLE;   segs[ns++].text = tr("Rename");
     segs[ns].icon = icon_back();      segs[ns++].text = tr("Back");

@@ -360,8 +360,19 @@ void page_devices_render(void)
     HintSeg segs[6] = { 0 };
     int ns = 0;
     segs[ns].icon = HICON_NONE;       segs[ns++].text = tr("SELECT Settings");
-    segs[ns].icon = HICON_LEFT;       segs[ns++].text = NULL;
-    segs[ns].icon = HICON_RIGHT;      segs[ns++].text = tr("Switch");
+    /* 十字键两条：左右切栏（两栏恒可切），上下在焦点栏内移动选中
+     * （选到该栏首/末项时对应臂画灰，读起来就是"到头了"） */
+    segs[ns].icon = HICON_DPAD;       segs[ns].dir_off = HDIR_VERT;
+    segs[ns++].text = tr("Switch");
+    {
+        int cnt = g_app.pane_focus == 0 ? g_app.dev_count : g_app.picked_count;
+        int sel = g_app.pane_focus == 0 ? g_app.dev_sel : g_app.picked_sel;
+        uint8_t off = HDIR_HORZ;
+        if (sel <= 0)       off |= HDIR_UP;
+        if (sel >= cnt - 1) off |= HDIR_DOWN;
+        segs[ns].icon = HICON_DPAD;   segs[ns].dir_off = off;
+        segs[ns++].text = tr("Choose");
+    }
     segs[ns].icon = HICON_SQUARE;     segs[ns++].text = tr("Select files");
     segs[ns].icon = icon_confirm();
     /* 确认键语义随焦点栏变化：设备栏=发送（一台设备都没有则灰掉）；
@@ -446,7 +457,7 @@ void page_devices_input(const Input *in)
             unpick_all();
     }
     if (in->menu) {
-        g_app.set_sel = 0;
+        settings_open();
         g_app.page = PAGE_SETTINGS;
     }
 }
@@ -657,8 +668,12 @@ void page_files_render(void)
     /* 固定提示靠左、随层级/全选状态变的靠右（变动的只推自己右侧，不推左边）。
      * 空目录里没有可选项：选择/打开/全选都灰掉 */
     bool has = count > 0;
+    /* 上下选文件：选到首/末行时把方向键对应臂画灰 */
+    uint8_t off = HDIR_HORZ;
+    if (g_app.file_sel <= 0)         off |= HDIR_UP;
+    if (g_app.file_sel >= count - 1) off |= HDIR_DOWN;
     segs[ns].icon = HICON_DPAD;       segs[ns].dim = !has;
-    segs[ns++].text = tr("Choose");
+    segs[ns].dir_off = off;           segs[ns++].text = tr("Choose");
     segs[ns].icon = icon_confirm();   segs[ns].dim = !has;
     segs[ns++].text = tr("Open/Pick");
     segs[ns].icon = HICON_SQUARE;     segs[ns++].text = tr("Done");

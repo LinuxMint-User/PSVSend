@@ -63,6 +63,16 @@ static int set_press_scroll = 0;
 /* 供 pages_warm_all 预热设置页：设置内容滚动偏移（0=顶，大值=由 render 夹到底） */
 void settings_scroll_to(int v) { set_scroll = v; }
 
+/* 进设置页：焦点落在第一个设置项（主机名），滚动回顶部。
+ * 不能直接置 set_sel = 0——枚举值 0 是 SET_ITEM_THEME，而页面从上到下的第一项
+ * 是主机名，置 0 会把焦点丢到页面中部的"主题"行上。 */
+void settings_open(void)
+{
+    g_app.set_sel = SET_ITEM_HOSTNAME;
+    set_scroll = 0;
+    set_press_scroll = 0;
+}
+
 static int slot_item(int slot)
 {
     switch (slot) {
@@ -317,8 +327,21 @@ void page_settings_render(void)
 
     HintSeg segs[6] = { 0 };
     int ns = 0;
-    segs[ns].icon = HICON_DPAD;      segs[ns++].text = tr("Choose");
-    segs[ns].icon = icon_confirm();  segs[ns++].text = tr("Change");
+    /* 上下移动选中项：哪一头按不动就把方向键那一臂画灰（列表到顶/到底）。
+     * 焦点在"确认键布局"项时，上下选择照旧，只是"改值"那一段从确认键换成左右方向键。 */
+    uint8_t off = HDIR_HORZ;
+    int sl = item_slot(g_app.set_sel);
+    if (sl < 0 || slot_step(sl, -1) == sl) off |= HDIR_UP;
+    if (sl < 0 || slot_step(sl, 1) == sl)  off |= HDIR_DOWN;
+    segs[ns].icon = HICON_DPAD;      segs[ns].dir_off = off;
+    segs[ns++].text = tr("Choose");
+    if (g_app.set_sel == SET_ITEM_KEY) {
+        segs[ns].icon = HICON_DPAD;  segs[ns].dir_off = HDIR_VERT;
+        segs[ns++].text = tr("Switch");
+    } else {
+        segs[ns].icon = icon_confirm();
+        segs[ns++].text = tr("Change");
+    }
     segs[ns].icon = icon_back();     segs[ns++].text = tr("Back");
     w_page_footer_segs(segs, ns);
 }
@@ -355,12 +378,18 @@ void page_settings_input(const Input *in)
         g_app.set_sel = slot_item(slot);
         set_keep_visible();
     }
-    if (in->left || in->right || in->confirm) {
+    /* 一般项用确认键改值；"确认键布局"项是唯一的自指设置（改的就是确认键本身，
+     * 切完按键身份就换了，用确认键去切有认知负担），故只用左右方向键切换，
+     * 确认键对它不响应。触摸左右半边改值的方式保持不变。 */
+    if (g_app.set_sel == SET_ITEM_KEY && (in->left || in->right))
+        settings_change(SET_ITEM_KEY, in->right ? 1 : -1);
+    if (in->confirm) {
         int item = g_app.set_sel;
         if (item == SET_ITEM_HOSTNAME) ask_ime_host();
         else if (item == SET_ITEM_SAVEDIR)
             open_dir_pick(PAGE_SETTINGS, true, g_cfg.save_dir);
-        else settings_change(item, in->left ? -1 : 1);
+        else if (item != SET_ITEM_KEY)
+            settings_change(item, 1);
     }
     if (in->back) g_app.page = PAGE_DEVICES;
 }
@@ -466,8 +495,11 @@ void page_dir_pick_render(void)
     int ns = 0;
     /* 空目录里没有可选项：选择/打开灰掉 */
     bool has = dpick_dcount > 0;
+    uint8_t off = HDIR_HORZ;
+    if (g_app.file_sel <= 0)                off |= HDIR_UP;
+    if (g_app.file_sel >= dpick_dcount - 1) off |= HDIR_DOWN;
     segs[ns].icon = HICON_DPAD;      segs[ns].dim = !has;
-    segs[ns++].text = tr("Choose");
+    segs[ns].dir_off = off;          segs[ns++].text = tr("Choose");
     segs[ns].icon = icon_confirm();  segs[ns].dim = !has;
     segs[ns++].text = tr("Open");
     segs[ns].icon = HICON_SQUARE;    segs[ns++].text = tr("Save here");

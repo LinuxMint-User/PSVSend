@@ -166,6 +166,7 @@ void goto_devices(void);            /* pages_progress.c：回设备页并复位�
 void open_dir_pick(PageId origin, bool persist, const char *start_dir); /* pages_settings.c */
 void ask_ime_host(void);            /* pages_recv.c：打开系统键盘改本机设备名（设置页主机名行用） */
 void settings_scroll_to(int v);     /* pages_settings.c：设置页滚动偏移（开机预热用） */
+void settings_open(void);           /* pages_settings.c：进设置页（焦点回首项、滚动归顶） */
 
 /* ---------- 跨页共享状态 ---------- */
 /* 进度页当前文件清单：发送时每帧由 xfer 快照覆盖；接收由 start_recv 先以本地

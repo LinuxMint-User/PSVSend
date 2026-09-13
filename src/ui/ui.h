@@ -42,16 +42,31 @@ typedef enum {
     HICON_TRIANGLE, /* 三角键 */
     HICON_SQUARE,   /* 方块键 */
     HICON_START,    /* START */
-    HICON_DPAD,     /* 方向键（十字） */
-    HICON_UP, HICON_DOWN, HICON_LEFT, HICON_RIGHT, /* 单个方向箭头 */
+    HICON_DPAD,     /* 方向键（十字）：按 HintSeg.dir_off 分亮臂/灰臂 */
     HICON_COUNT
 } HintIcon;
+
+/* 方向键提示的"灭臂"掩码位（HintSeg.dir_off）：标出当前按不动的方向，画成灰臂。
+ * 0 = 四向全亮（默认）——把"全亮"取作 0，使 `= { 0 }` 零初始化安全：
+ * 页面忘了设也只是多亮几臂，不会凭空把方向键画暗。 */
+#define HDIR_UP    0x1
+#define HDIR_DOWN  0x2
+#define HDIR_LEFT  0x4
+#define HDIR_RIGHT 0x8
+#define HDIR_VERT  (HDIR_UP | HDIR_DOWN)
+#define HDIR_HORZ  (HDIR_LEFT | HDIR_RIGHT)
 
 /* 一段按键提示。dim=true：该动作当前不可用（画成灰字灰图标，避免误导）。
  * icon2 != HICON_NONE：该段是"两个键同一个动作"，画成「icon / icon2 文案」，
  * 两个键都显示出来，动作文案只写一次。
- * 注意：HintSeg 数组请用 `= { 0 }` 初始化，否则 dim/icon2 是未初始化值。 */
-typedef struct { HintIcon icon; HintIcon icon2; const char *text; bool dim; } HintSeg;  /* text 可空：只画图标 */
+ * dir_off 仅对 HICON_DPAD 有意义，见上方 HDIR_* 说明。
+ * 注意：HintSeg 数组请用 `= { 0 }` 初始化，否则各字段是未初始化值。 */
+typedef struct {
+    HintIcon icon, icon2;
+    const char *text;   /* 可空：只画图标 */
+    bool dim;
+    uint8_t dir_off;    /* 方向键灰掉的方向（0 = 全亮） */
+} HintSeg;
 
 void w_clear(void);                  /* 每帧开始清空命中表 */
 void w_add(int id, Rect r);          /* 页面绘制时注册可触摸区域 */

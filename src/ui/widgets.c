@@ -242,24 +242,27 @@ void w_icon_cross(float cx, float cy, float r, uint32_t c)
     thick_seg(cx - r, cy + r, cx + r, cy - r, c);
 }
 
-static void w_icon(HintIcon ic, float cx, float cy, uint32_t c)
+static void w_icon(HintIcon ic, float cx, float cy, uint32_t c, uint8_t dir_off)
 {
     switch (ic) {
     case HICON_CROSS:
         w_icon_cross(cx, cy, 8.0f, c);
         break;
     case HICON_CIRCLE:
+        /* 环宽 2.5px：与 thick_seg 画的叉/三角线宽（≈2.6px）一致 */
         vita2d_draw_fill_circle(cx, cy, 9.0f, c);
-        vita2d_draw_fill_circle(cx, cy, 5.5f, theme->bg);
+        vita2d_draw_fill_circle(cx, cy, 6.5f, theme->bg);
         break;
     case HICON_TRIANGLE:
-        thick_seg(cx, cy - 10, cx - 9, cy + 7, c);
-        thick_seg(cx, cy - 10, cx + 9, cy + 7, c);
-        thick_seg(cx - 9, cy + 7, cx + 9, cy + 7, c);
+        /* 几何中心对准 (cx,cy)：原 -10..+7 上下不对称，视觉偏上 1.5px */
+        thick_seg(cx, cy - 9, cx - 9, cy + 8, c);
+        thick_seg(cx, cy - 9, cx + 9, cy + 8, c);
+        thick_seg(cx - 9, cy + 8, cx + 9, cy + 8, c);
         break;
     case HICON_SQUARE:
+        /* 边框 3px：与 thick_seg 线宽接近（原 4px 明显偏粗） */
         w_rect((Rect){ (int)cx - 9, (int)cy - 9, 18, 18 }, c);
-        w_rect((Rect){ (int)cx - 5, (int)cy - 5, 10, 10 }, theme->bg);
+        w_rect((Rect){ (int)cx - 6, (int)cy - 6, 12, 12 }, theme->bg);
         break;
     case HICON_START:
         /* 横向胶囊：填充 + 两条竖向挖空 */
@@ -267,30 +270,29 @@ static void w_icon(HintIcon ic, float cx, float cy, uint32_t c)
         w_rect((Rect){ (int)cx - 9, (int)cy - 7, 3, 14 }, theme->bg);
         w_rect((Rect){ (int)cx + 6, (int)cy - 7, 3, 14 }, theme->bg);
         break;
-    case HICON_DPAD:
-        w_rect((Rect){ (int)cx - 3, (int)cy - 10, 6, 20 }, c);
-        w_rect((Rect){ (int)cx - 10, (int)cy - 3, 20, 6 }, c);
+    case HICON_DPAD: {
+        /* 旋转 45° 的空心菱形（描边），在四条边中点附近切开成四份、各占一个角，
+         * 中心留空。切缝从中点向两侧各让出 s，四份之间才有明显空隙。
+         * 每份按 dir_off 分色——可用份主色，灭份 border 灰，
+         * 灭份用来表示"这个方向当前按不动"（列表滚到顶/到底等）。 */
+        uint32_t offc = theme->border;
+        const float R = 11.0f;   /* 顶点到中心 */
+        const float q = 5.5f;    /* 边中点相对中心的坐标（= R/2），切缝基准 */
+        const float s = 2.0f;    /* 切缝：每份沿边从中点让出的距离 */
+        uint32_t uc = (dir_off & HDIR_UP)    ? offc : c;
+        uint32_t dc = (dir_off & HDIR_DOWN)  ? offc : c;
+        uint32_t lc = (dir_off & HDIR_LEFT)  ? offc : c;
+        uint32_t rc = (dir_off & HDIR_RIGHT) ? offc : c;
+        thick_seg(cx, cy - R, cx - (q - s), cy - (q + s), uc);   /* 上角 */
+        thick_seg(cx, cy - R, cx + (q - s), cy - (q + s), uc);
+        thick_seg(cx + R, cy, cx + (q + s), cy - (q - s), rc);   /* 右角 */
+        thick_seg(cx + R, cy, cx + (q + s), cy + (q - s), rc);
+        thick_seg(cx, cy + R, cx - (q - s), cy + (q + s), dc);   /* 下角 */
+        thick_seg(cx, cy + R, cx + (q - s), cy + (q + s), dc);
+        thick_seg(cx - R, cy, cx - (q + s), cy - (q - s), lc);   /* 左角 */
+        thick_seg(cx - R, cy, cx - (q + s), cy + (q - s), lc);
         break;
-    case HICON_UP:
-        thick_seg(cx, cy + 9, cx, cy + 1, c);        /* 箭杆 */
-        thick_seg(cx, cy - 10, cx - 7, cy + 1, c);   /* 箭头 */
-        thick_seg(cx, cy - 10, cx + 7, cy + 1, c);
-        break;
-    case HICON_DOWN:
-        thick_seg(cx, cy - 9, cx, cy - 1, c);
-        thick_seg(cx, cy + 10, cx - 7, cy - 1, c);
-        thick_seg(cx, cy + 10, cx + 7, cy - 1, c);
-        break;
-    case HICON_LEFT:
-        thick_seg(cx + 9, cy, cx + 1, cy, c);
-        thick_seg(cx - 10, cy, cx + 1, cy - 7, c);
-        thick_seg(cx - 10, cy, cx + 1, cy + 7, c);
-        break;
-    case HICON_RIGHT:
-        thick_seg(cx - 9, cy, cx - 1, cy, c);
-        thick_seg(cx + 10, cy, cx - 1, cy - 7, c);
-        thick_seg(cx + 10, cy, cx - 1, cy + 7, c);
-        break;
+    }
     default:
         break;
     }
@@ -305,7 +307,10 @@ void w_page_footer_segs(const HintSeg *segs, int n)
     w_rect(f, theme->bg);
     w_rect((Rect){ 0, f.y, SCR_W, 2 }, theme->border);
     int x = 28, i;
-    int cy = f.y + 18;   /* 图标中心，与文字(顶 y+12)的水平中心对齐，略高于条带中线 */
+    /* 图标中心对准文字的字形视觉中线：1.0 号字 20px、升部 0.81em，文字顶在
+     * y+12（= f.y+12）→ 基线 f.y+28.2，满格字形视觉中心 ≈ f.y+20.1
+     * （拉丁大写略低约 1px，取 20 折中）。 */
+    int cy = f.y + 20;
     for (i = 0; i < n; i++) {
         int has_icon = segs[i].icon != HICON_NONE;
         int adv = 0;
@@ -313,13 +318,13 @@ void w_page_footer_segs(const HintSeg *segs, int n)
         uint32_t ic_c = segs[i].dim ? theme->border : theme->text;
         uint32_t tx_c = segs[i].dim ? theme->border : theme->text_dim;
         if (has_icon) {
-            w_icon(segs[i].icon, x + 11, cy, ic_c);
+            w_icon(segs[i].icon, x + 11, cy, ic_c, segs[i].dir_off);
             adv = 26;
             if (segs[i].icon2 != HICON_NONE) {
                 /* 第二个键：与第一个隔开，中间一个小号暗淡的 "/" 表示"或" */
                 int sw = 0;
                 w_text_w(0.9f, "/", &sw, NULL);
-                w_icon(segs[i].icon2, x + 42, cy, ic_c);
+                w_icon(segs[i].icon2, x + 42, cy, ic_c, segs[i].dir_off);
                 w_text(x + 26 - sw / 2, f.y + 12, 0.9f, tx_c, "/");
                 adv = 57;
             }
