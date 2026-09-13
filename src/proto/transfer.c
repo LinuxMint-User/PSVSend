@@ -505,6 +505,16 @@ static int conn_open(Conn *c, const char *method_path, SceOff body_len)
         c->fd = -1;
         return -1;
     }
+    /* 连接建立后置非阻塞：本文件的收发都按"无数据/无窗口 → EWOULDBLOCK →
+     * 20ms 轮询到截止"模型写（conn_send_all / conn_recv_poll）。socket 若保持
+     * 阻塞，recv 会一直挂到对端应答——等待接收方"接受/拒绝"的长窗口里取消
+     * 标志根本轮询不到，用户取消无效（真机现象）；发送窗口堵死时同理。connect
+     * 本身仍是阻塞语义（返回 0 即已建立），故只对已建立的连接生效。 */
+    if (r == 0) {
+        int one = 1;
+        sceNetSetsockopt(c->fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
+                         &one, sizeof one);
+    }
     if (c->tls) {
         r = tls_handshake(c);
         if (r == -2) {
