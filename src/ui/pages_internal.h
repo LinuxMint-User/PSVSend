@@ -86,8 +86,17 @@ static inline void add_row_hit(int id, int top)
 void files_load(void);          /* pages.c：按 cur_dir 重载 g_app.files */
 void enter_dir(const char *name);   /* pages.c：进入子目录并重载 */
 void parent_dir(void);              /* pages.c：回上级目录（根则退回设备页） */
+void goto_devices(void);            /* pages.c：回设备页并复位传输态（接收收尾/离开进度页用） */
 void open_dir_pick(PageId origin, bool persist, const char *start_dir); /* pages_settings.c */
-void ask_ime_host(void);            /* pages.c：打开系统键盘改本机设备名（设置页主机名行用） */
+void ask_ime_host(void);            /* pages_recv.c：打开系统键盘改本机设备名（设置页主机名行用） */
 void settings_scroll_to(int v);     /* pages_settings.c：设置页滚动偏移（开机预热用） */
+
+/* ---------- 跨页共享状态 ---------- */
+/* 进度页当前文件清单：发送时每帧由 xfer 快照覆盖；接收由 start_recv 先以本地
+ * 清单兜底首帧、再由 receive 会话快照覆盖（定义在 pages.c）。 */
+extern int    xf_count;
+extern char   xf_name[MAX_PICKED][128];
+extern SceOff xf_size[MAX_PICKED];
+extern int    xf_scroll;
 
 #endif
