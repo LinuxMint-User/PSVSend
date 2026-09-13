@@ -240,7 +240,8 @@ void ui_run(void)
         vita2d_wait_rendering_done();  /* sceGxmFinish：等 GPU 本帧命令全部执行完再开下一帧。
                                         * 缺此调用时渲染/显示队列长期高速超前回绕，可出现画面
                                         * 撕裂进而 GPU render crash（跨版本偶发、撕裂先兆）。 */
-        api_poke();          /* 断网活性刺激：可能在 Wi-Fi 重连时阻塞数秒，
-                              * 放 swap 之后，停顿期间屏幕保持当前帧 */
+        api_poke();          /* 断网活性刺激（d65 起非阻塞）：促使系统快速重连 Wi-Fi。
+                              * 旧的阻塞实现在重连过渡态会卡住主循环约 2s（UI 连同
+                              * 按键一起停摆），详见 net_poke / api_poke 注释。 */
     }
 }

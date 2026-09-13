@@ -197,19 +197,27 @@ int net_ctl_err(void)  { return g_ctl_err; }
 int net_ctl_state(void){ return g_ctl_st; }
 
 /* 断网期间的"活性刺激"：向组播 239.255.255.250 发一包 UDP。
- * 目的不是连通（无关联/无 IP 时必然失败或等待链路）——而是让无线驱动层感知
- * "有应用在要网络"，促使待机省电断开的热点自动重连。
- * 只能在主线程调用（Vita 的 UDP sendto 离开主线程会无限卡死）；Wi-Fi 正在重连
- * 时本调用会阻塞到链路可用（真机数秒），调用方（api_tick）需容忍该停顿。
+ * 目的不是连通——而是让无线驱动层感知"有应用在要网络"，促使待机省电断开的热点
+ * 自动重连。这是系统级唤醒，与应用级状态恢复（api_watch 看门狗）职责不同，不可
+ * 互相替代。只能在主线程调用（Vita 的 UDP sendto 离开主线程会无限卡死）。
+ * socket 置非阻塞（SCE_NET_SO_NBIO）：d64 真机日志实证两种断网场景差异——
+ *   · Wi-Fi 完全关闭、接口已被系统拆掉：阻塞式 sendto 也是 20ms 级立即失败；
+ *   · Wi-Fi 重连过渡态（netctl 报 CONNECTING / 取 IP，接口在但未就绪）：
+ *     阻塞式 sendto 会等路由就绪约 2s，把主循环连同按键输入一起钉死
+ *     （同期 ui: beat 心跳缺拍），这才是"断网时界面卡住"的真凶。
+ * 改非阻塞后两种场景都不再占住 UI：发不出去就跳过本轮，等接口就绪
+ * （实测 ctl=2 起可成功发出）下一拍自然命中；间隔见 api_poke。
  * 只要求 SceNet 栈（g_step&2）就绪：netctl 客户端没起来（Wi-Fi 全关时常见）
  * 不代表不能发包唤醒，故不以 g_state 整体作闸。 */
 int net_poke(void)
 {
     SceNetSockaddrIn a;
-    int fd, r;
+    int fd, r, so_nbio = 1;
     if ((g_step & 2) == 0) return -2;     /* SceNet 栈没起来：poke 无意义 */
     fd = sceNetSocket("psvsend_wake", SCE_NET_AF_INET, SCE_NET_SOCK_DGRAM, 0);
     if (fd < 0) return fd;
+    sceNetSetsockopt(fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
+                     &so_nbio, sizeof so_nbio);
     memset(&a, 0, sizeof a);
     a.sin_len = sizeof a;
     a.sin_family = SCE_NET_AF_INET;

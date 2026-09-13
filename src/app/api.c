@@ -22,6 +22,8 @@
 #include "core/dlog.h"
 
 #define DISC_RETRY_MS 2000           /* 发现失败后的重试冷却 */
+#define POKE_INTERVAL_MS 1000        /* 断网活性刺激间隔（d65）：发包非阻塞后靠高频
+                                      * 重试命中"接口就绪"窗口，见 api_poke */
 
 /* 一次巡检。由 api_start（首次同步）与 api_watch 线程调用。
  * 链路自愈（Q2）：待机唤醒/断线重连后，旧监听 socket 与 UDP 发送 socket 可能
@@ -138,7 +140,7 @@ static void watch_once(void)
 /* UI 主循环每帧调用（循环顶部）：500ms 节流喂一次 announce 节奏。
  * 发送 socket 与 sendto 都在主线程上——Vita SceNet 的 UDP sendto 离开主线程
  * 会无限卡死，勿移到后台线程。announce socket 已设非阻塞，此处不会阻塞渲染；
- * 断网活性刺激（会阻塞数秒的唤醒包）单独放 api_poke()，由主循环在 swap 后调用。 */
+ * 断网活性刺激（非阻塞唤醒包，见 net_poke）单独放 api_poke()，主循环 swap 后调用。 */
 void api_tick(void)
 {
     static uint64_t last_ms = 0;
@@ -149,17 +151,19 @@ void api_tick(void)
 }
 
 /* UI 主循环每帧调用（一帧渲染完、swap 之后）：断网时的"活性刺激"。
- * 每 4s 发一包出站 UDP，让系统感知"应用仍需网络"，促使待机省电断开的热点
- * 自动重连（链路恢复后本分支自然停发）。Wi-Fi 正在重连时该 sendto 会阻塞到
- * 链路可用（真机数秒）——放在 swap 之后，停顿期间屏幕保持当前帧，恢复后继续。 */
+ * 每 POKE_INTERVAL_MS 试发一包出站 UDP，让系统感知"应用仍需网络"，促使待机省电
+ * 断开的热点自动重连（链路恢复后本分支自然停发）。非阻塞（见 net_poke 注释）：
+ * d64 之前此处用阻塞 socket，Wi-Fi 重连过渡态每次占住主线程约 2s（UI 连同按键
+ * 一起卡死）；改非阻塞后靠 1s 高频重试命中"接口就绪"窗口，单次发包只占 μs~ms 级。
+ * 仍放 swap 之后：非为规避阻塞，只是按本帧顺序收尾。 */
 void api_poke(void)
 {
     static uint64_t last_poke_ms = 0;
     uint64_t now = (uint64_t)sceKernelGetSystemTimeWide() / 1000;
-    if (net_connected() || now - last_poke_ms < 4000) return;
+    if (net_connected() || now - last_poke_ms < POKE_INTERVAL_MS) return;
     last_poke_ms = now;
     {
-        dlog("net: poke begin (ctl_st=%d)", net_ctl_state());  /* 诊断：若发不出去会阻塞 */
+        dlog("net: poke begin (ctl_st=%d)", net_ctl_state());  /* begin→-> 时差 = 本次占主线程时长 */
         int pr = net_poke();              /* -2 = SceNet 栈未就绪，不发（静默） */
         if (pr != -2)
             dlog("net: poke -> 0x%08X (ctl_st=%d)",
@@ -199,7 +203,7 @@ void api_start(void)
     int r;
     config_init();                       /* 先建目录/读配置（dlog 目录依赖它） */
     dlog_init();
-    dlog("== psvsend boot [TAG:d63] ==");
+    dlog("== psvsend boot [TAG:d65] ==");
     {
         /* 版本标记 + 设备身份指纹：确认刷入的固件含 mTLS 客户端证书 */
         char f[65];
