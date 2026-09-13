@@ -6,6 +6,7 @@
 
 #include <stdbool.h>
 #include "net/device.h"        /* Device / DEVICE_MAX（类型住 net 层，见 device.h） */
+#include "proto/transfer.h"    /* XferFile / XferInfo / XFER_MAX_FILES：发送契约数据类型 */
 
 /* 启动后端：config_init + net_start + discovery_start（各模块内部幂等）。
  * 后台线程自理：api_watch（500ms 巡检重试）+ http（收对方 register/info）。
@@ -43,5 +44,18 @@ int  api_scan_active(void);          /* 1=正在扫 0=空闲 */
 int  api_scan_done(void);            /* 本轮已探主机数（active 时有效） */
 int  api_scan_total(void);           /* 本轮待探主机数（active 时有效） */
 int  api_scan_found(void);           /* 本轮发现的设备数 */
+
+/* ---- UI 门面：发送（proto/transfer.c） ----
+ * 发送数据类型（XferFile/XferInfo/XFER_MAX_FILES）随本契约暴露，UI 不再
+ * 直接 include proto/transfer.h。以下均为薄转发。 */
+
+/* 启动发送：目标 ip/port/协议/指纹 + 文件列表；<0=参数非法/已在传输中
+ * （失败原因写进快照，UI 照常展示） */
+int  api_send_start(const char *ip, int port, const char *proto, const char *fp,
+                    const XferFile *files, int n);
+/* 请求取消发送：置标志，后台线程轮询到后尽快收尾 */
+void api_send_cancel(void);
+/* 锁内拷贝当前发送快照（每帧可调；线程结束后保留最后一次状态） */
+void api_send_info(XferInfo *out);
 
 #endif

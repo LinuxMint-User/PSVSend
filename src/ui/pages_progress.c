@@ -11,7 +11,7 @@
 #include "ui/pages_internal.h"
 #include "ui/theme.h"
 #include "core/i18n.h"
-#include "proto/transfer.h"
+#include "app/api.h"
 #include "proto/receive.h"
 
 /* 传输页：文件列表区域与总进度布局（发送/接收共用） */
@@ -43,7 +43,7 @@ void page_progress_render(void)
 
     if (g_app.prog_dir == 0) {
         /* 发送路径（真实）：从 xfer 模块拷快照映射到行显示数组 */
-        xfer_info(&xv);
+        api_send_info(&xv);
         xf_count = xv.count > MAX_PICKED ? MAX_PICKED : xv.count;
         for (i = 0; i < xf_count; i++) {
             snprintf(xf_name[i], sizeof xf_name[0], "%s",
@@ -265,7 +265,7 @@ void page_progress_input(const Input *in)
         int id = w_hit(in->tap_x, in->tap_y);
         if (id == 1) {   /* 主按钮：传输中取消，否则退出 */
             if (g_app.prog_running) {
-                if (g_app.prog_dir == 0) xfer_cancel();
+                if (g_app.prog_dir == 0) api_send_cancel();
                 else recv_abort();
             } else {
                 progress_leave();
@@ -277,7 +277,7 @@ void page_progress_input(const Input *in)
     }
     if (in->confirm || in->back) {
         if (g_app.prog_running) {
-            if (g_app.prog_dir == 0) xfer_cancel();
+            if (g_app.prog_dir == 0) api_send_cancel();
             else recv_abort();
         } else {
             progress_leave();

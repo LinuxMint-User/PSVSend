@@ -15,7 +15,6 @@
 #include "ui/theme.h"
 #include "core/i18n.h"
 #include "app/api.h"
-#include "proto/transfer.h"
 
 static int dev_scroll = 0;        /* 设备列表内容像素偏移 */
 static int file_scroll = 0;       /* 文件列表内容像素偏移 */
@@ -421,13 +420,13 @@ static void start_send(void)
     if (g_app.dev_target >= 0 && g_app.dev_target < g_app.dev_count &&
         g_app.dev_ip[g_app.dev_target][0]) {
         int t = g_app.dev_target;
-        xfer_start(g_app.dev_ip[t], g_app.dev_port[t],
-                   g_app.dev_proto[t], g_app.dev_fp[t], ff, n);
+        api_send_start(g_app.dev_ip[t], g_app.dev_port[t],
+                       g_app.dev_proto[t], g_app.dev_fp[t], ff, n);
     } else {
-        /* 目标失效（如设备刚离线）：xfer_start 会把失败原因写进快照，进度页显示 */
+        /* 目标失效（如设备刚离线）：api_send_start 会把失败原因写进快照，进度页显示 */
         XferFile dummy;
         memset(&dummy, 0, sizeof dummy);
-        xfer_start("", 0, "http", "", &dummy, 1);
+        api_send_start("", 0, "http", "", &dummy, 1);
     }
     g_app.page = PAGE_PROGRESS;
 }

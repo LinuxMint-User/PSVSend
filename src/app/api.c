@@ -17,6 +17,7 @@
 #include "net/http.h"
 #include "net/discovery.h"
 #include "net/scan.h"
+#include "proto/transfer.h"
 #include "proto/receive.h"
 #include "app/api.h"
 #include "net/identity.h"
@@ -204,7 +205,7 @@ void api_start(void)
     int r;
     config_init();                       /* 先建目录/读配置（dlog 目录依赖它） */
     dlog_init();
-    dlog("== psvsend boot [TAG:d74] ==");
+    dlog("== psvsend boot [TAG:d75] ==");
     {
         /* 版本标记 + 设备身份指纹：确认刷入的固件含 mTLS 客户端证书 */
         char f[65];
@@ -291,4 +292,21 @@ int api_scan_total(void)
 int api_scan_found(void)
 {
     return scan_found();
+}
+
+/* ---- UI 门面：发送（均为薄转发，见 api.h） ---- */
+int api_send_start(const char *ip, int port, const char *proto, const char *fp,
+                   const XferFile *files, int n)
+{
+    return xfer_start(ip, port, proto, fp, files, n);
+}
+
+void api_send_cancel(void)
+{
+    xfer_cancel();
+}
+
+void api_send_info(XferInfo *out)
+{
+    xfer_info(out);
 }
