@@ -29,4 +29,19 @@ int  api_discovery_state(void);
 /* 失败定位（"步骤 错误码"，如 "join 224.0.0.167 0x8041010D"；未失败返回 ""） */
 const char *api_discovery_fail(void);
 
+/* ---- UI 门面：链路状态 + 主动扫描 ----
+ * r5：UI 只经本契约调后端，不再直接 include net/ 内部头。以下均为薄转发。 */
+
+/* 链路/网络状态（读 net_poll 刷新的缓存，不做系统调用，UI 每帧可调） */
+bool api_link_up(void);              /* 是否已连上 Wi-Fi */
+int  api_ctl_state(void);            /* 最近一次 net_poll 的状态值（诊断） */
+const char *api_local_ip(void);      /* 本机 IP（静态缓冲；未就绪为 "0.0.0.0"） */
+
+/* 主动扫描设备（net/scan.c）：触发一轮 / 查询进度与结果 */
+void api_scan_trigger(void);         /* 三角键手动扫网段；已在扫时顺延一轮 */
+int  api_scan_active(void);          /* 1=正在扫 0=空闲 */
+int  api_scan_done(void);            /* 本轮已探主机数（active 时有效） */
+int  api_scan_total(void);           /* 本轮待探主机数（active 时有效） */
+int  api_scan_found(void);           /* 本轮发现的设备数 */
+
 #endif

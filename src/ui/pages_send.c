@@ -14,10 +14,8 @@
 #include "ui/pages_internal.h"
 #include "ui/theme.h"
 #include "core/i18n.h"
-#include "net/net.h"
 #include "app/api.h"
 #include "proto/transfer.h"
-#include "net/scan.h"
 
 static int dev_scroll = 0;        /* 设备列表内容像素偏移 */
 static int file_scroll = 0;       /* 文件列表内容像素偏移 */
@@ -68,8 +66,8 @@ static void dev_sync(void)
 static void dev_scan_strip(void)
 {
     uint64_t now = (uint64_t)sceKernelGetSystemTimeWide();
-    if (scan_active()) {
-        int d = scan_done(), t = scan_total(), f = g_app.dev_count;
+    if (api_scan_active()) {
+        int d = api_scan_done(), t = api_scan_total(), f = g_app.dev_count;
         char st[96];
         if (t <= 0) t = 254;
         if (d < 0 || d > t) d = 0;
@@ -81,7 +79,7 @@ static void dev_scan_strip(void)
     } else if (dev_scan_was) {        /* round 结束边沿：记时刻与结果 */
         dev_scan_was = 0;
         dev_scan_end_us = now;
-        /* 以"表里现有设备数"为准（而非仅主动探测的 scan_found()）：
+        /* 以"表里现有设备数"为准（而非仅主动探测的 api_scan_found()）：
          * 扫描期间入表的既可能有探测命中，也可能有设备自己发的 register，
          * round 结束时列表里实际有几台就报几台，横幅才不与列表矛盾 */
         dev_scan_last_found = g_app.dev_count;
@@ -131,10 +129,10 @@ void page_devices_render(void)
                 w_text(28, LIST_TOP + 48, 1.0f, theme->text_dim, "%s",
                        tr("Waiting for Wi-Fi to come back up..."));
             }
-        } else if (!net_connected()) {
+        } else if (!api_link_up()) {
             w_text(28, LIST_TOP + 10, 1.15f, theme->text, "%s",
                    tr("Wi-Fi link is down."));
-        } else if (scan_active()) {
+        } else if (api_scan_active()) {
             w_text(28, LIST_TOP + 10, 1.15f, theme->text, "%s",
                    tr("Scanning network..."));
         } else {
@@ -178,7 +176,7 @@ void page_devices_input(const Input *in)
         keep_sel_visible(&dev_scroll, count, g_app.dev_sel);
     }
     if (in->alt) {
-        scan_trigger();          /* 三角键：手动扫一遍网段 */
+        api_scan_trigger();      /* 三角键：手动扫一遍网段 */
     }
     if (in->confirm) {
         g_app.dev_target = g_app.dev_sel;

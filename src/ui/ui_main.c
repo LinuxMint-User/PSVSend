@@ -7,7 +7,6 @@
 #include "ui/theme.h"
 #include "app/api.h"
 #include "app/update.h"
-#include "net/net.h"
 #include "core/dlog.h"
 
 App g_app;
@@ -201,11 +200,11 @@ void ui_run(void)
         {
             uint64_t bn = (uint64_t)sceKernelGetSystemTimeWide() / 1000;
             if (bn - last_be >= 1000 &&
-                (bn - run0 < 12000 || !api_network_ready() || !net_connected())) {
+                (bn - run0 < 12000 || !api_network_ready() || !api_link_up())) {
                 last_be = bn;
                 dlog("ui: beat disc=%d ctl=%d up=%d ip=%s",
-                     api_discovery_state(), net_ctl_state(),
-                     net_connected() ? 1 : 0, net_local_ip());
+                     api_discovery_state(), api_ctl_state(),
+                     api_link_up() ? 1 : 0, api_local_ip());
             }
         }
         api_tick();          /* announce 节奏（500ms 节流；sendto 只在主线程可靠） */

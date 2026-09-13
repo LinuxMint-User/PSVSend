@@ -16,6 +16,7 @@
 #include "net/net.h"
 #include "net/http.h"
 #include "net/discovery.h"
+#include "net/scan.h"
 #include "proto/receive.h"
 #include "app/api.h"
 #include "net/identity.h"
@@ -203,7 +204,7 @@ void api_start(void)
     int r;
     config_init();                       /* 先建目录/读配置（dlog 目录依赖它） */
     dlog_init();
-    dlog("== psvsend boot [TAG:d73] ==");
+    dlog("== psvsend boot [TAG:d74] ==");
     {
         /* 版本标记 + 设备身份指纹：确认刷入的固件含 mTLS 客户端证书 */
         char f[65];
@@ -249,4 +250,45 @@ int api_discovery_state(void)
 const char *api_discovery_fail(void)
 {
     return discovery_fail_step();
+}
+
+/* ---- UI 门面：链路状态 + 主动扫描（均为薄转发，见 api.h） ---- */
+bool api_link_up(void)
+{
+    return net_connected();
+}
+
+int api_ctl_state(void)
+{
+    return net_ctl_state();
+}
+
+const char *api_local_ip(void)
+{
+    return net_local_ip();
+}
+
+void api_scan_trigger(void)
+{
+    scan_trigger();
+}
+
+int api_scan_active(void)
+{
+    return scan_active();
+}
+
+int api_scan_done(void)
+{
+    return scan_done();
+}
+
+int api_scan_total(void)
+{
+    return scan_total();
+}
+
+int api_scan_found(void)
+{
+    return scan_found();
 }
