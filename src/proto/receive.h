@@ -7,7 +7,8 @@
  *                   持久默认，UI 可在接受前 recv_set_dir 覆盖为本次目录（内存态）。
  *   cancel?sessionId  发送方放弃会话
  * UI 轮询拉取"待确认请求 / 传输状态"，把勾选集合与接受决定写回；http 线程轮询唤醒。
- * 单活动会话：同一时刻只有一个接收会话，第二个 prepare-upload 回 409。 */
+ * 单活动会话：同一时刻只服务一个接收会话（另一台设备的第二个 prepare-upload 回
+ * 409）；但同一会话内的多个文件由发送方并发 upload，接收侧按文件独立流式收体。 */
 #ifndef PSVSEND_RECEIVE_H
 #define PSVSEND_RECEIVE_H
 

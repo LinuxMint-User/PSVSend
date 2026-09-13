@@ -10,7 +10,7 @@
 ### 实现现状（2026-09）
 
 - **已落地（发送方向）**：UDP 组播发现 / register 入表 → UI 选设备、浏览 ux0 选文件 → `transfer.c` 按对方 announce 的 protocol 走 HTTP 明文或 HTTPS（mbedTLS 3.6.5、锁定 TLS1.2）执行 `prepare-upload` / `upload`，带进度回写与本地取消。HTTPS 连接自动出示内嵌设备身份证书（mTLS，应对 2026 官方 Rust 内核接收端强制客户端证书），并按对方指纹锁定其证书（详见 §3 决策表）。
-- **已落地（接收方向）**：对方 prepare-upload → 自动弹接收确认页（Accept / Setup 逐文件勾选 / Reject）→ upload 由 http.c 提供流读回调、receive.c 边收边写 `ux0:data/psvsend/downloads/`（先 `.part` 收完改名，sha256 可选校验，断流/校验失败删残留，开机清扫遗留）。兼容对方无 Content-Length 的 **chunked 流式上传**（http.c 内嵌解码状态机）；多文件同会话逐 POST upload。取消/放弃/空闲超时等状态经快照接口给 UI 展示结束原因。announce 已声明 `download:true`。
+- **已落地（接收方向）**：对方 prepare-upload → 自动弹接收确认页（Accept / Setup 逐文件勾选 / Reject）→ upload 由 http.c 提供流读回调、receive.c 边收边写 `ux0:data/psvsend/downloads/`（先 `.part` 收完改名，sha256 可选校验，断流/校验失败删残留，开机清扫遗留）。兼容对方无 Content-Length 的 **chunked 流式上传**（http.c 内嵌解码状态机）；同一会话内多文件由对方**并发**发起 upload，接收侧按文件独立流式收体（每文件各自 busy 状态，互不阻塞；d68 修复了 v2.1.0 起后到文件被 409 拒绝的缺陷）。取消/放弃/空闲超时等状态经快照接口给 UI 展示结束原因。announce 已声明 `download:true`。
 - **已落地（发现补充）**：Vita 收不了 UDP 组播、也绑不了 53317，设备表主要靠对方主动 register 与 `scan.c` 主动扫描（向 /24 各 IP 的 53317 POST register 拿 member info）。扫描按 **TLS→明文顺序**探测并携带设备身份证书（2026 官方 Rust 内核接收端强制 mTLS 客户端证书），明文兜底兼容纯 HTTP 端；**优先探测历史在线设备**（config `knownIps` 持久化、LRU、上限 24，入表即记录），常用设备实测轮次开始 ~0.7s 内出现。曾修复两处致手动扫描失效的 bug：`s_read_resp` 未把响应 body 移到缓冲区头部（JSON 解析永远失败、found 恒 0）；TLS 探测静默失败。UI 三角键手动触发。
 - 实现边界的完整清单（忙时 409 / 每连接 worker 上限 8、清单 64 文件/32KB、超时 60s/120s/30s 三档、接收仅明文 HTTP、/24 扫描范围等）见 README「边界与已知限制」。
 - **已落地（稳定性，v2.0.0）**：修复待机唤醒 / Wi-Fi 断开恢复后卡「网络未就绪 / 没扫到设备」——watch 看门狗单线程低频轮询 netctl + 全互斥 `initCount=0` 语义修正（发现/扫描/收发/net 各互斥均改为无人先持锁），恢复后 UI 心跳自动续上；另曾用 6s 模拟断网窗口复现，现该调试开关已置 0（net.c `PSVSEND_SIM_DOWN_MS`，需要时 cmake 覆盖）。
@@ -278,7 +278,7 @@ src/ui/
 
 - multipart 边界解析（上传 body 格式以协议文档为准）
 - 大文件流式写盘（内存红线）
-- 并发多文件上传（一个 session 多连接）
+- 并发多文件上传（一个 session 多连接）—— 已落地（d68：接收侧按文件独立 busy，逐文件并发收体）
 - 网络异常处理：断连、超时、设备休眠、飞行模式恢复
 - 内存监控调试：`mallinfo()`（newlib 堆）+ `sceKernelGetFreeMemorySize()`（系统余量）——注意统一内存下显存块（sceKernelAllocMemBlock）不计入 mallinfo，需结合查看
 - 传输速度预期：PSV 802.11n 单天线，实测约 10~20MB/s

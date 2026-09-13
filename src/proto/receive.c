@@ -1,9 +1,13 @@
 /* receive.c —— 接收方向实现（LocalSend v2 上传 API 的服务端会话，见 receive.h）。
  *
  * 线程模型：http.c 为每个连接开独立 worker 线程并发调用 recv_http_*；本模块
- * 用一个全互斥 g_mtx 保护会话状态，单活动会话（一次只收一个设备）由 prepare 的
- * "检查+占位原子化"与 upload 的 busy 门卫共同保证——多余的并发连接立刻拿 409，
- * 不会被静默晾在 TCP 队列里。UI 线程通过 *_pull/_decide/_abort 访问同一份锁内状态。
+ * 用一个全互斥 g_mtx 保护会话状态。单活动会话（一次只收一个设备）由 prepare 的
+ * "检查+占位原子化"保证——会话已存在时另一个 prepare 立刻拿 409，不会被静默晾在
+ * TCP 队列里。
+ * 会话内多文件并发：官方客户端对同一会话的多个文件是并发发起 upload 的，故每
+ * 个 RFile 各自带 busy/状态标志，多个文件可同时流式收体；会话终态按"所有文件
+ * 是否都到终态"判定（见 upload 收尾）。跨会话（另一台设备）仍 409。
+ * UI 线程通过 *_pull/_decide/_abort 访问同一份锁内状态。
  *
  * 边界处理（用户约定）：
  *  - 大文件绝不全量入内存：upload 由 http.c 提供流读回调，边收边写 .part 临时文件，
@@ -30,7 +34,7 @@
 
 #define RECV_DECIDE_TIMEOUT_US (60 * 1000000LL)  /* prepare 等 UI 决定的上限 */
 #define RECV_IDLE_TIMEOUT_US   (120 * 1000000LL) /* 接受后/文件间没动静 → TIMEOUT */
-#define RECV_CHUNK             65536             /* 流式写盘缓冲（静态，不占栈） */
+#define RECV_CHUNK             65536             /* 流式写盘缓冲（每个 upload 各自一份，见下） */
 #define RECV_PART_SUFFIX       ".part"
 
 /* 会话生命周期：无 / 待决定 / 活动（接受后直到 recv_clear） */
@@ -47,6 +51,7 @@ typedef struct {
     SceOff got;           /* 已收字节（锁保护） */
     char sha256[65];      /* 期望 sha256（准备报文里给了才校验，空串=不校验） */
     int  st;              /* 0=等待 1=完成 2=跳过 3=失败 */
+    bool busy;            /* 本文件正在流式收体（同会话多文件可并发，各自独立） */
 } RFile;
 
 /* 待决定请求（PH_PENDING） */
@@ -68,21 +73,19 @@ static struct {
     char peer_alias[64];
     int  n;               /* 参与文件数（已剔除未勾选） */
     RFile f[RECV_MAX_FILES];
-    int  cur;             /* 正在收的下标，-1=无 */
+    int  cur;             /* 正在收的某个文件下标，-1=无（并发时取最早遇到的，仅 UI 高亮用） */
     int  state;           /* RecvStateId */
     char err[192];
     SceOff total;         /* 期望总字节（含 size==0 的已免收文件） */
     SceOff got_total;     /* 已收总字节（锁保护） */
     uint64_t start_us;    /* 接受时刻 */
     uint64_t last_us;     /* 接受/最近一次收体开始时刻（空闲超时判定用） */
-    bool busy;            /* 正在流式收体（http 线程内） */
 } g_sess;
 
 static int  g_phase = PH_NONE;      /* 当前生命周期 */
 static int  g_pend_result = 0;      /* 0=未决 1=接受 2=拒绝 3=超时 */
 static volatile int g_abort = 0;    /* 用户中止请求（http 收体循环轮询） */
 static SceUID g_mtx = -1;
-static unsigned char g_buf[RECV_CHUNK];
 /* 本会话保存目录：accept 前由 UI 用 recv_set_dir 设定（临时、不入 config）；
  * 启动清扫等默认场景在 recv_init 里回退 config saveDir。 */
 static char g_dir[512];
@@ -90,6 +93,31 @@ static char g_dir[512];
 static void lock(void)   { if (g_mtx >= 0) sceKernelLockMutex(g_mtx, 1, NULL); }
 static void unlock(void) { if (g_mtx >= 0) sceKernelUnlockMutex(g_mtx, 1); }
 static uint64_t now_us(void) { return (uint64_t)sceKernelGetSystemTimeWide(); }
+
+/* 会话是否已到终态（终态后不再改变，除 recv_clear 清场） */
+static bool sess_is_terminal(int state)
+{
+    return state == RECV_ST_DONE || state == RECV_ST_FAIL ||
+           state == RECV_ST_CANCEL || state == RECV_ST_TIMEOUT;
+}
+
+/* 是否有任一文件正在流式收体（持锁调用）：同会话多文件可并发，busy 各自独立 */
+static bool any_busy_locked(void)
+{
+    int i;
+    for (i = 0; i < g_sess.n; i++)
+        if (g_sess.f[i].busy) return true;
+    return false;
+}
+
+/* 刷新"当前正在收的文件"下标（持锁调用）：并发时取最早遇到的一个，仅供 UI 高亮 */
+static void update_cur_locked(void)
+{
+    int i;
+    g_sess.cur = -1;
+    for (i = 0; i < g_sess.n; i++)
+        if (g_sess.f[i].busy) { g_sess.cur = i; break; }
+}
 
 /* 随机 hex（sessionId/token） */
 static void gen_hex(char *out, int bytes)
@@ -191,20 +219,22 @@ static int disk_free(SceOff *free_size)
     return -1;
 }
 
-/* 删掉还没完成/失败的文件的 .part（会话结束清理用；持有锁时调用） */
+/* 删掉还没完成/失败的文件的 .part（会话结束清理用；持有锁时调用）。
+ * busy 的文件正被另一个 worker 写盘，跳过——由该 worker 自己清理。 */
 static void cleanup_parts(void)
 {
     int i;
     for (i = 0; i < g_sess.n; i++)
-        if (g_sess.f[i].st != 1) sceIoRemove(g_sess.f[i].part);
+        if (g_sess.f[i].st != 1 && !g_sess.f[i].busy)
+            sceIoRemove(g_sess.f[i].part);
 }
 
-/* 结束活动会话到终态（持有锁时调用） */
+/* 结束活动会话到终态（持有锁时调用）。不碰各文件的 busy 标志：仍在并发
+ * 收体的 worker 会自行收尾并清自己的 busy。 */
 static void sess_terminal(int state, const char *err)
 {
     g_sess.state = state;
     g_sess.cur = -1;
-    g_sess.busy = false;
     g_sess.last_us = now_us();
     if (err) {
         snprintf(g_sess.err, sizeof g_sess.err, "%s", err);
@@ -374,11 +404,9 @@ void recv_decide(bool accept)
 void recv_abort(void)
 {
     lock();
-    if (g_phase == PH_ACTIVE && g_sess.busy) {
+    if (g_phase == PH_ACTIVE && any_busy_locked()) {
         g_abort = 1;                       /* 收体循环下一块检测到 */
-    } else if (g_phase == PH_ACTIVE &&
-               g_sess.state != RECV_ST_DONE && g_sess.state != RECV_ST_FAIL &&
-               g_sess.state != RECV_ST_CANCEL && g_sess.state != RECV_ST_TIMEOUT) {
+    } else if (g_phase == PH_ACTIVE && !sess_is_terminal(g_sess.state)) {
         cleanup_parts();
         sess_terminal(RECV_ST_CANCEL, "用户取消");
     }
@@ -535,7 +563,6 @@ static int recv_http_prepare(const char *body, const char *ip, char *resp, int r
         g_sess.cur = -1;
         g_sess.start_us = now_us();
         g_sess.last_us = g_sess.start_us;
-        g_sess.busy = false;
         g_abort = 0;
         if (m == 0) {                        /* 全被勾掉：告诉对方不用传 */
             g_phase = PH_NONE;
@@ -589,11 +616,13 @@ static bool hex_eq_nocase(const char *a, const unsigned char *b, int n)
     return true;
 }
 
-/* 标记会话整体失败并清理残留 .part（持有锁时调用；fd 由调用点先关闭） */
+/* 标记会话整体失败并清理残留 .part（持有锁时调用；fd 由调用点先关闭）。
+ * 已是终态（如并发中另一个文件已先失败/被取消）则只做清理、不覆盖原终态。 */
 static void sess_fail_locked(const char *err)
 {
     cleanup_parts();
-    sess_terminal(RECV_ST_FAIL, err);
+    if (!sess_is_terminal(g_sess.state))
+        sess_terminal(RECV_ST_FAIL, err);
 }
 
 /* upload：校验 query + 来源 IP → 经 fn 流式收 total 字节写盘。
@@ -609,6 +638,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     bool check_sha = false, aborted = false;
     mbedtls_sha256_context hctx;
     unsigned char digest[32];
+    unsigned char buf[RECV_CHUNK];   /* 本 upload 私有：同会话多文件并发时不能共用静态缓冲 */
 
     if (!query || !fn || !ctx) return 400;
     query_get(query, "sessionId", sid, sizeof sid);
@@ -635,8 +665,8 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         unlock();
         return f->size == 0 ? 200 : 403;
     }
-    if (g_sess.busy) {                       /* 另一文件正在流式收体（http 并发连接）：
-                                              * 单活动会话下不该发生，礼貌拒绝 */
+    if (f->busy) {                           /* 同一文件被重复并发上传（同会话多文件
+                                              * 并发是允许的，仅同文件自身重入要拒） */
         unlock();
         return 409;
     }
@@ -651,7 +681,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         unlock();
         return 500;
     }
-    g_sess.busy = true;
+    f->busy = true;
     g_sess.cur = idx;
     g_sess.state = RECV_ST_RECEIVING;
     g_sess.last_us = now_us();
@@ -668,6 +698,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     if (fd < 0) {
         dlog("recv: open part fail 0x%08X (%s)", (unsigned)fd, f->part);
         lock();
+        f->busy = false;
         sess_fail_locked("无法创建文件");
         unlock();
         if (check_sha) mbedtls_sha256_free(&hctx);
@@ -683,6 +714,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         if (aborted) {
             sceIoClose(fd); fd = -1;
             lock();
+            f->busy = false;
             cleanup_parts();
             sess_terminal(RECV_ST_CANCEL, "用户取消");
             unlock();
@@ -693,11 +725,12 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         if (f->got >= f->size) break;
         {
             SceOff rem = f->size - f->got;
-            n = fn(ctx, g_buf, (int)(rem < RECV_CHUNK ? rem : RECV_CHUNK));
+            n = fn(ctx, buf, (int)(rem < RECV_CHUNK ? rem : RECV_CHUNK));
         }
         if (n <= 0) {                        /* 断流/空闲超时/socket 错/用户中止 */
             sceIoClose(fd); fd = -1;
             lock();
+            f->busy = false;
             if (g_abort) {                   /* http 层看到中止标志提前退出 → 取消 */
                 cleanup_parts();
                 sess_terminal(RECV_ST_CANCEL, "用户取消");
@@ -709,11 +742,12 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             sceIoRemove(f->part);
             return 500;
         }
-        if (check_sha) mbedtls_sha256_update(&hctx, g_buf, (unsigned)n);
-        wr = sceIoWrite(fd, g_buf, (unsigned)n);
+        if (check_sha) mbedtls_sha256_update(&hctx, buf, (unsigned)n);
+        wr = sceIoWrite(fd, buf, (unsigned)n);
         if (wr != n) {                       /* 磁盘满 / IO 错误 */
             sceIoClose(fd); fd = -1;
             lock();
+            f->busy = false;
             sess_fail_locked("写入失败（磁盘空间不足？）");
             unlock();
             if (check_sha) mbedtls_sha256_free(&hctx);
@@ -733,6 +767,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     sceIoClose(fd); fd = -1;
     if (check_sha && !hex_eq_nocase(f->sha256, digest, 32)) {
         lock();
+        f->busy = false;
         sess_fail_locked("sha256 校验失败");
         unlock();
         sceIoRemove(f->part);
@@ -740,6 +775,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     }
     if (sceIoRename(f->part, f->final) < 0) {
         lock();
+        f->busy = false;
         sess_fail_locked("文件落盘失败");
         unlock();
         sceIoRemove(f->part);
@@ -747,8 +783,9 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     }
     lock();
     f->st = 1;
-    g_sess.cur = -1;
-    {
+    f->busy = false;
+    update_cur_locked();
+    if (!sess_is_terminal(g_sess.state)) {
         int all = 1;
         for (i = 0; i < g_sess.n; i++)
             if (g_sess.f[i].st == 0) { all = 0; break; }
@@ -763,8 +800,8 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             sess_terminal(RECV_ST_CANCEL, "用户取消");
             dlog("recv: session %s cancelled (file done)", g_sess.session);
         } else {
-            g_sess.busy = false;
-            g_sess.state = RECV_ST_READY;    /* 还有文件没到，等下一个 upload */
+            /* 还有文件没到（或正在并发收）：等下一个 upload 完成 */
+            g_sess.state = any_busy_locked() ? RECV_ST_RECEIVING : RECV_ST_READY;
             g_sess.last_us = now_us();
         }
     }
@@ -780,8 +817,8 @@ static int recv_http_cancel(const char *query, const char *ip)
     lock();
     if (g_phase == PH_ACTIVE && sid[0] &&
         strcmp(g_sess.session, sid) == 0) {
-        if (g_sess.busy) {
-            /* 正在流式收体（http 并发连接）：直接清场会删掉收体中那个
+        if (any_busy_locked()) {
+            /* 正在流式收体（http 并发连接）：直接清场会删掉收体中那些
              * .part；置中止位，让收体循环在锁内统一收尾（与 UI 取消一致） */
             g_abort = 1;
             dlog("recv: session %s cancel by sender during body -> abort",
@@ -803,10 +840,8 @@ int recv_status_pull(RecvStatus *out)
     if (!out) return 0;
     lock();
     if (g_phase == PH_ACTIVE) {
-        /* 空闲超时：非收体中且超过 IDLE 无动静 → TIMEOUT（清残留） */
-        if (!g_sess.busy &&
-            g_sess.state != RECV_ST_DONE && g_sess.state != RECV_ST_FAIL &&
-            g_sess.state != RECV_ST_CANCEL && g_sess.state != RECV_ST_TIMEOUT &&
+        /* 空闲超时：没有文件在收体且超过 IDLE 无动静 → TIMEOUT（清残留） */
+        if (!any_busy_locked() && !sess_is_terminal(g_sess.state) &&
             now - g_sess.last_us > (uint64_t)RECV_IDLE_TIMEOUT_US) {
             cleanup_parts();
             sess_terminal(RECV_ST_TIMEOUT, "等待对方传输超时");
@@ -835,7 +870,7 @@ void recv_clear(void)
 {
     lock();
     if (g_phase == PH_ACTIVE) {
-        if (g_sess.busy) {                   /* 收体进行中：别硬清，先请中止 */
+        if (any_busy_locked()) {             /* 收体进行中：别硬清，先请中止 */
             g_abort = 1;
             unlock();
             return;
