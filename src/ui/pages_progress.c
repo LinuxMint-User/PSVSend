@@ -211,9 +211,9 @@ void page_progress_render(void)
 
     HintSeg segs[6] = { 0 };
     int ns = 0;
+    segs[ns].icon = HICON_TRIANGLE;  segs[ns++].text = tr("Advanced");  /* 固定 → 靠左 */
     segs[ns].icon = icon_confirm();
-    segs[ns++].text = g_app.prog_running ? tr("Cancel") : tr("Done");
-    segs[ns].icon = HICON_TRIANGLE;  segs[ns++].text = tr("Advanced");
+    segs[ns++].text = g_app.prog_running ? tr("Cancel") : tr("Done");   /* 会变 → 靠右 */
     w_page_footer_segs(segs, ns);
 
     /* 底部右侧按钮：右边=取消/完成，其左=高级 */

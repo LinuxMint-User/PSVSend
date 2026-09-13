@@ -95,6 +95,7 @@ static const TrEntry s_zh[] = {
     /* ---- 传输进度页 ---- */
     { "Transfer failed", "传输失败" },
     { "Waiting for receiver to accept...", "等待对方接受…" },
+    { "Please accept on the other device.", "请在对方设备上确认接收。" },
     { "Sending...", "发送中…" },
     { "Sending", "发送" },
     { "Receive failed", "接收失败" },

@@ -1,7 +1,9 @@
-/* 页面：发送流程——发送主页（设备栏 + 已选文件栏）/ 文件选择页。
+/* 页面：发送流程——发送主页（设备栏 + 已选文件栏）/ 文件选择页 / 发送等待页。
  * 流程对齐官方 LocalSend：先在文件栏把文件选好（方块键进文件选择页），
- * 最后在设备栏点/按确认键挑目标即发。"选定目标 → 真正连接"的窗口由此
- * 压到近 0，设备列表也最新鲜（d77 的 connect 超时是兜底，不是根治）。
+ * 最后在设备栏点/按确认键挑目标即发，先进等待页等对方接受（pages_recv.c 的
+ * pages_tick 检测到对端接受后自动切进度页），避免一发起就进"无进展"的进度页。
+ * "选定目标 → 真正连接"的窗口由此压到近 0，设备列表也最新鲜（d77 的 connect
+ * 超时是兜底，不是根治）。
  * 设备栏来自后端 UDP 发现（api.h 快照）；文件浏览走 sceIo 目录枚举；
  * 发送由 start_send 组装清单交给 xfer 后台线程，进度页在 pages_progress.c。
  *
@@ -353,8 +355,11 @@ void page_devices_render(void)
     dev_pane_render(&dev, g_app.pane_focus == 0);
     pick_pane_render(&fil, g_app.pane_focus == 1);
 
+    /* 页脚排序：固定不变的靠左（设置/切换/选文件），随焦点栏变的靠右（确认、三角）。
+     * 变动的文案只会推自己右侧的东西，左边固定提示就不会跟着左右乱跳。 */
     HintSeg segs[6] = { 0 };
     int ns = 0;
+    segs[ns].icon = HICON_NONE;       segs[ns++].text = tr("SELECT Settings");
     segs[ns].icon = HICON_LEFT;       segs[ns++].text = NULL;
     segs[ns].icon = HICON_RIGHT;      segs[ns++].text = tr("Switch");
     segs[ns].icon = HICON_SQUARE;     segs[ns++].text = tr("Select files");
@@ -375,7 +380,6 @@ void page_devices_render(void)
         segs[ns].dim = g_app.picked_count <= 0;
         segs[ns++].text = tr("Remove all");
     }
-    segs[ns].icon = HICON_NONE;       segs[ns++].text = tr("SELECT Settings");
     w_page_footer_segs(segs, ns);
 }
 
@@ -650,16 +654,17 @@ void page_files_render(void)
                tr("(empty folder)"));
     HintSeg segs[6] = { 0 };
     int ns = 0;
-    /* 空目录里没有可选项：选择/打开/全选都灰掉 */
+    /* 固定提示靠左、随层级/全选状态变的靠右（变动的只推自己右侧，不推左边）。
+     * 空目录里没有可选项：选择/打开/全选都灰掉 */
     bool has = count > 0;
     segs[ns].icon = HICON_DPAD;       segs[ns].dim = !has;
     segs[ns++].text = tr("Choose");
     segs[ns].icon = icon_confirm();   segs[ns].dim = !has;
     segs[ns++].text = tr("Open/Pick");
+    segs[ns].icon = HICON_SQUARE;     segs[ns++].text = tr("Done");
     /* 根目录无"上级"：返回键此时=退回设备页（与选择保存路径页一致地换标签） */
     segs[ns].icon = icon_back();
     segs[ns++].text = strlen(g_app.cur_dir) <= 5 ? tr("Back") : tr("Up");
-    segs[ns].icon = HICON_SQUARE;     segs[ns++].text = tr("Done");
     segs[ns].icon = HICON_TRIANGLE;   segs[ns].dim = !has;
     segs[ns++].text = all_files_picked() ? tr("Deselect all") : tr("Select all");
     w_page_footer_segs(segs, ns);
@@ -750,56 +755,75 @@ static void start_send(int dev_idx)
     xf_count = n;
     api_send_start(g_app.dev_ip[dev_idx], g_app.dev_port[dev_idx],
                    g_app.dev_proto[dev_idx], g_app.dev_fp[dev_idx], ff, n);
-    g_app.page = PAGE_PROGRESS;
+    g_app.page = PAGE_SEND_WAIT;   /* 先进等待页；对端接受后由 pages_tick 切进度页 */
 }
 
-void page_send_confirm_render(void)
+/* ================= 发送等待页 =================
+ * 只是"等对方在接收端点接受"的过渡页：进度页在对端接受前没有任何进展，
+ * 摆在那会让用户以为卡死。对端接受（开始上传）后才由 pages_tick 切进度页。
+ * 若在开始上传前就出结果（被拒/连不上），结果就地报在本页，不再跳到进度页
+ * 去报——过渡页自己就是"这次请求"的完整反馈面。
+ *
+ * 交互：本页只有一个主操作，画成焦点态（accent 实底），页脚按语义确认键的
+ * 图标提示（确认键=激活该按钮），触摸按钮同义；返回键是等价的退出（与进度
+ * 页一致），不再单独提示，免得一个动作在页脚出现两条一样的说明。
+ * 等待中=取消（通知后台收尾）；已出结果=退出。都回设备页，已选文件保留。 */
+void page_send_wait_render(void)
 {
-    int i, n = g_app.picked_count;
-    w_page_header(tr("Confirm Send"));
-    char line[256];
-    Rect card = { 24, 80, SCR_W - 48, 330 };
+    char line[256], sz[16];
+    XferInfo xv;
+    int n = g_app.picked_count;
+    bool ended, failed;
+
+    api_send_info(&xv);
+    ended  = xv.finished;                  /* 开始上传前线程就结束了：被拒/出错 */
+    failed = ended && !xv.ok;
+
+    w_page_header(tr("Sending"));
+    Rect card = { 24, 76, SCR_W - 48, 210 };
     w_rect(card, theme->card);
     snprintf(line, sizeof line, tr("Target: %s"), g_app.dev_alias[g_app.dev_target]);
-    w_text(48, 100, 1.2f, theme->text, "%s", line);
-    char sz[16];
+    w_text_clip(48, 96, 1.2f, theme->text, line, card.w - 48);
     w_human_size(g_app.picked_total, sz);
     snprintf(line, sizeof line, tr("%d file(s)  total %s"), n, sz);
-    w_text(48, 140, 1.0f, theme->text_dim, "%s", line);
-    int shown = n < 8 ? n : 8;
-    for (i = 0; i < shown; i++) {
-        char m[256];
-        if (g_app.picked[i].name[0])
-            snprintf(m, sizeof m, "  %s", g_app.picked[i].name);
-        else
-            snprintf(m, sizeof m, tr("  <file %d>"), i + 1);
-        w_text_clip(48, 176 + i * 26, 1.0f, theme->text, m, card.w - 60);
+    w_text(48, 132, 1.0f, theme->text_dim, "%s", line);
+    if (ended) {
+        const char *m = xv.err[0] ? xv.err
+                      : (xv.msg[0] ? xv.msg : tr("Transfer failed"));
+        w_text_clip(48, 190, 1.2f, failed ? theme->danger : theme->text,
+                    m, card.w - 48);
+    } else {
+        w_text(48, 190, 1.3f, theme->accent, "%s",
+               tr("Waiting for receiver to accept..."));
+        w_text(48, 230, 1.0f, theme->text_dim, "%s",
+               tr("Please accept on the other device."));
     }
-    if (n > shown)
-        w_text(48, 176 + shown * 26, 1.0f, theme->text_dim, "%s",
-               tr("  ... %d more"), n - shown);
-    Rect cancel = { SCR_W / 2 - 220, 444, 200, 48 };
-    Rect ok     = { SCR_W / 2 + 20, 444, 200, 48 };
-    w_add(0, cancel);
-    w_add(1, ok);
-    w_button(cancel, tr("Cancel"), false);
-    w_button(ok, tr("Send"), true);
-    HintSeg segs[4] = { 0 };
+    Rect btn = { SCR_W / 2 - 100, 444, 200, 48 };
+    w_add(0, btn);
+    w_button(btn, ended ? tr("Done") : tr("Cancel"), true);   /* 唯一动作，焦点态 */
+    HintSeg segs[2] = { 0 };
     int ns = 0;
-    segs[ns].icon = icon_confirm();  segs[ns++].text = tr("Send");
-    segs[ns].icon = icon_back();     segs[ns++].text = tr("Cancel");
+    segs[ns].icon  = icon_confirm();
+    segs[ns].icon2 = icon_back();   /* 确认/返回都退出本页 → 合并成「确认/返回 …」 */
+    segs[ns++].text = ended ? tr("Done") : tr("Cancel");
     w_page_footer_segs(segs, ns);
 }
 
-void page_send_confirm_input(const Input *in)
+void page_send_wait_input(const Input *in)
 {
+    XferInfo xv;
     if (in->drag_start || in->dragging) return;
     if (in->tap) {
-        int id = w_hit(in->tap_x, in->tap_y);
-        if (id == 1) start_send(g_app.dev_sel);
-        else if (id == 0) g_app.page = PAGE_DEVICES;
+        if (w_hit(in->tap_x, in->tap_y) == 0) {
+            api_send_info(&xv);
+            if (!xv.finished) api_send_cancel();   /* 还在等 → 通知后台收尾 */
+            goto_devices();
+        }
         return;
     }
-    if (in->confirm) start_send(g_app.dev_sel);
-    if (in->back) g_app.page = PAGE_DEVICES;
+    if (in->confirm || in->back) {
+        api_send_info(&xv);
+        if (!xv.finished) api_send_cancel();
+        goto_devices();
+    }
 }

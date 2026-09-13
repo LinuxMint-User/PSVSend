@@ -36,7 +36,7 @@ typedef struct { int x, y, w, h; } Rect;
 
 /* 底部提示用的按键图标 */
 typedef enum {
-    HICON_NONE = -1,
+    HICON_NONE = 0, /* 无图标；取 0 使 HintSeg 数组 `= { 0 }` 零初始化即为"无图标" */
     HICON_CROSS,    /* X 键 */
     HICON_CIRCLE,   /* O 键 */
     HICON_TRIANGLE, /* 三角键 */
@@ -48,8 +48,10 @@ typedef enum {
 } HintIcon;
 
 /* 一段按键提示。dim=true：该动作当前不可用（画成灰字灰图标，避免误导）。
- * 注意：HintSeg 数组请用 `= { 0 }` 初始化，否则 dim 是未初始化值。 */
-typedef struct { HintIcon icon; const char *text; bool dim; } HintSeg;  /* text 可空：只画图标 */
+ * icon2 != HICON_NONE：该段是"两个键同一个动作"，画成「icon / icon2 文案」，
+ * 两个键都显示出来，动作文案只写一次。
+ * 注意：HintSeg 数组请用 `= { 0 }` 初始化，否则 dim/icon2 是未初始化值。 */
+typedef struct { HintIcon icon; HintIcon icon2; const char *text; bool dim; } HintSeg;  /* text 可空：只画图标 */
 
 void w_clear(void);                  /* 每帧开始清空命中表 */
 void w_add(int id, Rect r);          /* 页面绘制时注册可触摸区域 */
@@ -83,7 +85,7 @@ typedef struct {
 typedef enum {
     PAGE_DEVICES,      /* 设备列表（主页面） */
     PAGE_FILES,        /* 文件浏览（发文件流程） */
-    PAGE_SEND_CONFIRM, /* 发送确认 */
+    PAGE_SEND_WAIT,    /* 发送等待：等接收方接受；接受后自动切进度页 */
     PAGE_RECV_CONFIRM, /* 接收请求确认 */
     PAGE_RECV_SETUP,   /* 接收设置：本次保存目录 + 逐文件勾选/改名 */
     PAGE_DIR_PICK,     /* 目录选择（设置页默认保存目录 / 接收本次目录共用） */
@@ -163,7 +165,8 @@ void ui_input_poll(Input *in);
 
 /* ---------- 初始化（pages.c） ---------- */
 void pages_init(void);
-/* 每帧主循环调用：发现新的"待决定接收请求"时自动弹接收确认页 */
+/* 每帧主循环调用：发送等待页→进度页的自动切换；发现新的"待决定接收请求"
+ * 时自动弹接收确认页。 */
 void pages_tick(void);
 
 /* 逐页真实渲染预热字形（pages.c，隐帧内由 ui_main 调用） */
@@ -177,8 +180,8 @@ void page_devices_render(void);
 void page_devices_input(const Input *in);
 void page_files_render(void);
 void page_files_input(const Input *in);
-void page_send_confirm_render(void);
-void page_send_confirm_input(const Input *in);
+void page_send_wait_render(void);
+void page_send_wait_input(const Input *in);
 void page_recv_confirm_render(void);
 void page_recv_confirm_input(const Input *in);
 void page_recv_setup_render(void);

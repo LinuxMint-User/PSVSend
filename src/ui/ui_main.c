@@ -114,7 +114,7 @@ static void render_page(void)
     switch (g_app.page) {
     case PAGE_DEVICES:       page_devices_render(); break;
     case PAGE_FILES:         page_files_render(); break;
-    case PAGE_SEND_CONFIRM:  page_send_confirm_render(); break;
+    case PAGE_SEND_WAIT:     page_send_wait_render(); break;
     case PAGE_RECV_CONFIRM:  page_recv_confirm_render(); break;
     case PAGE_RECV_SETUP:    page_recv_setup_render(); break;
     case PAGE_DIR_PICK:      page_dir_pick_render(); break;
@@ -129,7 +129,7 @@ static void input_page(const Input *in)
     switch (g_app.page) {
     case PAGE_DEVICES:       page_devices_input(in); break;
     case PAGE_FILES:         page_files_input(in); break;
-    case PAGE_SEND_CONFIRM:  page_send_confirm_input(in); break;
+    case PAGE_SEND_WAIT:     page_send_wait_input(in); break;
     case PAGE_RECV_CONFIRM:  page_recv_confirm_input(in); break;
     case PAGE_RECV_SETUP:    page_recv_setup_input(in); break;
     case PAGE_DIR_PICK:      page_dir_pick_input(in); break;

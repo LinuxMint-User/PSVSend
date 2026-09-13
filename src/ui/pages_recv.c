@@ -79,7 +79,9 @@ void page_recv_confirm_render(void)
         w_button(close, tr("Close"), true);
         HintSeg segs[2] = { 0 };
         int ns = 0;
-        segs[ns].icon = icon_confirm(); segs[ns++].text = tr("Close");
+        segs[ns].icon  = icon_confirm();
+        segs[ns].icon2 = icon_back();   /* 确认/返回都能关闭 → 合并成「确认/返回 关闭」 */
+        segs[ns++].text = tr("Close");
         w_page_footer_segs(segs, ns);
         return;
     }
@@ -165,11 +167,22 @@ void page_recv_confirm_render(void)
                theme->text_dim, "%s", s_accept);
     }
 
+    /* 页脚：固定提示（切换 / 返回 Reject）靠左，跟随焦点的确认段靠右——否则焦点
+     * 一动就把左边的提示推来推去。确认段文案不再固定写 Accept（那会在焦点压到别的
+     * 按钮上时撒谎）；焦点落在 Reject 上时它与返回键同动作 → 合并成「确认/返回
+     * Reject」，两个键都显示，文案不重复。 */
     HintSeg segs[6] = { 0 };
     int ns = 0;
     segs[ns].icon = HICON_DPAD;       segs[ns++].text = tr("Switch");
-    segs[ns].icon = icon_confirm();   segs[ns++].text = s_accept;
-    segs[ns].icon = icon_back();      segs[ns++].text = s_reject;
+    if (recv_focus == 0) {
+        segs[ns].icon  = icon_confirm();
+        segs[ns].icon2 = icon_back();
+        segs[ns++].text = s_reject;
+    } else {
+        segs[ns].icon = icon_back();  segs[ns++].text = s_reject;
+        segs[ns].icon = icon_confirm();
+        segs[ns++].text = recv_focus == 1 ? s_setup : s_accept;
+    }
     w_page_footer_segs(segs, ns);
 }
 
@@ -632,23 +645,34 @@ static void open_recv_request(const RecvPending *rp)
     g_app.page = PAGE_RECV_CONFIRM;
 }
 
-/* 每帧由 ui_main 调用：出现"待决定接收请求"且当前页面可打断时自动弹确认页。
+/* 每帧由 ui_main 调用：① 发送等待页在接收方接受后自动切进度页；② 出现
+ * "待决定接收请求"且当前页面可打断时自动弹确认页。
  * 用户拒绝/接受后 g_recv_supp_ms 置 2s 抑制窗，防对端立刻重试又弹回；
  * 接收流程页/传输中本身不打断（switch 的 default）。 */
 void pages_tick(void)
 {
     RecvPending rp;
     uint64_t now_ms = (uint64_t)sceKernelGetSystemTimeWide() / 1000;
+
+    /* 发送等待页：只在对端接受、真正开始上传（cur>=0）后才切进度页。
+     * 开始上传前就出结果（被拒 403 / 连不上）留在等待页原地报出——否则用户
+     * 看到的是一次"进进度页才报错"的跳转，而不是就地反馈。 */
+    if (g_app.page == PAGE_SEND_WAIT) {
+        XferInfo xv;
+        api_send_info(&xv);
+        if (xv.cur >= 0 || xv.total_sent > 0)
+            g_app.page = PAGE_PROGRESS;
+    }
+
     if (now_ms < g_recv_supp_ms) return;     /* 决定后的抑制窗内不弹 */
     if (api_recv_pending_pull(&rp) != 1) return; /* 无"待决定"请求 */
     switch (g_app.page) {
     case PAGE_DEVICES:
     case PAGE_FILES:
-    case PAGE_SEND_CONFIRM:
     case PAGE_SETTINGS:
         break;
     default:
-        return;                              /* 接收流程/传输中不打断 */
+        return;                              /* 发送等待/接收流程/传输中不打断 */
     }
     open_recv_request(&rp);
 }

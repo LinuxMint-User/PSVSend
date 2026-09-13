@@ -296,7 +296,9 @@ static void w_icon(HintIcon ic, float cx, float cy, uint32_t c)
     }
 }
 
-/* 底部按键提示条：图标 + 文字多段并排 */
+/* 底部按键提示条：图标 + 文字多段并排。
+ * 段的 icon2 非 HICON_NONE 时表示"两个键同一个动作"，画成「icon / icon2 文案」：
+ * 两个键都显示出来（告知两条路子都能走），动作文案只写一次，避免同一句话写两遍。 */
 void w_page_footer_segs(const HintSeg *segs, int n)
 {
     Rect f = { 0, SCR_H - FOOTER_H, SCR_W, FOOTER_H };
@@ -313,6 +315,14 @@ void w_page_footer_segs(const HintSeg *segs, int n)
         if (has_icon) {
             w_icon(segs[i].icon, x + 11, cy, ic_c);
             adv = 26;
+            if (segs[i].icon2 != HICON_NONE) {
+                /* 第二个键：与第一个隔开，中间一个小号暗淡的 "/" 表示"或" */
+                int sw = 0;
+                w_text_w(0.9f, "/", &sw, NULL);
+                w_icon(segs[i].icon2, x + 42, cy, ic_c);
+                w_text(x + 26 - sw / 2, f.y + 12, 0.9f, tx_c, "/");
+                adv = 57;
+            }
         }
         if (segs[i].text && segs[i].text[0]) {
             int tw = 0, th = 0;
