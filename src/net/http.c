@@ -372,6 +372,136 @@ static int upload_stream(void *ctx, unsigned char *buf, int max)
     return -1;    /* 错/换代/用户中止：让 receive 收尾为取消 */
 }
 
+/* ---------- 路由处理 ----------
+ * 请求行/头/body 由 handle_conn 统一解析成 HttpReq，再按路由分派到下面的
+ * handler；每个 handler 只负责自己那条路由的语义与应答。纯搬移，行为不变。 */
+typedef struct {
+    Conn       *cn;         /* 连接（响应经它发） */
+    const char *ip;         /* 来源 IP（日志/接收侧校验用） */
+    char        method[8];
+    char        route[256];
+    const char *query;      /* URL query（无则空串） */
+    const char *buf;        /* 请求原始缓冲（诊断打点用） */
+    int         he;         /* header 结束偏移（空行起点） */
+    const char *left;       /* body 起始（buf + he + 4） */
+    int         llen;       /* 已随头读入的 body 长度 */
+    SceLong64   cl64;       /* Content-Length（无则 0） */
+} HttpReq;
+
+/* GET /api/localsend/v2/info —— 回本机 member info */
+static void h_info(HttpReq *r)
+{
+    char out[HTTP_MAX_BODY];
+    member_info_json(out, sizeof out);
+    http_respond(r->cn, 200, "OK", out);
+}
+
+/* POST /api/localsend/v2/register —— 对方注册/公告，回本机 member info */
+static void h_register(HttpReq *r)
+{
+    char body[HTTP_MAX_BODY];
+    int got = r->llen;                   /* body 已随头读齐（见 handle_conn 补读） */
+    if (got > (int)sizeof body - 1) got = (int)sizeof body - 1;
+    memcpy(body, r->left, (unsigned)got);
+    body[got] = 0;
+    if (got > 0) {
+        dlog("http: register body %d bytes from %s", got, r->ip);
+        if (g_cb) g_cb(body, r->ip);
+    } else {
+        dlog("http: register with empty body from %s", r->ip);
+    }
+    {
+        char out[HTTP_MAX_BODY];
+        member_info_json(out, sizeof out);
+        http_respond(r->cn, 200, "OK", out);
+    }
+}
+
+/* POST /api/localsend/v2/prepare-upload —— 清单交给接收模块挂起等 UI 决定 */
+static void h_prepare(HttpReq *r)
+{
+    char body[HTTP_MAX_PREPARE];
+    char resp[HTTP_MAX_PREPARE];
+    int got = r->llen;                   /* body 已随头读齐 */
+    if (got > (int)sizeof body - 1) got = (int)sizeof body - 1;
+    memcpy(body, r->left, (unsigned)got);
+    body[got] = 0;
+    if (r->cl64 <= 0) {                  /* 诊断：无 CL 客户端长啥样 */
+        char dbg[256];
+        int a, b = 0;
+        int hl = r->he < 200 ? r->he : 200;
+        for (a = 0; a < hl && b < 250; a++) {
+            char ch = r->buf[a];
+            if (ch == '\r' || ch == '\n') ch = '|';
+            dbg[b++] = ch;
+        }
+        dbg[b] = 0;
+        dlog("http: prepare no-cl hdr: %s", dbg);
+    }
+    if (r->cl64 > 0 && (SceLong64)got < r->cl64) {  /* 声称有体但没读齐 → 400 */
+        dlog("http: prepare body short cl=%lld got=%d from %s",
+             (long long)r->cl64, got, r->ip);
+        http_respond(r->cn, 400, "Bad Request", "");
+        return;
+    }
+    if (!recv_ops_ready()) {
+        http_respond(r->cn, 500, "Internal Server Error", "");
+        return;
+    }
+    {
+        int code = g_recv->prepare(body, r->ip, resp, (int)sizeof resp);
+        dlog("http: prepare -> %d", code);
+        http_respond(r->cn, code, reason_of(code), resp);
+    }
+}
+
+/* POST /api/localsend/v2/upload —— 裸文件字节流，经流回调边收边交给接收模块 */
+static void h_upload(HttpReq *r)
+{
+    UploadCtx uctx;
+    int code;
+    {                                    /* 诊断：看 PC 发的 upload 头（有无 CL/TE） */
+        char dbg[512];
+        int a, b = 0;
+        int hl = r->he < 500 ? r->he : 500;
+        for (a = 0; a < hl && b < 505; a++) {
+            char ch = r->buf[a];
+            if (ch == '\r' || ch == '\n') ch = '|';
+            dbg[b++] = ch;
+        }
+        dbg[b] = 0;
+        dlog("http: upload hdr: %s |cl=%lld", dbg, (long long)r->cl64);
+    }
+    memset(&uctx, 0, sizeof uctx);       /* 含 chunked 解码状态 */
+    uctx.conn = *r->cn;                  /* fd + 所属代次 */
+    uctx.left = r->left;
+    uctx.llen = r->llen;
+    if (r->cl64 <= 0) {                  /* 无 CL：dio 流式上传 → chunked */
+        char te[80] = "";
+        hdr_copy(r->buf, r->he, "transfer-encoding", te, sizeof te);
+        if (str_has_ci(te, "chunked")) uctx.chunked = 1;
+    }
+    if (!recv_ops_ready()) {
+        http_respond(r->cn, 500, "Internal Server Error", "");
+        return;
+    }
+    if (uctx.chunked) {
+        dlog("http: upload chunked (no content-length)");
+        code = g_recv->upload(r->query, r->ip, -1, upload_stream, &uctx);
+    } else {
+        code = g_recv->upload(r->query, r->ip, r->cl64, upload_stream, &uctx);
+    }
+    dlog("http: upload -> %d", code);
+    http_respond(r->cn, code, reason_of(code), "");
+}
+
+/* POST /api/localsend/v2/cancel —— 发送方放弃会话 */
+static void h_cancel(HttpReq *r)
+{
+    int code = recv_ops_ready() ? g_recv->cancel(r->query, r->ip) : 500;
+    http_respond(r->cn, code, reason_of(code), "");
+}
+
 /* 解析 HTTP 请求并应答一个连接（在独立 worker 线程跑），返回后由 worker 关 fd */
 static void handle_conn(Conn *cn, const char *rip, int my_gen)
 {
@@ -482,117 +612,39 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
     else
         dlog("http: unparsed req from %s", rip);
 
-    if (strcmp(method, "GET") == 0 &&
-        strcmp(route, "/api/localsend/v2/info") == 0) {
-        char out[HTTP_MAX_BODY];
-        member_info_json(out, sizeof out);
-        http_respond(cn, 200, "OK", out);
-        return;
+    /* 按路由分派：每个 handler 只管自己那条路由的语义与应答 */
+    {
+        HttpReq r;
+        memset(&r, 0, sizeof r);
+        r.cn = cn;
+        r.ip = rip;
+        memcpy(r.method, method, sizeof r.method);
+        memcpy(r.route, route, sizeof r.route);
+        r.query = query;
+        r.buf = buf;
+        r.he = he;
+        r.left = left;
+        r.llen = llen;
+        r.cl64 = cl64;
+
+        if (strcmp(method, "GET") == 0 &&
+            strcmp(route, "/api/localsend/v2/info") == 0)
+            h_info(&r);
+        else if (strcmp(method, "POST") == 0 &&
+                 strcmp(route, "/api/localsend/v2/register") == 0)
+            h_register(&r);
+        else if (strcmp(method, "POST") == 0 &&
+                 strcmp(route, "/api/localsend/v2/prepare-upload") == 0)
+            h_prepare(&r);
+        else if (strcmp(method, "POST") == 0 &&
+                 strcmp(route, "/api/localsend/v2/upload") == 0)
+            h_upload(&r);
+        else if (strcmp(method, "POST") == 0 &&
+                 strcmp(route, "/api/localsend/v2/cancel") == 0)
+            h_cancel(&r);
+        else
+            http_respond(cn, 404, "Not Found", "{\"error\":\"not found\"}");
     }
-    if (strcmp(method, "POST") == 0 &&
-        strcmp(route, "/api/localsend/v2/register") == 0) {
-        char body[HTTP_MAX_BODY];
-        int got = llen;                      /* body 已随头读齐（见上补读） */
-        if (got > (int)sizeof body - 1) got = (int)sizeof body - 1;
-        memcpy(body, left, (unsigned)got);
-        body[got] = 0;
-        if (got > 0) {
-            dlog("http: register body %d bytes from %s", got, rip);
-            if (g_cb) g_cb(body, rip);
-        } else {
-            dlog("http: register with empty body from %s", rip);
-        }
-        {
-            char out[HTTP_MAX_BODY];
-            member_info_json(out, sizeof out);
-            http_respond(cn, 200, "OK", out);
-        }
-        return;
-    }
-    if (strcmp(method, "POST") == 0 &&
-        strcmp(route, "/api/localsend/v2/prepare-upload") == 0) {
-        char body[HTTP_MAX_PREPARE];
-        char resp[HTTP_MAX_PREPARE];
-        int got = llen;                      /* body 已随头读齐 */
-        if (got > (int)sizeof body - 1) got = (int)sizeof body - 1;
-        memcpy(body, left, (unsigned)got);
-        body[got] = 0;
-        if (cl64 <= 0) {                   /* 诊断：无 CL 客户端长啥样 */
-            char dbg[256];
-            int a, b = 0;
-            int hl = he < 200 ? he : 200;
-            for (a = 0; a < hl && b < 250; a++) {
-                char ch = buf[a];
-                if (ch == '\r' || ch == '\n') ch = '|';
-                dbg[b++] = ch;
-            }
-            dbg[b] = 0;
-            dlog("http: prepare no-cl hdr: %s", dbg);
-        }
-        if (cl64 > 0 && (SceLong64)got < cl64) {  /* 声称有体但没读齐 → 400 */
-            dlog("http: prepare body short cl=%lld got=%d from %s",
-                 (long long)cl64, got, rip);
-            http_respond(cn, 400, "Bad Request", "");
-            return;
-        }
-        if (!recv_ops_ready()) {
-            http_respond(cn, 500, "Internal Server Error", "");
-            return;
-        }
-        {
-            int code = g_recv->prepare(body, rip, resp, (int)sizeof resp);
-            dlog("http: prepare -> %d", code);
-            http_respond(cn, code, reason_of(code), resp);
-        }
-        return;
-    }
-    if (strcmp(method, "POST") == 0 &&
-        strcmp(route, "/api/localsend/v2/upload") == 0) {
-        UploadCtx uctx;
-        int code;
-        {                            /* 诊断：看 PC 发的 upload 头（有无 CL/TE） */
-            char dbg[512];
-            int a, b = 0;
-            int hl = he < 500 ? he : 500;
-            for (a = 0; a < hl && b < 505; a++) {
-                char ch = buf[a];
-                if (ch == '\r' || ch == '\n') ch = '|';
-                dbg[b++] = ch;
-            }
-            dbg[b] = 0;
-            dlog("http: upload hdr: %s |cl=%lld", dbg, (long long)cl64);
-        }
-        if (cl64 < 0) cl64 = 0;
-        memset(&uctx, 0, sizeof uctx);       /* 含 chunked 解码状态 */
-        uctx.conn = *cn;                     /* fd + 所属代次 */
-        uctx.left = left;
-        uctx.llen = llen;
-        if (cl64 <= 0) {                     /* 无 CL：dio 流式上传 → chunked */
-            char te[80] = "";
-            hdr_copy(buf, he, "transfer-encoding", te, sizeof te);
-            if (str_has_ci(te, "chunked")) uctx.chunked = 1;
-        }
-        if (!recv_ops_ready()) {
-            http_respond(cn, 500, "Internal Server Error", "");
-            return;
-        }
-        if (uctx.chunked) {
-            dlog("http: upload chunked (no content-length)");
-            code = g_recv->upload(query, rip, -1, upload_stream, &uctx);
-        } else {
-            code = g_recv->upload(query, rip, cl64, upload_stream, &uctx);
-        }
-        dlog("http: upload -> %d", code);
-        http_respond(cn, code, reason_of(code), "");
-        return;
-    }
-    if (strcmp(method, "POST") == 0 &&
-        strcmp(route, "/api/localsend/v2/cancel") == 0) {
-        int code = recv_ops_ready() ? g_recv->cancel(query, rip) : 500;
-        http_respond(cn, code, reason_of(code), "");
-        return;
-    }
-    http_respond(cn, 404, "Not Found", "{\"error\":\"not found\"}");
 }
 
 /* ---------- accept 线程 + 连接 worker ----------
