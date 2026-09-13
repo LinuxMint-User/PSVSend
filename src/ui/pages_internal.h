@@ -2,7 +2,9 @@
  * 仅供 src/ui/pages*.c 使用，不属于 ui.h 的公共页面接口。
  *
  * 拆分背景：原 pages.c 是单文件上帝模块，按"页面/职责"拆为
- *   pages.c            核心（布局/工具体 + 设备列表 + 文件浏览 + 发送确认 + 进度）
+ *   pages.c            共享状态（进度行清单 xf_*）+ 开机初始化/预热
+ *   pages_send.c       设备列表 + 文件浏览 + 发送确认
+ *   pages_progress.c   进度页（发送/接收共用）
  *   pages_recv.c       接收确认/接收设置（含系统键盘改名）
  *   pages_settings.c   设置 + 目录选择
  * 各文件共享的常量与小工具集中于此（工具以 static inline 提供，避免额外符号）。 */
@@ -83,10 +85,10 @@ static inline void add_row_hit(int id, int top)
 }
 
 /* ---------- 跨页符号 ---------- */
-void files_load(void);          /* pages.c：按 cur_dir 重载 g_app.files */
-void enter_dir(const char *name);   /* pages.c：进入子目录并重载 */
-void parent_dir(void);              /* pages.c：回上级目录（根则退回设备页） */
-void goto_devices(void);            /* pages.c：回设备页并复位传输态（接收收尾/离开进度页用） */
+void files_load(void);          /* pages_send.c：按 cur_dir 重载 g_app.files */
+void enter_dir(const char *name);   /* pages_send.c：进入子目录并重载 */
+void parent_dir(void);              /* pages_send.c：回上级目录（根则退回设备页） */
+void goto_devices(void);            /* pages_progress.c：回设备页并复位传输态（接收收尾/离开进度页用） */
 void open_dir_pick(PageId origin, bool persist, const char *start_dir); /* pages_settings.c */
 void ask_ime_host(void);            /* pages_recv.c：打开系统键盘改本机设备名（设置页主机名行用） */
 void settings_scroll_to(int v);     /* pages_settings.c：设置页滚动偏移（开机预热用） */
