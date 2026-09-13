@@ -1,0 +1,93 @@
+/* pages 内部共享：布局常量 + 各页共用的小工具/跨页符号。
+ * 仅供 src/ui/pages*.c 使用，不属于 ui.h 的公共页面接口。
+ *
+ * 拆分背景：原 pages.c 是单文件上帝模块，按"页面/职责"拆为
+ *   pages.c            核心（布局/工具体 + 设备列表 + 文件浏览 + 发送确认 + 进度）
+ *   pages_recv.c       接收确认/接收设置（含系统键盘改名）
+ *   pages_settings.c   设置 + 目录选择
+ * 各文件共享的常量与小工具集中于此（工具以 static inline 提供，避免额外符号）。 */
+#ifndef PSVSEND_UI_PAGES_INTERNAL_H
+#define PSVSEND_UI_PAGES_INTERNAL_H
+
+#include <vita2d.h>
+#include "ui/ui.h"
+
+/* ---------- 布局常量 ---------- */
+#define LIST_TOP     76                 /* 列表可视区顶 */
+#define LIST_BOTTOM  (SCR_H - 46 - 6)   /* 列表可视区底（页脚上方留白） */
+#define LIST_VIEW_H  (LIST_BOTTOM - LIST_TOP)
+#define ROW_H        56
+#define ROW_STRIDE   62
+#define WID_FILES_SEND 0x8001
+#define WID_DIRPICK_SAVE 0x9001  /* 目录选择页"存到当前目录"触摸按钮 */
+#define DIR_SUFFIX   "/"         /* 目录名后缀 */
+
+/* ---------- 各页共用的小工具 ---------- */
+
+/* 确认/返回键在当前布局下的提示名（随 X/O 布局即时变化） */
+static inline const char *key_confirm(void) { return g_app.confirm_layout == 0 ? "X" : "O"; }
+static inline const char *key_back(void)    { return g_app.confirm_layout == 0 ? "O" : "X"; }
+
+/* 确认/返回键在当前布局下的图形图标 */
+static inline HintIcon icon_confirm(void) { return g_app.confirm_layout == 0 ? HICON_CROSS : HICON_CIRCLE; }
+static inline HintIcon icon_back(void)    { return g_app.confirm_layout == 0 ? HICON_CIRCLE : HICON_CROSS; }
+
+static inline int list_max_scroll(int count)
+{
+    int m = count * ROW_STRIDE - LIST_VIEW_H;
+    return m > 0 ? m : 0;
+}
+
+static inline void clamp_scroll(int *st, int count)
+{
+    int m = list_max_scroll(count);
+    if (*st < 0) *st = 0;
+    if (*st > m) *st = m;
+}
+
+/* 让选中行保持完整可见（键盘导航用；最小滚动量） */
+static inline void keep_sel_visible(int *st, int count, int sel)
+{
+    int top = sel * ROW_STRIDE;
+    int bot = top + ROW_H;
+    if (top < *st) *st = top;
+    if (bot > *st + LIST_VIEW_H) *st = bot - LIST_VIEW_H;
+    clamp_scroll(st, count);
+}
+
+/* 触摸拖动：内容跟随手指；选中 = 手指压住的行（贴边时顺行移动） */
+static inline void list_drag(const Input *in, int count, int *scroll, int *press, int *sel)
+{
+    int vis_top, vis_bot, row;
+    if (in->drag_start) *press = *scroll;
+    int ns = *press - in->drag_dy;      /* 手指下移(dy>0) → 内容下移 → 滚动减小 */
+    clamp_scroll(&ns, count);
+    *scroll = ns;
+    vis_top = *scroll / ROW_STRIDE;
+    vis_bot = (*scroll + LIST_VIEW_H) / ROW_STRIDE;
+    row = (in->drag_y - LIST_TOP + *scroll) / ROW_STRIDE;
+    if (row < vis_top) row = vis_top;
+    if (row > vis_bot) row = vis_bot;
+    if (row < 0) row = 0;
+    if (row >= count) row = count - 1;
+    *sel = row;
+}
+
+/* 把一行注册成触摸区（可视区外部分裁掉，避免误命中头部/页脚） */
+static inline void add_row_hit(int id, int top)
+{
+    Rect h = { 24, top, SCR_W - 48, ROW_H };
+    if (h.y < LIST_TOP) { h.h -= LIST_TOP - h.y; h.y = LIST_TOP; }
+    if (h.y + h.h > LIST_BOTTOM) h.h = LIST_BOTTOM - h.y;
+    if (h.h > 0) w_add(id, h);
+}
+
+/* ---------- 跨页符号 ---------- */
+void files_load(void);          /* pages.c：按 cur_dir 重载 g_app.files */
+void enter_dir(const char *name);   /* pages.c：进入子目录并重载 */
+void parent_dir(void);              /* pages.c：回上级目录（根则退回设备页） */
+void open_dir_pick(PageId origin, bool persist, const char *start_dir); /* pages_settings.c */
+void ask_ime_host(void);            /* pages.c：打开系统键盘改本机设备名（设置页主机名行用） */
+void settings_scroll_to(int v);     /* pages_settings.c：设置页滚动偏移（开机预热用） */
+
+#endif
