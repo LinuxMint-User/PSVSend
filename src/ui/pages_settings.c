@@ -18,8 +18,9 @@
  * g_app.set_sel 存设置项 id（SET_ITEM_*）；分组标题不参与选择。
  * 每行触摸分成两半：左半=上一档，右半=下一档（主机名行点任意半开键盘改名）。 */
 enum {
-    SET_ITEM_THEME = 0,    /* 显示：主题（色系：Yaru / OLED） */
+    SET_ITEM_THEME = 0,    /* 显示：主题（色系：Yaru / OLED / Custom） */
     SET_ITEM_LIGHT,        /* 显示：外观（明暗：深色 / 浅色；OLED 固定深色，不可改） */
+    SET_ITEM_COLOR,        /* 显示：主色（自定义主题的色盘；动作行→进色盘页） */
     SET_ITEM_LANG,         /* 显示：界面语言 */
     SET_ITEM_KEY,          /* 操作：确认键布局 */
     SET_ITEM_PANE,         /* 操作：主页两栏布局（设备在左 / 文件在左） */
@@ -36,6 +37,7 @@ enum {
     SET_SLOT_HOST,
     SET_SLOT_HDR_B,        /* 分组：显示 */
     SET_SLOT_THEME,
+    SET_SLOT_COLOR,        /* 仅在主题=Custom 时显示（见 slot_visible） */
     SET_SLOT_LIGHT,
     SET_SLOT_LANG,
     SET_SLOT_HDR_C,        /* 分组：操作 */
@@ -81,6 +83,7 @@ static int slot_item(int slot)
     case SET_SLOT_HOST:  return SET_ITEM_HOSTNAME;
     case SET_SLOT_THEME: return SET_ITEM_THEME;
     case SET_SLOT_LIGHT: return SET_ITEM_LIGHT;
+    case SET_SLOT_COLOR: return SET_ITEM_COLOR;
     case SET_SLOT_LANG:  return SET_ITEM_LANG;
     case SET_SLOT_KEY:   return SET_ITEM_KEY;
     case SET_SLOT_PANE:  return SET_ITEM_PANE;
@@ -98,6 +101,7 @@ static int item_slot(int item)
     case SET_ITEM_SAVEDIR:  return SET_SLOT_SAVEDIR;
     case SET_ITEM_THEME:    return SET_SLOT_THEME;
     case SET_ITEM_LIGHT:    return SET_SLOT_LIGHT;
+    case SET_ITEM_COLOR:    return SET_SLOT_COLOR;
     case SET_ITEM_LANG:     return SET_SLOT_LANG;
     case SET_ITEM_KEY:      return SET_SLOT_KEY;
     case SET_ITEM_PANE:     return SET_SLOT_PANE;
@@ -107,8 +111,17 @@ static int item_slot(int item)
     return -1;
 }
 
+/* 行槽是否显示：色盘行只在当前主题为自定义时出现（其他主题下它没有作用，
+ * 显示出来只会让人困惑）；隐藏行不占位、不参与导航、不注册触摸。 */
+static bool slot_visible(int slot)
+{
+    if (slot == SET_SLOT_COLOR) return g_app.theme_id == THEME_CUSTOM;
+    return true;
+}
+
 static int set_row_h(int slot)
 {
+    if (!slot_visible(slot))     return 0;
     if (slot == SET_SLOT_HINT)   return SET_HINT_H;
     if (slot == SET_SLOT_ABOUT_A) return SET_LOGO_H;
     if (slot == SET_SLOT_ABOUT_B) return SET_ADAPT_H;
@@ -138,14 +151,14 @@ static void set_clamp_scroll(void)
     if (set_scroll > m) set_scroll = m;
 }
 
-/* 从 slot 出发沿 dir 找下一个可选项行槽（跳过分组标题），越界原地不动 */
+/* 从 slot 出发沿 dir 找下一个可选项行槽（跳过分组标题与隐藏行），越界原地不动 */
 static int slot_step(int slot, int dir)
 {
     int s = slot;
     for (;;) {
         s += dir;
         if (s < 0 || s >= SET_SLOT_N) return slot;
-        if (slot_item(s) >= 0) return s;
+        if (slot_visible(s) && slot_item(s) >= 0) return s;
     }
 }
 
@@ -172,6 +185,9 @@ static void settings_change(int item, int dir)
         g_cfg.theme_id = g_app.theme_id;
         theme_set(g_app.theme_id, g_app.light_mode);
         config_save();
+        /* 切离 Custom 后色盘行隐藏：焦点若正落在它上面，退回主题行 */
+        if (g_app.theme_id != THEME_CUSTOM && g_app.set_sel == SET_ITEM_COLOR)
+            g_app.set_sel = SET_ITEM_THEME;
     } else if (item == SET_ITEM_LIGHT) {
         /* 明暗（与色系正交）：OLED 固定深色，无浅色变体 → 该项对它不响应 */
         if (g_app.theme_id == THEME_OLED) return;
@@ -246,6 +262,7 @@ void page_settings_render(void)
         int item = slot_item(slot);
         int top = LIST_TOP - set_scroll + set_row_top(slot);
         int h = set_row_h(slot);
+        if (h == 0) continue;                   /* 隐藏行（非自定义主题下的色盘行） */
         if (top + h <= LIST_TOP) continue;      /* 整行滚到可视区上方外 */
         if (top >= LIST_BOTTOM) break;          /* 以下都滚到可视区下方外 */
         if (item < 0) {
@@ -307,6 +324,22 @@ void page_settings_render(void)
         case SET_ITEM_LIGHT:
             w_row(r, tr("Appearance"), light_v, item == g_app.set_sel);
             break;
+        case SET_ITEM_COLOR: {
+            /* 主色行：右端不是文字而是色块——直接预览自定义主色（纯色，不随
+             * 当前主题明暗变），描边保证浅色主题下也能看清边界。 */
+            uint32_t card = item == g_app.set_sel ? theme->accent : theme->card;
+            uint32_t tc = item == g_app.set_sel ? theme->accent_text : theme->text;
+            w_rect(r, card);
+            int mh = 0;
+            w_text_w(1.25f, tr("Primary color"), NULL, &mh);
+            w_text(r.x + 24, r.y + (r.h - mh) / 2, 1.25f, tc, "%s",
+                   tr("Primary color"));
+            Rect chip = { r.x + r.w - 24 - 96, r.y + (r.h - 32) / 2, 96, 32 };
+            w_rect(chip, theme_hsv(g_cfg.custom_h, g_cfg.custom_s, g_cfg.custom_v));
+            w_rect_outline(chip, item == g_app.set_sel ? theme->accent_text
+                                                       : theme->border);
+            break;
+        }
         case SET_ITEM_LANG:
             w_row(r, tr("Language"), lang_v, item == g_app.set_sel);
             break;
@@ -390,6 +423,7 @@ void page_settings_input(const Input *in)
                 if (item == SET_ITEM_HOSTNAME) ask_ime_host();
                 else if (item == SET_ITEM_SAVEDIR)
                     open_dir_pick(PAGE_SETTINGS, true, g_cfg.save_dir);
+                else if (item == SET_ITEM_COLOR) open_color_pick();
                 else settings_change(item, (id & 1) ? 1 : -1);
             }
         }
@@ -411,6 +445,7 @@ void page_settings_input(const Input *in)
         if (item == SET_ITEM_HOSTNAME) ask_ime_host();
         else if (item == SET_ITEM_SAVEDIR)
             open_dir_pick(PAGE_SETTINGS, true, g_cfg.save_dir);
+        else if (item == SET_ITEM_COLOR) open_color_pick();
         else if (item != SET_ITEM_KEY)
             settings_change(item, 1);
     }
@@ -567,4 +602,200 @@ void page_dir_pick_input(const Input *in)
         return;
     }
     if (in->back) dpick_up();
+}
+
+/* ================= 色盘页（自定义主题选主色） =================
+ * 三条 HSV 渐变条（色相 / 饱和度 / 明度）+ 主色预览区：上下选条、左右调值，
+ * 触摸可直接点/拖某条定位。选色实时生效——进入即以 Custom 主题预览整套配色
+ * （页头/页脚/背景跟着变），确认落盘并切到 Custom；取消则丢弃工作值、还原
+ * 进入前的色系。整套色值由主色推导，见 theme.c build_custom。 */
+#define CP_BAR_X   190
+#define CP_BAR_W   660
+#define CP_BAR_H   48
+#define CP_BAR_Y0  108
+#define CP_BAR_DY  84
+#define CP_PREV_Y  360
+#define CP_PREV_H  78
+
+static int cp_h, cp_s, cp_v;   /* 工作值（未确认前不写 config） */
+static int cp_focus;           /* 0=色相 1=饱和度 2=明度 */
+static int cp_prev_theme;      /* 进入前的色系：取消时还原 */
+
+static void cp_apply(void)
+{
+    theme_set_custom(cp_h, cp_s, cp_v);
+    theme_set(THEME_CUSTOM, g_app.light_mode);
+}
+
+static int cp_val_of(int axis)
+{
+    if (axis == 0) return cp_h * 100 / 359;   /* 色相 0-359 折算成 0-100 定位 */
+    return axis == 1 ? cp_s : cp_v;
+}
+
+static uint32_t cp_axis_color(int axis, int t)
+{
+    if (axis == 0) return theme_hsv(t * 359 / 100, cp_s, cp_v);
+    if (axis == 1) return theme_hsv(cp_h, t, cp_v);
+    return theme_hsv(cp_h, cp_s, t);
+}
+
+static int cp_axis_at(int y)
+{
+    int a;
+    for (a = 0; a < 3; a++) {
+        int top = CP_BAR_Y0 + a * CP_BAR_DY;
+        if (y >= top - 8 && y <= top + CP_BAR_H + 8) return a;
+    }
+    return -1;
+}
+
+static void cp_set_from_x(int axis, int x)
+{
+    int t = (x - CP_BAR_X) * 100 / (CP_BAR_W - 1);
+    if (t < 0) t = 0;
+    if (t > 100) t = 100;
+    if (axis == 0)      cp_h = t * 359 / 100;
+    else if (axis == 1) cp_s = t;
+    else                cp_v = t;
+    cp_apply();
+}
+
+static void cp_adjust(int axis, int dir)
+{
+    if (axis == 0) {
+        cp_h += dir * 4;
+        if (cp_h < 0) cp_h += 360;
+        if (cp_h > 359) cp_h -= 360;
+    } else if (axis == 1) {
+        cp_s += dir * 3;
+        if (cp_s < 0) cp_s = 0;
+        if (cp_s > 100) cp_s = 100;
+    } else {
+        cp_v += dir * 3;
+        if (cp_v < 0) cp_v = 0;
+        if (cp_v > 100) cp_v = 100;
+    }
+    cp_apply();
+}
+
+void open_color_pick(void)
+{
+    cp_prev_theme = g_app.theme_id;
+    cp_h = g_cfg.custom_h;
+    cp_s = g_cfg.custom_s;
+    cp_v = g_cfg.custom_v;
+    cp_focus = 0;
+    cp_apply();                     /* 进入即预览：整套配色随选色实时变 */
+    g_app.page = PAGE_COLOR_PICK;
+}
+
+/* 确认：工作值落盘并把当前色系切到 Custom */
+static void cp_commit(void)
+{
+    g_cfg.custom_h = cp_h;
+    g_cfg.custom_s = cp_s;
+    g_cfg.custom_v = cp_v;
+    g_cfg.theme_id = THEME_CUSTOM;
+    g_app.theme_id = THEME_CUSTOM;
+    theme_set(THEME_CUSTOM, g_app.light_mode);
+    config_save();
+    g_app.set_sel = SET_ITEM_COLOR;
+    g_app.page = PAGE_SETTINGS;
+}
+
+/* 取消：丢弃工作值（还原盘上主色），并回到进入前的色系 */
+static void cp_cancel(void)
+{
+    theme_set_custom(g_cfg.custom_h, g_cfg.custom_s, g_cfg.custom_v);
+    g_app.theme_id = cp_prev_theme;
+    theme_set(g_app.theme_id, g_app.light_mode);
+    g_app.set_sel = SET_ITEM_COLOR;
+    g_app.page = PAGE_SETTINGS;
+}
+
+static void cp_draw_bar(int axis, const char *label)
+{
+    const int seg = 64;
+    int y = CP_BAR_Y0 + axis * CP_BAR_DY;
+    bool foc = (cp_focus == axis);
+    int i, pos, cx;
+
+    w_text(28, y + 8, 1.1f, foc ? theme->text : theme->text_dim, "%s", label);
+    for (i = 0; i < seg; i++) {
+        int x = CP_BAR_X + CP_BAR_W * i / seg;
+        int x2 = CP_BAR_X + CP_BAR_W * (i + 1) / seg;
+        w_rect((Rect){ x, y, x2 - x, CP_BAR_H },
+               cp_axis_color(axis, i * 100 / (seg - 1)));
+    }
+    w_rect_outline((Rect){ CP_BAR_X, y, CP_BAR_W, CP_BAR_H },
+                   foc ? theme->text : theme->border);
+    /* 游标：黑底 + 白线，任何底色上都看得清 */
+    pos = cp_val_of(axis) * (CP_BAR_W - 1) / 100;
+    cx = CP_BAR_X + pos;
+    w_rect((Rect){ cx - 3, y - 6, 6, CP_BAR_H + 12 }, RGBA8(0, 0, 0, 200));
+    w_rect((Rect){ cx - 1, y - 6, 3, CP_BAR_H + 12 }, RGBA8(255, 255, 255, 255));
+}
+
+void page_color_pick_render(void)
+{
+    static const char *cp_labels[] = { "Hue", "Saturation", "Brightness" };
+    uint32_t c = theme_hsv(cp_h, cp_s, cp_v);
+    int r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
+    int axis;
+
+    w_page_header(tr("Choose color"));
+    for (axis = 0; axis < 3; axis++)
+        cp_draw_bar(axis, tr(cp_labels[axis]));
+
+    /* 主色预览：大色块 + 十六进制值（文字色按亮度取白/深，保证可读） */
+    Rect pv = { CP_BAR_X, CP_PREV_Y, CP_BAR_W, CP_PREV_H };
+    w_rect(pv, c);
+    w_rect_outline(pv, theme->border);
+    {
+        char hex[16];
+        int tw = 0, th = 0;
+        uint32_t tc = (r * 2126 + g * 7152 + b * 722) / 10000 > 140
+                          ? RGBA8(20, 20, 20, 255) : RGBA8(255, 255, 255, 255);
+        snprintf(hex, sizeof hex, "#%02X%02X%02X", r, g, b);
+        w_text_w(1.2f, hex, &tw, &th);
+        w_text(pv.x + (pv.w - tw) / 2, pv.y + (pv.h - th) / 2, 1.2f, tc, "%s", hex);
+    }
+
+    HintSeg segs[4] = { 0 };
+    int ns = 0;
+    segs[ns].key = HKEY_DPAD;    segs[ns].dir_off = HDIR_HORZ;  /* 只亮上下：选条 */
+    segs[ns++].text = tr("Choose");
+    segs[ns].key = HKEY_DPAD;    segs[ns].dir_off = HDIR_VERT;  /* 只亮左右：调值 */
+    segs[ns++].text = tr("Adjust");
+    segs[ns].key = HKEY_CONFIRM; segs[ns++].text = tr("Save");
+    segs[ns].key = HKEY_BACK;    segs[ns++].text = tr("Cancel");
+    w_page_footer_segs(segs, ns);
+}
+
+void page_color_pick_input(const Input *in)
+{
+    int axis;
+    /* 触摸：点/拖某条 = 选中该条并按横坐标定位（纵向拖过条界可换条继续调） */
+    if (in->drag_start) {
+        axis = cp_axis_at(in->drag_y);
+        if (axis >= 0) { cp_focus = axis; cp_set_from_x(axis, in->drag_x); }
+        return;
+    }
+    if (in->dragging) {
+        axis = cp_axis_at(in->drag_y);
+        if (axis >= 0) cp_set_from_x(axis, in->drag_x);
+        return;
+    }
+    if (in->tap) {
+        axis = cp_axis_at(in->tap_y);
+        if (axis >= 0) { cp_focus = axis; cp_set_from_x(axis, in->tap_x); }
+        return;
+    }
+    if (in->up)    cp_focus = (cp_focus + 2) % 3;
+    if (in->down)  cp_focus = (cp_focus + 1) % 3;
+    if (in->left)  cp_adjust(cp_focus, -1);
+    if (in->right) cp_adjust(cp_focus, 1);
+    if (in->confirm) { cp_commit(); return; }
+    if (in->back)    { cp_cancel(); return; }
 }

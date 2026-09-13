@@ -53,6 +53,7 @@ void pages_init(void)
     g_app.page = PAGE_DEVICES;
     g_app.prog_running = false;
     g_app.done = false;
+    theme_set_custom(g_cfg.custom_h, g_cfg.custom_s, g_cfg.custom_v);
     theme_set(g_app.theme_id, g_app.light_mode);
     api_start();                         /* 网络底座：net + UDP 发现线程 */
 }

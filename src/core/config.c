@@ -43,6 +43,9 @@ static void cfg_defaults(void)
     g_cfg.port = DEFAULT_PORT;
     g_cfg.theme_id = 0;
     g_cfg.light_mode = 0;              /* 明暗：默认深色 */
+    g_cfg.custom_h = 210;              /* 自定义主色默认：偏冷的蓝（用户可改） */
+    g_cfg.custom_s = 65;
+    g_cfg.custom_v = 90;
     g_cfg.confirm_layout = 0;
     g_cfg.pane_swap = 0;               /* 主页两栏：默认设备在左 */
     g_cfg.lang = 0;                    /* 语言偏好默认跟随系统 */
@@ -75,6 +78,9 @@ void config_init(void)
             if (json_get_int(buf, "port", &v)) g_cfg.port = (int)v;
             if (json_get_int(buf, "theme", &v)) g_cfg.theme_id = (int)v;
             if (json_get_int(buf, "lightMode", &v)) g_cfg.light_mode = (int)v ? 1 : 0;
+            if (json_get_int(buf, "customH", &v)) g_cfg.custom_h = (int)v;
+            if (json_get_int(buf, "customS", &v)) g_cfg.custom_s = (int)v;
+            if (json_get_int(buf, "customV", &v)) g_cfg.custom_v = (int)v;
             if (json_get_int(buf, "confirmLayout", &v)) g_cfg.confirm_layout = (int)v;
             if (json_get_int(buf, "paneSwap", &v)) g_cfg.pane_swap = (int)v;
             if (json_get_int(buf, "lang", &v)) g_cfg.lang = (int)v;
@@ -108,6 +114,9 @@ void config_init(void)
                                                sizeof g_cfg.fingerprint);
     if (g_cfg.port <= 0 || g_cfg.port > 65535) g_cfg.port = DEFAULT_PORT;
     if (g_cfg.pane_swap != 0 && g_cfg.pane_swap != 1) g_cfg.pane_swap = 0;
+    if (g_cfg.custom_h < 0 || g_cfg.custom_h > 359) g_cfg.custom_h = 210;
+    if (g_cfg.custom_s < 0 || g_cfg.custom_s > 100) g_cfg.custom_s = 65;
+    if (g_cfg.custom_v < 0 || g_cfg.custom_v > 100) g_cfg.custom_v = 90;
     if (!g_cfg.alias[0]) strncpy(g_cfg.alias, DEFAULT_ALIAS, sizeof g_cfg.alias - 1);
     if (g_cfg.upd_auto < 0 || g_cfg.upd_auto > 3) g_cfg.upd_auto = 2;
     if (g_cfg.upd_last < 0) g_cfg.upd_last = 0;
@@ -147,6 +156,9 @@ void config_save(void)
                    "  \"port\": %d,\n"
                    "  \"theme\": %d,\n"
                    "  \"lightMode\": %d,\n"
+                   "  \"customH\": %d,\n"
+                   "  \"customS\": %d,\n"
+                   "  \"customV\": %d,\n"
                    "  \"confirmLayout\": %d,\n"
                    "  \"paneSwap\": %d,\n"
                    "  \"lang\": %d,\n"
@@ -156,6 +168,7 @@ void config_save(void)
                    "  \"knownIps\": \"%s\"\n"
                    "}\n",
                    a, f, g_cfg.port, g_cfg.theme_id, g_cfg.light_mode,
+                   g_cfg.custom_h, g_cfg.custom_s, g_cfg.custom_v,
                    g_cfg.confirm_layout, g_cfg.pane_swap,
                    g_cfg.lang, g_cfg.upd_auto, g_cfg.upd_last, d, k);
     cfg_unlock();

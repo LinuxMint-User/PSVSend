@@ -120,6 +120,7 @@ static void render_page(void)
     case PAGE_DIR_PICK:      page_dir_pick_render(); break;
     case PAGE_PROGRESS:      page_progress_render(); break;
     case PAGE_SETTINGS:      page_settings_render(); break;
+    case PAGE_COLOR_PICK:    page_color_pick_render(); break;
     default: break;
     }
 }
@@ -135,6 +136,7 @@ static void input_page(const Input *in)
     case PAGE_DIR_PICK:      page_dir_pick_input(in); break;
     case PAGE_PROGRESS:      page_progress_input(in); break;
     case PAGE_SETTINGS:      page_settings_input(in); break;
+    case PAGE_COLOR_PICK:    page_color_pick_input(in); break;
     default: break;
     }
 }

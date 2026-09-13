@@ -75,6 +75,7 @@ typedef enum {
     PAGE_DIR_PICK,     /* 目录选择（设置页默认保存目录 / 接收本次目录共用） */
     PAGE_PROGRESS,     /* 传输进度 */
     PAGE_SETTINGS,     /* 设置 */
+    PAGE_COLOR_PICK,   /* 色盘：自定义主题选主色（设置页子页） */
     PAGE_COUNT
 } PageId;
 
@@ -177,6 +178,8 @@ void page_progress_render(void);
 void page_progress_input(const Input *in);
 void page_settings_render(void);
 void page_settings_input(const Input *in);
+void page_color_pick_render(void);
+void page_color_pick_input(const Input *in);
 
 /* ---------- 系统键盘（IME）改名事务（pages.c + app/ime.c） ---------- */
 bool page_ime_busy(void);   /* 改名事务进行中：主循环应跳过页面按键/触摸 */

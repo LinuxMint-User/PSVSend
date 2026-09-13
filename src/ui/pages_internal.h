@@ -160,6 +160,7 @@ void parent_dir(void);              /* pages_send.c：回上级目录（根则�
 void pane_focus_default(void);      /* pages_send.c：按已选文件数定主页焦点栏（有文件→设备栏） */
 void goto_devices(void);            /* pages_progress.c：回设备页并复位传输态（接收收尾/离开进度页用） */
 void open_dir_pick(PageId origin, bool persist, const char *start_dir); /* pages_settings.c */
+void open_color_pick(void);         /* pages_settings.c：进自定义色盘页（实时预览、确认落盘） */
 void ask_ime_host(void);            /* pages_recv.c：打开系统键盘改本机设备名（设置页主机名行用） */
 void settings_scroll_to(int v);     /* pages_settings.c：设置页滚动偏移（开机预热用） */
 void settings_open(void);           /* pages_settings.c：进设置页（焦点回首项、滚动归顶） */

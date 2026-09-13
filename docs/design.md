@@ -181,7 +181,7 @@ void on_session_done(const Session *s);      // 完成 / 失败
 | 接收请求确认 | 来者名字/平台 + 文件数 + 预览（含取消态） | 接受 / 设置 / 拒绝；发送方取消 → 单个关闭 |
 | 接收设置 | 本次保存目录（可点进目录选择器改本次）+ 逐文件改名（系统键盘 SceIme）/勾选跳过 | 方向键选行、确认勾选、返回继续 |
 | 传输进度 | 会话列表 + 进度条 | 取消 |
-| 设置 | 主题、布局（两栏左右互换）、界面语言、确认键布局（用**左右方向键**切换）、主机名（系统键盘改设备名）、保存目录、检查更新/自动频率 | 上下选行、确认改值；进入时焦点落在首项并滚回顶部 |
+| 设置 | 主题、主色（色盘，**仅主题 = 自定义时显示**）、外观（深色/浅色）、布局（两栏左右互换）、界面语言、确认键布局（用**左右方向键**切换）、主机名（系统键盘改设备名）、保存目录、检查更新/自动频率 | 上下选行、确认改值；进入时焦点落在首项并滚回顶部 |
 
 ### 5.2 架构：事件驱动 + 状态机
 
@@ -210,11 +210,12 @@ void on_session_done(const Session *s);      // 完成 / 失败
 ### 5.4 主题系统（theme.c）
 
 - 主题 = 一组颜色常量（bg / card / accent / accent_text / text / text_dim / border / success / danger / warn / overlay），UI 绘制只引用主题变量（**UI 层零硬编码颜色**），**运行时可切换，下帧生效**
-- 内置主题在**两个正交轴**上组合：色系（`ThemeId`：Yaru / OLED）× 明暗（`THEME_DARK` / `THEME_LIGHT`），色值表 `themes[色系][明暗]`，`theme_set(id, mode)`；config 存 `theme`（色系）+ `lightMode`（明暗），设置页对应「主题」「外观」两行。将来自定义色盘 = 色系列加一项，明暗自动正交
+- 内置主题在**两个正交轴**上组合：色系（`ThemeId`：Yaru / OLED / Custom）× 明暗（`THEME_DARK` / `THEME_LIGHT`），色值表 `themes[色系][明暗]`，`theme_set(id, mode)`；config 存 `theme`（色系）+ `lightMode`（明暗），设置页对应「主题」「外观」两行。自定义即色系列加一项（Custom），明暗自动正交
   - **OLED**：纯黑 `#000000` 底 + 卡片 `#111111` + 白字高对比（PSV1000 OLED 最佳）；定位纯黑高对比，**无浅色变体**（`theme_set` 对它恒定走深色档，设置页「外观」行显示"深色（固定）"且不可改）
   - **Yaru**：深灰底 + Ubuntu 橙 `#E95420` 主色 + 圆角扁平卡片（vita2d 矩形拼接画圆角，不依赖图片）；**浅色版**（Yaru × LIGHT）= 白卡片 + 主色压深（198,62,20）+ 状态色整体压深（亮绿/亮红/黄在白底对比不足）
   - **浅色系里 `border` 必须比 `text_dim` 更浅**：它兼作"禁用 / 未聚焦"色（页脚灭臂、未聚焦卡片底），否则"禁用"会读成"更黑更抢眼"，语义反转
-  - **自定义**（后续实现）：色盘选主色 → **RGB↔HSV 推导整套**（背景=主色暗化、卡片=背景+10% 亮度、高亮=主色、文字按对比度取白/深），保证配色协调
+  - **Custom（自定义，2026-09-13 d108/d109 落地）**：不写死色值，只存用户所选主色 HSV（config `customH/customS/customV`，h 0-359 / s 0-100 / v 0-100），运行时由 `theme_set_custom()` 经 `theme_hsv()` 推导整套（**暗 / 浅各一套**，明暗轴照常正交）：背景 = 主色压暗 + 降饱和、卡片 / 边线逐级提亮、`accent` = 主色、文字按对比度取白/深、`accent_text` 按主色感知亮度（0.2126R+0.7152G+0.0722B）取深/白；浅色系 `border` 比 `text_dim` 更浅（同"禁用=更弱"口径）
+    - **色盘页（`PAGE_COLOR_PICK`）**：设置页「主色」行**仅在主题 = Custom 时显示**（其他主题下无意义；隐藏行不占位、不参与上下导航、不注册触摸），点进色盘页 = 三条 HSV 渐变条（上下选条、左右调值、触摸点 / 拖定位），**进入即以 Custom 实时预览整套配色**；确认 = 落盘主色并切到 Custom，取消 = 还原盘上主色与进入前色系
 - 默认主题：Yaru 深色
 
 ### 5.5 字体
@@ -252,7 +253,7 @@ void on_session_done(const Session *s);      // 完成 / 失败
 src/ui/
 ├── ui.h            # App 全局状态、页面枚举(PageId)、Input 抽象、font_get
 ├── ui_main.c       # 主循环：输入 → 事件 → 渲染 + 字体按字号分槽（font_get 实现）+ 开屏/预热
-├── theme.c/.h      # 主题颜色表 + 切换（Theme 结构，OLED / Yaru）
+├── theme.c/.h      # 主题颜色表 + 切换（Theme 结构，OLED / Yaru / Custom 主色推导）
 ├── widgets.c       # 文本/列表/按钮/进度条/弹窗（FONT_PX / FONT_ASC 常量）
 ├── hintbar.c/.h    # 底部按键提示条：键位图标绘制 + 段排序 + 排版（HintKey / HintSeg / w_page_footer_segs）
 ├── input.c         # 按键 + 触摸 → 抽象动作
@@ -271,11 +272,11 @@ src/ui/
 3. 文件浏览页（读 ux0 真目录）
 4. 确认弹窗 + 进度条
 5. 接后端事件队列，换真数据
-6. 设置页（含主题切换；自定义色盘后续）
+6. 设置页（含主题切换 + 自定义色盘）
 
 ## 6. 配置与存储
 
-- `ux0:data/psvsend/config`（JSON，键为驼峰）：alias（设备名）、fingerprint（随机身份串）、port、theme（0=Yaru / 1=OLED）、confirmLayout（0=美式 / 1=日式）、paneSwap（主页两栏左右位置：0=设备在左默认 / 1=文件在左）、lang（0=跟随系统 / 1=English / 2=中文）、knownIps（历史在线设备 IP，逗号分隔、LRU、上限 24，主动扫描种子）、updateAuto（更新检查：0=关 / 1=每天 / 2=每周默认 / 3=每月）、updateLast（上次检查更新的网络 unix 秒，自动节流）、saveDir（默认接收目录，默认 `ux0:data/psvsend/downloads`；读回去尾斜杠、非法回退默认）
+- `ux0:data/psvsend/config`（JSON，键为驼峰）：alias（设备名）、fingerprint（随机身份串）、port、theme（0=Yaru / 1=OLED / 2=自定义）、lightMode（0=深色 / 1=浅色）、customH / customS / customV（自定义主色 HSV，h 0-359 / s 0-100 / v 0-100，默认 210/65/90；缺字段回默认、越界回默认）、confirmLayout（0=美式 / 1=日式）、paneSwap（主页两栏左右位置：0=设备在左默认 / 1=文件在左）、lang（0=跟随系统 / 1=English / 2=中文）、knownIps（历史在线设备 IP，逗号分隔、LRU、上限 24，主动扫描种子）、updateAuto（更新检查：0=关 / 1=每天 / 2=每周默认 / 3=每月）、updateLast（上次检查更新的网络 unix 秒，自动节流）、saveDir（默认接收目录，默认 `ux0:data/psvsend/downloads`；读回去尾斜杠、非法回退默认）
 - `ux0:data/psvsend/downloads/`：接收文件的默认目录（config `saveDir` 可改；设置页持久改、接收 Setup 临时改本次）
 - 首次启动 `sceIoMkdir` 幂等创建（已存在返回 0x80410011，忽略）
 
@@ -298,8 +299,8 @@ src/ui/
 ## 9. 待定问题
 
 - [x] 中文字体：已落地（freetype 双字体 Droid Sans + Fallback，按字号分槽绘制，见 §5.5）；升部实测校准 0.81、字号基准 20px@scale1，2026-09-04 真机确认显示正常
-- [ ] 深浅色切换是否做（当前统一深色）
-- [ ] 自定义主题色盘的实现时机（先 OLED/Yaru，色盘后置）
+- [x] 深浅色切换：已落地（2026-09-13 d102，见 §5.4）——色系 × 明暗两正交轴，设置页「外观」行切深色/浅色（OLED 固定深色）；config `lightMode`
+- [x] 自定义主题色盘：已落地（2026-09-13 d108/d109，见 §5.4）——色系加 Custom，只存主色 HSV（`customH/customS/customV`）运行时推导整套；设置页「主色」行（仅 Custom 时显示）进色盘页，实时预览、确认落盘、取消还原
 - [x] HTTP 解析兼容清单最终确认：**chunked 已落地**——http.c 对无 Content-Length 的请求按 `Transfer-Encoding: chunked` 走 chunked 解码（upload_stream/chunked_stream），dio/官方客户端流式上传真机验证；大文件 upload 一律不进内存。2026-09-07 确认
 - [x] 接收设置页：文件重命名输入：已落地（2026-09-09，SceIme 系统键盘，见 §1「实现现状」）——接收 Setup 每行可改保存名；设置页主机名改名已落地（同日，见 §1）
 - [x] 接收设置页：本次保存目录选择：已落地（2026-09-09，见 §1「实现现状」）——接收 Setup 目录行可点进 ux0 目录选择器改本次目录（内存 recv_dir），设置页「保存目录」持久改默认（config `saveDir`）；仅 ux0 单分区、无新建目录入口
