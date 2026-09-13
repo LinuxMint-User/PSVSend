@@ -43,6 +43,7 @@ static void cfg_defaults(void)
     g_cfg.port = DEFAULT_PORT;
     g_cfg.theme_id = 0;
     g_cfg.confirm_layout = 0;
+    g_cfg.pane_swap = 0;               /* 主页两栏：默认设备在左 */
     g_cfg.lang = 0;                    /* 语言偏好默认跟随系统 */
     g_cfg.known_n = 0;
     g_cfg.upd_auto = 2;                /* 自动检查更新：默认每周 */
@@ -73,6 +74,7 @@ void config_init(void)
             if (json_get_int(buf, "port", &v)) g_cfg.port = (int)v;
             if (json_get_int(buf, "theme", &v)) g_cfg.theme_id = (int)v;
             if (json_get_int(buf, "confirmLayout", &v)) g_cfg.confirm_layout = (int)v;
+            if (json_get_int(buf, "paneSwap", &v)) g_cfg.pane_swap = (int)v;
             if (json_get_int(buf, "lang", &v)) g_cfg.lang = (int)v;
             if (json_get_int(buf, "updateAuto", &v)) g_cfg.upd_auto = (int)v;
             if (json_get_int(buf, "updateLast", &v)) g_cfg.upd_last = (int)v;
@@ -103,6 +105,7 @@ void config_init(void)
     if (!g_cfg.fingerprint[0]) gen_fingerprint(g_cfg.fingerprint,
                                                sizeof g_cfg.fingerprint);
     if (g_cfg.port <= 0 || g_cfg.port > 65535) g_cfg.port = DEFAULT_PORT;
+    if (g_cfg.pane_swap != 0 && g_cfg.pane_swap != 1) g_cfg.pane_swap = 0;
     if (!g_cfg.alias[0]) strncpy(g_cfg.alias, DEFAULT_ALIAS, sizeof g_cfg.alias - 1);
     if (g_cfg.upd_auto < 0 || g_cfg.upd_auto > 3) g_cfg.upd_auto = 2;
     if (g_cfg.upd_last < 0) g_cfg.upd_last = 0;
@@ -142,6 +145,7 @@ void config_save(void)
                    "  \"port\": %d,\n"
                    "  \"theme\": %d,\n"
                    "  \"confirmLayout\": %d,\n"
+                   "  \"paneSwap\": %d,\n"
                    "  \"lang\": %d,\n"
                    "  \"updateAuto\": %d,\n"
                    "  \"updateLast\": %d,\n"
@@ -149,6 +153,7 @@ void config_save(void)
                    "  \"knownIps\": \"%s\"\n"
                    "}\n",
                    a, f, g_cfg.port, g_cfg.theme_id, g_cfg.confirm_layout,
+                   g_cfg.pane_swap,
                    g_cfg.lang, g_cfg.upd_auto, g_cfg.upd_last, d, k);
     cfg_unlock();
     if (len < 0 || len >= (int)sizeof out) return;

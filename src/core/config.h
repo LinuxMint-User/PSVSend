@@ -26,6 +26,7 @@ typedef struct {
     int  port;               /* HTTP 服务端口（默认 53317，与协议一致） */
     int  theme_id;           /* 0=Yaru 1=OLED */
     int  confirm_layout;     /* 0=美式 1=日式 */
+    int  pane_swap;          /* 发送主页两栏布局：0=设备在左 1=文件在左（照顾左撇子） */
     int  lang;               /* 界面语言偏好：0=跟随系统 1=English 2=中文 */
     int  known_n;            /* 历史设备 IP 条数（最近发现优先，作扫描种子） */
     char known_ips[KNOWN_MAX][16]; /* 历史设备 IP，最新在前 */
