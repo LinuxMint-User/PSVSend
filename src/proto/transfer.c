@@ -45,6 +45,10 @@
 #define OP_TIMEOUT_US   30000000LL    /* 上传响应等待上限 30s */
 #define CHUNK_DEADLINE_US 10000000LL  /* 单个分块发送上限 10s */
 #define TLS_HANDSHAKE_US  20000000LL  /* TLS 握手上限 20s */
+/* TCP connect 截止：局域网内正常 connect <100ms（实测 thread entered→tls handshake
+ * ok 约 640ms，含握手），6s 已是很宽的余量；对端 Wi-Fi 休眠唤醒也够。到点即判
+ * "对端已离线"——期间每 20ms 查取消，随时可中断。 */
+#define CONNECT_WAIT_US    6000000LL
 
 typedef struct {
     XferInfo   v;
@@ -487,6 +491,17 @@ static int conn_open(Conn *c, const char *method_path, SceOff body_len)
         dlog("xfer: socket fail 0x%08X", (unsigned)c->fd);
         return -1;
     }
+    /* 建好即置非阻塞：本文件的收发本就按"无数据/无窗口 → EWOULDBLOCK → 20ms
+     * 轮询到截止"模型写（conn_send_all / conn_recv_poll），connect 也一并纳入。
+     * Vita socket 默认阻塞且 connect 无内置超时——挑到台刚离线的设备会一直堵在
+     * 三次握手（真机实测 >45s 未返回），期间取消标志查不到，进度页按钮全失效、
+     * 只能杀进程重启。置非阻塞后 connect 立即返回"在途"，改由 getpeername 轮询
+     * 判定 + 截止（与 scan.c 的 net_connect_to 同一套做法）。 */
+    {
+        int one = 1;
+        sceNetSetsockopt(c->fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
+                         &one, sizeof one);
+    }
     memset(&sa, 0, sizeof sa);
     sa.sin_len = sizeof sa;
     sa.sin_family = SCE_NET_AF_INET;
@@ -498,22 +513,54 @@ static int conn_open(Conn *c, const char *method_path, SceOff body_len)
         return -1;
     }
     r = sceNetConnect(c->fd, (const SceNetSockaddr *)&sa, sizeof sa);
-    if (r < 0 && !NET_AGAIN(r)) {
+    if (r != 0 && r != SCE_NET_ERROR_EWOULDBLOCK &&
+        r != SCE_NET_ERROR_EINPROGRESS && r != SCE_NET_ERROR_EALREADY) {
+        /* 立即裁决的失败：connection refused / 无路由 / 不可达 */
         dlog("xfer: connect %s:%d fail 0x%08X",
              g_j.ip, g_j.port, (unsigned)r);
         sceNetSocketClose(c->fd);
         c->fd = -1;
         return -1;
     }
-    /* 连接建立后置非阻塞：本文件的收发都按"无数据/无窗口 → EWOULDBLOCK →
-     * 20ms 轮询到截止"模型写（conn_send_all / conn_recv_poll）。socket 若保持
-     * 阻塞，recv 会一直挂到对端应答——等待接收方"接受/拒绝"的长窗口里取消
-     * 标志根本轮询不到，用户取消无效（真机现象）；发送窗口堵死时同理。connect
-     * 本身仍是阻塞语义（返回 0 即已建立），故只对已建立的连接生效。 */
-    if (r == 0) {
-        int one = 1;
-        sceNetSetsockopt(c->fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
-                         &one, sizeof one);
+    if (r != 0) {
+        /* 在途：轮询到截止。未裁决时 getpeername 返回 ENOTCONN 且 SO_ERROR 为 0；
+         * 建立后 getpeername 返回 0；内核裁决失败则 SO_ERROR 非 0（refused/不可达）。
+         * 每轮先查取消 → 用户按取消 20ms 内生效，不再像阻塞 connect 那样只能重启。 */
+        SceLong64 dl = sceKernelGetSystemTimeWide() + CONNECT_WAIT_US;
+        int up = 0;
+        while (!up) {
+            int so = 0;
+            unsigned int sl = sizeof so;
+            SceNetSockaddrIn p;
+            unsigned int plen = sizeof p;
+            if (g_j.cancel) {
+                dlog("xfer: connect cancelled -> %s:%d", g_j.ip, g_j.port);
+                sceNetSocketClose(c->fd);
+                c->fd = -1;
+                return -2;
+            }
+            if (sceNetGetsockopt(c->fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_ERROR,
+                                 &so, &sl) == 0 && so != 0) {
+                dlog("xfer: connect %s:%d fail 0x%08X",
+                     g_j.ip, g_j.port, (unsigned)so);
+                break;
+            }
+            if (sceNetGetpeername(c->fd, (SceNetSockaddr *)&p, &plen) == 0) {
+                up = 1;
+                break;
+            }
+            if (sceKernelGetSystemTimeWide() >= dl) {
+                dlog("xfer: connect %s:%d timeout (%dms) - peer offline?",
+                     g_j.ip, g_j.port, (int)(CONNECT_WAIT_US / 1000));
+                break;
+            }
+            sceKernelDelayThread(POLL_US);
+        }
+        if (!up) {
+            sceNetSocketClose(c->fd);
+            c->fd = -1;
+            return -1;
+        }
     }
     if (c->tls) {
         r = tls_handshake(c);
