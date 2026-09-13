@@ -24,7 +24,8 @@ typedef struct {
     char alias[64];          /* 设备名，广播给其他 LocalSend 设备 */
     char fingerprint[64];    /* 随机身份串：防自发现；首次生成后持久化 */
     int  port;               /* HTTP 服务端口（默认 53317，与协议一致） */
-    int  theme_id;           /* 0=Yaru 1=OLED */
+    int  theme_id;           /* 色系：0=Yaru 1=OLED */
+    int  light_mode;         /* 明暗（与色系正交）：0=深色(默认) 1=浅色；OLED 固定深色 */
     int  confirm_layout;     /* 0=美式 1=日式 */
     int  pane_swap;          /* 发送主页两栏布局：0=设备在左 1=文件在左（照顾左撇子） */
     int  lang;               /* 界面语言偏好：0=跟随系统 1=English 2=中文 */

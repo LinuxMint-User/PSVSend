@@ -18,7 +18,8 @@
  * g_app.set_sel 存设置项 id（SET_ITEM_*）；分组标题不参与选择。
  * 每行触摸分成两半：左半=上一档，右半=下一档（主机名行点任意半开键盘改名）。 */
 enum {
-    SET_ITEM_THEME = 0,    /* 显示：主题 */
+    SET_ITEM_THEME = 0,    /* 显示：主题（色系：Yaru / OLED） */
+    SET_ITEM_LIGHT,        /* 显示：外观（明暗：深色 / 浅色；OLED 固定深色，不可改） */
     SET_ITEM_LANG,         /* 显示：界面语言 */
     SET_ITEM_KEY,          /* 操作：确认键布局 */
     SET_ITEM_PANE,         /* 操作：主页两栏布局（设备在左 / 文件在左） */
@@ -35,6 +36,7 @@ enum {
     SET_SLOT_HOST,
     SET_SLOT_HDR_B,        /* 分组：显示 */
     SET_SLOT_THEME,
+    SET_SLOT_LIGHT,
     SET_SLOT_LANG,
     SET_SLOT_HDR_C,        /* 分组：操作 */
     SET_SLOT_KEY,
@@ -78,6 +80,7 @@ static int slot_item(int slot)
     switch (slot) {
     case SET_SLOT_HOST:  return SET_ITEM_HOSTNAME;
     case SET_SLOT_THEME: return SET_ITEM_THEME;
+    case SET_SLOT_LIGHT: return SET_ITEM_LIGHT;
     case SET_SLOT_LANG:  return SET_ITEM_LANG;
     case SET_SLOT_KEY:   return SET_ITEM_KEY;
     case SET_SLOT_PANE:  return SET_ITEM_PANE;
@@ -94,6 +97,7 @@ static int item_slot(int item)
     case SET_ITEM_HOSTNAME: return SET_SLOT_HOST;
     case SET_ITEM_SAVEDIR:  return SET_SLOT_SAVEDIR;
     case SET_ITEM_THEME:    return SET_SLOT_THEME;
+    case SET_ITEM_LIGHT:    return SET_SLOT_LIGHT;
     case SET_ITEM_LANG:     return SET_SLOT_LANG;
     case SET_ITEM_KEY:      return SET_SLOT_KEY;
     case SET_ITEM_PANE:     return SET_SLOT_PANE;
@@ -166,7 +170,14 @@ static void settings_change(int item, int dir)
         if (g_app.theme_id < 0) g_app.theme_id = THEME_COUNT - 1;
         if (g_app.theme_id >= THEME_COUNT) g_app.theme_id = 0;
         g_cfg.theme_id = g_app.theme_id;
-        theme_set(g_app.theme_id);
+        theme_set(g_app.theme_id, g_app.light_mode);
+        config_save();
+    } else if (item == SET_ITEM_LIGHT) {
+        /* 明暗（与色系正交）：OLED 固定深色，无浅色变体 → 该项对它不响应 */
+        if (g_app.theme_id == THEME_OLED) return;
+        g_app.light_mode = g_app.light_mode ? THEME_DARK : THEME_LIGHT;
+        g_cfg.light_mode = g_app.light_mode;
+        theme_set(g_app.theme_id, g_app.light_mode);
         config_save();
     } else if (item == SET_ITEM_LANG) {
         int p = i18n_lang_pref() + dir;
@@ -195,7 +206,7 @@ static void settings_change(int item, int dir)
 void page_settings_render(void)
 {
     static const char *upd_mode_en[] = { "Off", "Daily", "Weekly", "Monthly" };
-    char theme_v[64], layout_v[96], lang_v[32], pane_v[32];
+    char theme_v[64], light_v[32], layout_v[96], lang_v[32], pane_v[32];
     char upd_v[64];
     int upd_st = update_state();
     int slot;
@@ -203,6 +214,12 @@ void page_settings_render(void)
     w_page_header(tr("Settings"));
     set_clamp_scroll();
     snprintf(theme_v, sizeof theme_v, "%s", theme_names[g_cfg.theme_id]);
+    /* 外观行：OLED 无浅色变体，恒显"深色（固定）" */
+    if (g_app.theme_id == THEME_OLED)
+        snprintf(light_v, sizeof light_v, "%s", tr("Dark (fixed)"));
+    else
+        snprintf(light_v, sizeof light_v, "%s",
+                 g_app.light_mode ? tr("Light") : tr("Dark"));
     snprintf(layout_v, sizeof layout_v, tr("%s confirm / %s back (%s)"),
              key_confirm(), key_back(),
              g_app.confirm_layout == 0 ? "US" : "JP");
@@ -287,6 +304,9 @@ void page_settings_render(void)
         case SET_ITEM_THEME:
             w_row(r, tr("Theme"), theme_v, item == g_app.set_sel);
             break;
+        case SET_ITEM_LIGHT:
+            w_row(r, tr("Appearance"), light_v, item == g_app.set_sel);
+            break;
         case SET_ITEM_LANG:
             w_row(r, tr("Language"), lang_v, item == g_app.set_sel);
             break;
@@ -340,6 +360,9 @@ void page_settings_render(void)
         segs[ns++].text = tr("Switch");
     } else {
         segs[ns].icon = icon_confirm();
+        /* OLED 下"外观"行不可改：确认键那一段画灰，与行值"深色（固定）"一致 */
+        segs[ns].dim = (g_app.set_sel == SET_ITEM_LIGHT &&
+                        g_app.theme_id == THEME_OLED);
         segs[ns++].text = tr("Change");
     }
     segs[ns].icon = icon_back();     segs[ns++].text = tr("Back");
@@ -396,7 +419,9 @@ void page_settings_input(const Input *in)
 
 /* ================= 目录选择页 =================
  * 设置页"默认保存目录"与接收 Setup"本次目录"共用：仅列文件夹，选定目标 =
- * "当前进入到的目录"（cur_dir），点文件夹进入、方块键或右下按钮确认。 */
+ * "当前进入到的目录"（cur_dir）。按键：上下选择、○（或点行）进入文件夹、
+ * △ 选定当前目录并返回（等同右下"存到此处"按钮）、□ 退出选择且不改目录、
+ * ✗ 回上一层（在 ux0:/ 根时=退出）。 */
 static PageId dpick_origin = PAGE_SETTINGS;
 static bool   dpick_persist = false;  /* true=写 config saveDir（设置页）；false=写本次 recv_dir */
 static int    dpick_dirs[MAX_FILES];  /* files[] 中目录行下标（渲染/焦点按此索引） */
@@ -502,8 +527,9 @@ void page_dir_pick_render(void)
     segs[ns].dir_off = off;          segs[ns++].text = tr("Choose");
     segs[ns].icon = icon_confirm();  segs[ns].dim = !has;
     segs[ns++].text = tr("Open");
-    segs[ns].icon = HICON_SQUARE;    segs[ns++].text = tr("Save here");
-    /* 根目录无"上级"：返回键此时=退出选择（回来源页），提示随层级切换 */
+    segs[ns].icon = HICON_TRIANGLE;  segs[ns++].text = tr("Save here");
+    segs[ns].icon = HICON_SQUARE;    segs[ns++].text = tr("Exit");
+    /* ✗ = 回上一层目录（在 ux0:/ 根时=退出选择）；要直接退出按方块 */
     segs[ns].icon = icon_back();
     segs[ns++].text = strlen(g_app.cur_dir) <= 5 ? tr("Back") : tr("Up");
     w_page_footer_segs(segs, ns);
@@ -535,6 +561,10 @@ void page_dir_pick_input(const Input *in)
     }
     if (in->confirm && dpick_dcount > 0)
         dpick_enter(g_app.file_sel);
-    if (in->square) { dpick_save(); return; }
+    if (in->alt) { dpick_save(); return; }   /* 三角：选定当前目录并返回 */
+    if (in->square) {                        /* 方块：退出选择，不改任何目录 */
+        g_app.page = dpick_origin;
+        return;
+    }
     if (in->back) dpick_up();
 }

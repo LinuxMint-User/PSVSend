@@ -31,6 +31,7 @@ void pages_init(void)
     i18n_init();                         /* 解析界面语言（跟随系统或偏好） */
     if (g_cfg.theme_id < 0 || g_cfg.theme_id >= THEME_COUNT) g_cfg.theme_id = 0;
     g_app.theme_id = g_cfg.theme_id;
+    g_app.light_mode = g_cfg.light_mode ? THEME_LIGHT : THEME_DARK;
     g_app.confirm_layout = g_cfg.confirm_layout ? 1 : 0;
     g_app.dev_count = 0;
     g_app.dev_sel = 0;
@@ -52,7 +53,7 @@ void pages_init(void)
     g_app.page = PAGE_DEVICES;
     g_app.prog_running = false;
     g_app.done = false;
-    theme_set(g_app.theme_id);
+    theme_set(g_app.theme_id, g_app.light_mode);
     api_start();                         /* 网络底座：net + UDP 发现线程 */
 }
 

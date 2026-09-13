@@ -118,6 +118,10 @@ static const TrEntry s_zh[] = {
     /* ---- 设置页 ---- */
     { "Settings", "设置" },
     { "Theme", "主题" },
+    { "Appearance", "外观" },
+    { "Dark", "深色" },
+    { "Light", "浅色" },
+    { "Dark (fixed)", "深色（固定）" },
     { "Language", "语言" },
     { "Confirm key", "确认键" },
     { "Layout", "布局" },
@@ -138,6 +142,7 @@ static const TrEntry s_zh[] = {
     { "Choose folder", "选择文件夹" },
     { "Open", "打开" },
     { "Save here", "存到此处" },
+    { "Exit", "退出" },
     { "LocalSend client v1.15+ compatible (protocol v2.0)",
       "适配 LocalSend 客户端 v1.15+（协议 v2.0）" },
 

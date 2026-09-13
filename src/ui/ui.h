@@ -163,7 +163,8 @@ typedef struct {
     int     recv_overflow; /* 发送方文件数超出上限被丢弃的个数（确认页提示） */
 
     /* 设置 */
-    int     theme_id;      /* 0=Yaru 1=OLED */
+    int     theme_id;      /* 色系：0=Yaru 1=OLED */
+    int     light_mode;    /* 明暗：0=深色 1=浅色（OLED 固定深色） */
     int     confirm_layout;/* 0=美式(X确认/O返回) 1=日式(O确认/X返回) */
     int     set_sel;
 

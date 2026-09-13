@@ -483,15 +483,13 @@ void page_recv_setup_render(void)
 
         if (i == 0) {
             /* 保存目录行：本次目录（默认=config saveDir）。确认键/点击进入
-             * 目录选择器临时改本次目录（内存态，接受时才传给后端生效）。 */
+             * 目录选择器临时改本次目录（内存态，接受时才传给后端生效）。
+             * 本行整行可点（下方 w_add 注册），故行尾不再画"更改"二字：
+             * 它此前用 accent_text，而选中行底色其实是 card（只有左侧一条
+             * accent 竖条），浅色主题下白字白底完全不可见。 */
             w_text(60, top + 8, 1.0f, theme->text_dim, "%s", tr("Save to"));
             w_text_clip(60, top + 30, 1.1f, sel ? theme->text : theme->text_dim,
-                        g_app.recv_dir, 620);
-            const char *act = tr("Change");
-            int aw = 0, ah = 0;
-            w_text_w(1.0f, act, &aw, &ah);
-            w_text(r.x + r.w - aw - 24, top + 16, 1.0f,
-                   sel ? theme->accent_text : theme->text_dim, "%s", act);
+                        g_app.recv_dir, 780);
             continue;
         }
 

@@ -42,6 +42,7 @@ static void cfg_defaults(void)
     g_cfg.fingerprint[0] = 0;
     g_cfg.port = DEFAULT_PORT;
     g_cfg.theme_id = 0;
+    g_cfg.light_mode = 0;              /* 明暗：默认深色 */
     g_cfg.confirm_layout = 0;
     g_cfg.pane_swap = 0;               /* 主页两栏：默认设备在左 */
     g_cfg.lang = 0;                    /* 语言偏好默认跟随系统 */
@@ -73,6 +74,7 @@ void config_init(void)
                          sizeof g_cfg.fingerprint);
             if (json_get_int(buf, "port", &v)) g_cfg.port = (int)v;
             if (json_get_int(buf, "theme", &v)) g_cfg.theme_id = (int)v;
+            if (json_get_int(buf, "lightMode", &v)) g_cfg.light_mode = (int)v ? 1 : 0;
             if (json_get_int(buf, "confirmLayout", &v)) g_cfg.confirm_layout = (int)v;
             if (json_get_int(buf, "paneSwap", &v)) g_cfg.pane_swap = (int)v;
             if (json_get_int(buf, "lang", &v)) g_cfg.lang = (int)v;
@@ -144,6 +146,7 @@ void config_save(void)
                    "  \"fingerprint\": \"%s\",\n"
                    "  \"port\": %d,\n"
                    "  \"theme\": %d,\n"
+                   "  \"lightMode\": %d,\n"
                    "  \"confirmLayout\": %d,\n"
                    "  \"paneSwap\": %d,\n"
                    "  \"lang\": %d,\n"
@@ -152,8 +155,8 @@ void config_save(void)
                    "  \"saveDir\": \"%s\",\n"
                    "  \"knownIps\": \"%s\"\n"
                    "}\n",
-                   a, f, g_cfg.port, g_cfg.theme_id, g_cfg.confirm_layout,
-                   g_cfg.pane_swap,
+                   a, f, g_cfg.port, g_cfg.theme_id, g_cfg.light_mode,
+                   g_cfg.confirm_layout, g_cfg.pane_swap,
                    g_cfg.lang, g_cfg.upd_auto, g_cfg.upd_last, d, k);
     cfg_unlock();
     if (len < 0 || len >= (int)sizeof out) return;
