@@ -27,6 +27,7 @@ extern void pages_init(void);
 #define FONT_LAT_FILE   FONT_PATHS_BASE "NotoSans-Regular.ttf"
 #define FONT_SC_FILE    FONT_PATHS_BASE "NotoSansCJKsc-Regular.otf"
 #define FONT_TC_FILE    FONT_PATHS_BASE "NotoSansCJKtc-Regular.otf"
+#define FONT_JP_FILE    FONT_PATHS_BASE "NotoSansCJKjp-Regular.otf"
 #define MAX_FONT_SIZES 24
 static struct {
     int size;
@@ -48,27 +49,30 @@ static int g_font_lang = -1;   /* g_fs 的 cjk 字体是按哪个界面语言建
  * 时把字体文件各读一份到 RAM，字体对象改从内存建：取轮廓退化为内存访问。
  * 注：vita2d_load_font_mem 只存指针不拷贝数据，这些 buffer 必须常驻。
  *
- * 字体分三份：拉丁 NotoSans，CJK 用 Noto Sans CJK 的地区版本（简 sc / 繁 tc）。
- * 两份 CJK 都含全部 CJK 字形，差别只在"同一码位默认取哪个地区的字形"
+ * 字体分四份：拉丁 NotoSans，CJK 用 Noto Sans CJK 的地区版本（简 sc / 繁 tc /
+ * 日 jp）。各份都含全部 CJK 字形，差别只在"同一码位默认取哪个地区的字形"
  * （骨/道/直/繁…），故按当前界面语言只加载其中一份，换语言时才读另一份
  * （见 font_reload_cjk）。 */
-static void *g_font_ram[3];        /* 0=拉丁 1=CJK简 2=CJK繁 */
-static int   g_font_ram_len[3];
+static void *g_font_ram[4];        /* 0=拉丁 1=CJK简 2=CJK繁 3=CJK日 */
+static int   g_font_ram_len[4];
 
 static const char *font_path(int slot)
 {
     switch (slot) {
     case 0:  return FONT_LAT_FILE;
     case 1:  return FONT_SC_FILE;
-    default: return FONT_TC_FILE;
+    case 2:  return FONT_TC_FILE;
+    default: return FONT_JP_FILE;
     }
 }
 
-/* 当前界面语言对应的 CJK 地区槽（繁中台/港用 tc，简体与英文用 sc） */
+/* 当前界面语言对应的 CJK 地区槽（繁中台/港用 tc、日语用 jp，简体与英文用 sc） */
 static int cjk_slot_current(void)
 {
     int l = i18n_lang();
-    return (l == I18N_LANG_ZH_TW || l == I18N_LANG_ZH_HK) ? 2 : 1;
+    if (l == I18N_LANG_ZH_TW || l == I18N_LANG_ZH_HK) return 2;
+    if (l == I18N_LANG_JA) return 3;
+    return 1;
 }
 
 static void *font_ram(int slot)

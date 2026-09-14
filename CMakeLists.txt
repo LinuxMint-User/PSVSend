@@ -101,6 +101,7 @@ add_custom_command(OUTPUT ${_vpk}
           -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSans-Regular.ttf=fonts/NotoSans-Regular.ttf
           -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKsc-Regular.otf=fonts/NotoSansCJKsc-Regular.otf
           -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKtc-Regular.otf=fonts/NotoSansCJKtc-Regular.otf
+          -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKjp-Regular.otf=fonts/NotoSansCJKjp-Regular.otf
           ${_vpk}
   DEPENDS ${_elf}
           ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/icon0.png
@@ -110,6 +111,7 @@ add_custom_command(OUTPUT ${_vpk}
           ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSans-Regular.ttf
           ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKsc-Regular.otf
           ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKtc-Regular.otf
+          ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKjp-Regular.otf
   COMMENT "Building vpk ${PROJECT_NAME}"
   VERBATIM
 )
