@@ -64,9 +64,6 @@ enum {
 static int set_scroll = 0;        /* 设置页内容偏移 */
 static int set_press_scroll = 0;
 
-/* 供 pages_warm_all 预热设置页：设置内容滚动偏移（0=顶，大值=由 render 夹到底） */
-void settings_scroll_to(int v) { set_scroll = v; }
-
 /* 进设置页：焦点落在第一个设置项（主机名），滚动回顶部。
  * 不能直接置 set_sel = 0——枚举值 0 是 SET_ITEM_THEME，而页面从上到下的第一项
  * 是主机名，置 0 会把焦点丢到页面中部的"主题"行上。 */

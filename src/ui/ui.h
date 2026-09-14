@@ -155,9 +155,6 @@ void pages_init(void);
  * 时自动弹接收确认页。 */
 void pages_tick(void);
 
-/* 逐页真实渲染预热字形（pages.c，隐帧内由 ui_main 调用） */
-void pages_warm_all(void);
-
 /* ---------- UI 模块入口（ui_main.c） ---------- */
 void ui_run(void);
 

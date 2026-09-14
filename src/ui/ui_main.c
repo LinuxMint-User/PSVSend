@@ -1,8 +1,10 @@
 /* UI 主循环：渲染 + 输入 → 页面调度。
  * widget 命中表由 w_clear/w_add 在本帧渲染时填充，输入处理时查询。 */
 #include <string.h>
+#include <stdlib.h>
 #include <vita2d.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/io/fcntl.h>
 #include "ui/ui.h"
 #include "ui/theme.h"
 #include "app/api.h"
@@ -23,12 +25,57 @@ extern void pages_init(void);
 #define FONT_PATHS_BASE "app0:/fonts/"
 #define FONT_LAT_FILE   FONT_PATHS_BASE "DroidSans.ttf"
 #define FONT_CJK_FILE   FONT_PATHS_BASE "DroidSansFallbackFull.ttf"
-/* 开屏底图 = livearea 壁纸（840x500），随 vpk 装在 app0:/sce_sys/livearea/。
- * 与 Vita 桌面上点开应用前的画面同源，启动衔接不跳变。 */
-#define SPLASH_BG_FILE "app0:/sce_sys/livearea/contents/bg.png"
 #define MAX_FONT_SIZES 24
 static struct { int size; vita2d_font *lat; vita2d_font *cjk; } g_fs[MAX_FONT_SIZES];
 static int g_fs_n;
+
+/* ---------- 字体文件的一次性内存副本 ----------
+ * libvita2d 默认用 FT_New_Face 开"文件 face"（app0:/fonts/*.ttf）。app0: 是
+ * VPK 内的压缩文件系统，FreeType 每取一个**新**字形的轮廓都要在包内随机读
+ * 一块并解压：实测 ~40ms/字形（d121 探针同字同号的对照：文件 face
+ * 43.5ms/字形，内存 face 0.19ms/字形）。启动预热那 5.3s、以及切页时"该页新
+ * 字越多越卡"，都出自这里；且成本与字号无关（轮廓数据量只跟字形复杂度有
+ * 关），故砍字号档位、缩小标题字号都无效。
+ * 机型是 UMA（无独立显存，无需把数据搬进显存），字体文件本身也不大，故启动
+ * 时把两个 ttf 各读一份到 RAM，字体对象改从内存建：取轮廓退化为内存访问。
+ * 注：vita2d_load_font_mem 只存指针不拷贝数据，这两个 buffer 必须常驻。 */
+static void *g_font_ram[2];        /* [0]=latin, [1]=CJK */
+static int   g_font_ram_len[2];
+
+static void *font_ram(int cjk)
+{
+    const char *path = cjk ? FONT_CJK_FILE : FONT_LAT_FILE;
+    SceUID fd;
+    int sz, got = 0;
+    long long t0;
+
+    if (g_font_ram[cjk])
+        return g_font_ram[cjk];
+    fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        dlog("font ram: open failed %s", path);
+        return NULL;
+    }
+    sz = (int)sceIoLseek(fd, 0, SCE_SEEK_END);
+    sceIoLseek(fd, 0, SCE_SEEK_SET);
+    if (sz > 0) {
+        void *buf = malloc((size_t)sz);
+        t0 = (long long)sceKernelGetSystemTimeWide();
+        if (buf)
+            got = sceIoRead(fd, buf, (unsigned)sz);
+        if (!buf || got != sz) {
+            dlog("font ram: read failed %s size=%d got=%d", path, sz, got);
+            free(buf);
+        } else {
+            g_font_ram[cjk] = buf;
+            g_font_ram_len[cjk] = sz;
+            dlog("font ram: %s %d bytes in %lldus", cjk ? "cjk" : "lat", sz,
+                 (long long)sceKernelGetSystemTimeWide() - t0);
+        }
+    }
+    sceIoClose(fd);
+    return g_font_ram[cjk];
+}
 
 /* 返回 size 像素字号的字体：cjk=0 拉丁、1 CJK；加载失败返回 NULL。
  * 表满（UI 档位应远少于 MAX_FONT_SIZES）时回退 0 号槽。 */
@@ -39,8 +86,15 @@ vita2d_font *font_get(int size, int cjk)
         if (g_fs[i].size == size)
             return cjk ? g_fs[i].cjk : g_fs[i].lat;
     if (g_fs_n < MAX_FONT_SIZES) {
-        vita2d_font *lat = vita2d_load_font_file(FONT_LAT_FILE);
-        vita2d_font *cj  = vita2d_load_font_file(FONT_CJK_FILE);
+        vita2d_font *lat, *cj;
+        font_ram(0);
+        font_ram(1);        /* 首次进来时把两个 ttf 读进 RAM，之后命中缓存 */
+        lat = g_font_ram[0]
+            ? vita2d_load_font_mem(g_font_ram[0], (unsigned)g_font_ram_len[0])
+            : NULL;
+        cj = g_font_ram[1]
+            ? vita2d_load_font_mem(g_font_ram[1], (unsigned)g_font_ram_len[1])
+            : NULL;
         if (!lat || !cj)
             dlog("font load failed size=%d lat=%p cjk=%p", size,
                  (void *)lat, (void *)cj);
@@ -62,7 +116,7 @@ static const int g_font_sizes[] = {
 
 /* 启动时帧外预加载全部字号档（见 ui_run 的调用点）。
  * 动机：字体对象是懒加载的，若某字号第一次被页面用到才创建，创建动作
- * （vita2d_load_font_file：freetype 初始化 + 512x512 灰度纹理分配 + 显存
+ * （vita2d_load_font_mem：freetype 初始化 + 512x512 灰度纹理分配 + 显存
  * 映射）会落在渲染 pass 中途（start_drawing 与 end_drawing 之间）。GPU
  * 正异步执行上一批命令时 CPU 侧改显存管理状态，可触发 render GPU crash
  * （无 CPU 异常线程、纯 GPU 驱动报错，表现为撕裂后崩溃）。UI 字号档位
@@ -141,49 +195,6 @@ static void input_page(const Input *in)
     }
 }
 
-/* ---------- 开屏 + 开机预热（temp，实验用） ----------
- * 先呈现一帧开屏画面（livearea 壁纸铺底，不加文字避免遮挡图面），随即
- * 建齐字号字体对象、把三个高频页的字形画进隐帧（屏幕停留开屏画面），
- * 完成后交回主循环画第一帧主界面。预热窗口内用户本就预期等待，无交互
- * 可抢 → 不构成卡顿感。 */
-static void ui_warm_pass(void)
-{
-    vita2d_texture *bg;
-    dlog("splash begin");
-    bg = vita2d_load_PNG_file(SPLASH_BG_FILE);   /* 840x500 位图解码，一次性 */
-    vita2d_start_drawing();
-    vita2d_set_clear_color(theme->bg);
-    vita2d_clear_screen();
-    if (bg) {
-        /* livearea 壁纸全屏铺底：与桌面点开前的画面同源，无缝衔接 */
-        vita2d_draw_texture_scale(bg, 0, 0,
-            (float)SCR_W / (float)vita2d_texture_get_width(bg),
-            (float)SCR_H / (float)vita2d_texture_get_height(bg));
-    } else {
-        dlog("splash: bg.png load failed, fallback to plain");
-    }
-    vita2d_end_drawing();
-    vita2d_swap_buffers();
-    vita2d_wait_rendering_done();
-    if (bg) vita2d_free_texture(bg);   /* 开屏已上屏，纹理用完即放 */
-    dlog("splash end");
-    font_preload_all();                /* 开屏已可见，此后再建齐字号字体对象（帧外） */
-
-    dlog("warm pass begin");
-    vita2d_start_drawing();
-    vita2d_set_clear_color(theme->bg);
-    vita2d_clear_screen();
-    pages_warm_all();            /* 隐帧烤字形；屏幕此刻仍停留在开屏画面 */
-    vita2d_clear_screen();       /* 隐帧结尾清成底色，防任何途径误上屏时露出最后一页 */
-    vita2d_end_drawing();
-    /* 不 swap：display 继续停在开屏帧。字形光栅化在 CPU 端慢、GPU 命令排队
-     * 异步回放；若在这里 swap，display 会去读那块还在逐页回放(dev→files→
-     * set-top→set-about)的缓冲 → 开屏后一堆页面闪过才到主界面。只等 GPU
-     * 画完（wait_rendering_done），主循环第一帧画好主页面再 swap。 */
-    vita2d_wait_rendering_done();
-    dlog("warm pass end");
-}
-
 /* ---------- 主循环 ---------- */
 void ui_run(void)
 {
@@ -192,7 +203,7 @@ void ui_run(void)
     ui_input_init();           /* 开启触摸采样 */
     pages_init();
     update_init();             /* 更新检查状态机（自动周期由 config 决定） */
-    ui_warm_pass();            /* 开屏先上屏（不依赖字体），再建字体 + 高频页预热 */
+    font_preload_all();        /* 建齐字号字体对象（帧外；首次触发 ttf 读进 RAM） */
 
     while (!g_app.done) {
         /* 主线程心跳（诊断用）：开机头 12s 或"网络未就绪"期间每秒打一行，
