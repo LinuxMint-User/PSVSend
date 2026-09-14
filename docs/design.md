@@ -14,8 +14,9 @@
 - **已落地（发现补充）**：Vita 收不了 UDP 组播、也绑不了 53317，设备表主要靠对方主动 register 与 `scan.c` 主动扫描（向 /24 各 IP 的 53317 POST register 拿 member info）。扫描按 **TLS→明文顺序**探测并携带设备身份证书（2026 官方 Rust 内核接收端强制 mTLS 客户端证书），明文兜底兼容纯 HTTP 端；**优先探测历史在线设备**（config `knownIps` 持久化、LRU、上限 24，入表即记录），常用设备实测轮次开始 ~0.7s 内出现。曾修复两处致手动扫描失效的 bug：`s_read_resp` 未把响应 body 移到缓冲区头部（JSON 解析永远失败、found 恒 0）；TLS 探测静默失败。UI 三角键手动触发。
 - 实现边界的完整清单（忙时 409 / 每连接 worker 上限 8、清单 64 文件/32KB、超时 60s/120s/30s 三档、接收仅明文 HTTP、/24 扫描范围等）见 README「边界与已知限制」。
 - **已落地（稳定性，v2.0.0）**：修复待机唤醒 / Wi-Fi 断开恢复后卡「网络未就绪 / 没扫到设备」——watch 看门狗单线程低频轮询 netctl + 全互斥 `initCount=0` 语义修正（发现/扫描/收发/net 各互斥均改为无人先持锁），恢复后 UI 心跳自动续上；另曾用 6s 模拟断网窗口复现，现该调试开关已置 0（net.c `PSVSEND_SIM_DOWN_MS`，需要时 cmake 覆盖）。
-- **已落地（渲染稳定，v2.0.0）**：修复偶发 **GPU render crash**（先兆为界面「三角形空白撕裂」→ 系统判 render gpu crash 重启）。根因：主循环缺 `vita2d_wait_rendering_done()`，每帧 swap 后 GPU 队列无收敛点，渲染/显示队列超前回绕导致撕裂与驱动状态错乱；修复：每帧 swap 后等待渲染完成（ui_main.c）。字体对象另改为启动帧外预载（`font_preload_all`），堵住"渲染中途创建 GPU 纹理"的隐患（非本次根因，作加固保留）。
-- **已落地（界面，v2.0.0）**：多语言界面（英文 / 简体中文 / 繁中（台灣）/ 繁中（香港），设置页语言行切换，`i18n.c/h`）+ 设置页底部「关于」区（PSVSend 大字 logo、应用版本与 LocalSend 适配说明）。版本号单源维护：手改 `CMakeLists.txt` 的 `project(VERSION)` 与 `core/config.h` 的 `PSVSEND_APP_VERSION`，SFO `APP_VER` 由 VERSION 自动派生。
+- **已落地（渲染稳定，v2.0.0）**：修复偶发 **GPU render crash**（先兆为界面「三角形空白撕裂」→ 系统判 render gpu crash 重启）。根因：主循环缺 `vita2d_wait_rendering_done()`，每帧 swap 后 GPU 队列无收敛点，渲染/显示队列超前回绕导致撕裂与驱动状态错乱；修复：每帧 swap 后等待渲染完成（ui_main.c）。字体对象另改为启动帧外预载（`font_preload_all`），堵住"渲染中途创建 GPU 纹理"的隐患（非本次根因，作加固保留；d122 起字体改从内存建，预载仍保留）。
+- **已落地（字体，d120-d126，见 §5.5）**：**字形冷启动根治**——定位到 libvita2d 的 `vita2d_load_font_file` 开的是**文件 face**，字体放在 VPK 的 `app0:`（deflate 压缩流）里，FreeType 每取一个**新字形**轮廓都要包内随机读一块并解压，实测 **~40ms/字形**（同字同号对照：文件 face 43.5ms vs 内存 face 0.19ms，差 150~180×；且与字号无关，故"砍字号档位"无效）。改为启动一次性把字体文件读进 RAM（UMA 架构，无需搬显存），字体对象走 `vita2d_load_font_mem`——`warm total` 5315ms → **65ms**（81×），开机到主界面总开销 ≈665ms。此后**删掉开屏画面与 `pages_warm_all()` 全部预热逻辑**（预热已无意义），`ui_run` 直接建齐字号字体对象。**字体换 Noto Sans**：拉丁 `NotoSans-Regular.ttf` + CJK 按界面语言取地区版本 `NotoSansCJKsc/tc/jp-Regular.otf`（简/繁/日，各 15.7MB，都含全部 CJK 字形，差别只在同一码位默认取哪个地区的字形），`FONT_ASC` 由 0.81（Droid 标定）调至 0.88（Noto CJK 实测）；换语言时在每帧 `start_drawing` 之前帧外重建 CJK 字体对象（`vita2d_load_font_mem` 会建显存纹理，落在渲染 pass 中途有 GPU crash 风险），首次切到某地区读盘 ~1.6s 后该地区字体常驻 RAM。字体随仓库入库（SIL OFL 1.1）。
+- **已落地（界面，v2.0.0）**：多语言界面（英文 / 简体中文 / 繁中（台灣）/ 繁中（香港）/ 日本語，设置页语言行切换，`i18n.c/h`）+ 设置页底部「关于」区（PSVSend 大字 logo、应用版本与 LocalSend 适配说明）。版本号单源维护：手改 `CMakeLists.txt` 的 `project(VERSION)` 与 `core/config.h` 的 `PSVSEND_APP_VERSION`，SFO `APP_VER` 由 VERSION 自动派生。
 - **已落地（工程，v2.0.0 后）**：GitHub Actions（`.github/workflows/build-vpk.yml`）在官方 vitasdk 2026.08 Docker 镜像内自动构建 VPK：推送 `v*` tag 或 Actions 页手动触发 → 生成 **Releases 草稿**（人工确认后公开）。注意本地与 CI 产物 `eboot.bin` 存在字节差异（本地链接 vdpm prebuilt 静态库，CI 链接镜像内现场编译的同源库），功能等价（真机验证通过）；需字节级可复现则须统一在容器内构建。
 - **已落地（更新检查，v2.1.0）**：`app/update.c` 后台线程按序尝试双源——主源拉 **Gitee 镜像仓库**（epix-xhan/PSVSend，只同步 main 分支、不放 Release）的 `src/core/config.h` 版本宏（raw.giteeusercontent.com 直取免 302），兜底 GitHub Releases atom；解析出的版本与本地 `PSVSEND_APP_VERSION` 宏比对定状态。**不新增任何版本文件**：config.h 是客户端唯一版本真源（发版本就要改它，镜像同步自然带新版，杜绝多版本文件不一致）。入口：设置页手动检查 + 自动定期（默认每周，可每天/每月/关）。PSV 无实时钟：自动周期靠远端响应头 `Date` 授时（`update.c` 内纯算术解析 RFC7231；曾误用 `sceKernelGetSystemTimeWide` 的开机计时冒充 unix 时间戳致 upd_last 跨重启错乱，d48 修复），每会话一次轻量判定——未到周期静默跳过，到周期才完整检查。真机全路径验证（d47-d49）：手动检出新版 / 手动已最新 / 自动到期 full-check / 自动静默，均按预期。
 - **已落地（保存目录可选，v2.1.0 后）**：接收不再钉死 downloads——config 新增 `saveDir`（默认 `ux0:data/psvsend/downloads`，JSON 读回去尾斜杠、非法回退默认），设置页新增“存储”组“保存目录”行，进目录选择器选定即写 config 并落盘（**持久**）；接收 Setup 页目录行由只读默认改为可点，进同一选择器改**本次**目录（内存 `g_app.recv_dir`，仅当次会话、新请求回默认），Accept 前 `recv_set_dir` 喂给后端。目录选择器复用文件浏览页 ux0 目录树（仅列文件夹、点入、方块/右下键 = 存到当前目录），与文件浏览一样只浏览 ux0 单分区、无新建目录入口。曾因 ui_main `render_page` 漏配 `PAGE_DIR_PICK` case 出现整页白屏且看似卡死（d50-d53 用逐秒心跳 + 阶段打点定位，d54 修复并清理诊断日志）。真机全路径验证 d50-d54。
@@ -24,7 +25,8 @@
 - **已落地（稳定性，d65）**：修复 **Wi-Fi 重连过渡态界面卡死**——断网"活性刺激"（`api_poke`，为让系统感知出站请求、促使热点快速重连而发的组播出站 UDP）此前用**阻塞 socket**：完全断网（接口已被系统拆掉）时只是 20ms 级立即失败，但**重连过渡态**（netctl 报 CONNECTING / 取 IP，接口在而路由未就绪）会等路由就绪约 **2s**，把主循环连同按键输入一并钉死——这正是"断网时界面卡住、进不了设置页"的真凶，也解释了为何按"关 Wi-Fi"复现不出（两种断网态在协议栈里表现不同）。d64 真机日志实证：过渡态单次阻塞 1939/2378ms，同期 `ui: beat` 心跳缺拍。修法：poke socket 置 `SCE_NET_SO_NBIO`（与 announce 发送 socket 一致），间隔 4s→1s（`POKE_INTERVAL_MS`），以高频重试命中"接口就绪"窗口；**系统级唤醒意图保留**（应用级状态恢复仍归 api_watch，两者职责不同不可互替）。d65 真机验证：单次发包 6~9ms，断网+重连全程心跳无缺拍。
 - **已落地（界面交互，d86-d100）**：**扫描中提示**（d99/d100）改为 `Scanning... N of M possible hosts, K found, you could proceed`——分母是 /24 上限、不是"必须探完才能用"的门槛，设备入表即可选可发（knownIps 优先时 ~0.7s 即出现），明说"可继续"以免用户对着 `12/254` 干等；一台未有时不出现该句。发送流程对齐官方顺序——主页改为**两栏**（设备栏 + 已选文件栏），两栏左右位置可在设置项「布局」互换（config `paneSwap`，默认设备在左）；**发送等待独立成页**（`PAGE_SEND_WAIT`）——点设备后停在此页等接收方接受，对方开始上传（`api_send_info` 的 `cur>=0` / `total_sent>0`）才自动切进度页，被拒/连不上则就地红字报错而不误跳进度页（30 分钟 prepare 窗口仅作软兜底，页面本身随时可退）。**页脚提示条口径统一**：确认键段文案跟随当前焦点动作（不写死）、两键同一动作时合并成「图标 / 图标 文案」、固定提示靠左而可变提示靠右；十字键提示改为**方向可用性指示**（`HintSeg.dir_off` 掩码，列表到顶/到底时对应方向变灰）。**设置页**：进入时焦点落在首项（主机名）并滚回顶部；取消左右改值（选项行无左右箭头提示，且上下切换时易误触）；「确认键布局」项改用左右方向键切换（避免用确认键修改确认键本身），页脚只替换"改值"那一段。
 - **已落地（多语言扩展，d111-d113）**：语言偏好由 3 项扩到 5 项（跟随系统 / English / 中文 / 繁中（台灣）/ 繁中（香港）），译文表由「key + 简中一列」改为「key + 简 / 繁台 / 繁港三列」，`tr()` 按当前语言取列；两列繁中**按各自地区用词习惯分别翻译**（非繁简一对一转写，如 網路/網絡、資料夾/文件夾、版面配置/版面、每週）。**「跟随系统」此前恒回退英文**：根因是 `sceAppUtilSystemParamGetInt` 要求先 `sceAppUtilInit`，而应用从未初始化 SceAppUtil，调用恒失败（vitasdk `apputil.h` 本就有该函数声明，早期"SDK 未声明、手工 extern"的注释是误记）；现惰性初始化一次，并把读取结果写 log（`i18n: system lang read r=... v=...`，SDK 语言枚举 日0…繁10 简11）便于真机排查。系统语言只区分简繁、推不出台港，而 **PSV 的中文（繁體）本地化基底是台灣用語**（Sony 从未单独做港式繁中），故系统繁体默认取台灣，港式用词只能手选；初版曾按"SCEH 港台区"推成默认香港（区域归属 ≠ 语言习惯的误推），同日改回。
-- **未落地**：与 §4/§5 目标架构的规划差项（multipart 收件等）仍在路线中，动态清单见 docs/TODO.md（本地，不入库）。已销账（2026-09-07，理由见 TODO 闭环留痕）：session.c 拆分（会话职责由 proto/receive + proto/transfer 承担，见 §4.1）、自定义字体替换/追加、内存监控调试视图、发送入口外置卡浏览。中文字体已落地（见 §5.5）；字形冷启动处理已定案（开机高频页预热，见 §5.5.1）。
+- **已落地（日语，d126）**：语言偏好由 5 项再扩到 6 项（加 **日本語**，枚举 `I18N_LANG_JA` 加在 `I18N_LANG_COUNT` 前，老配置数值含义不变），译文表由四列扩到五列（每行 key + 简 / 繁台 / 繁港 / 日），日语**意译而非汉字直搬**（如 Devices → デバイス、Up → 上へ），避免"中味"；「跟随系统」映射补 `SCE_SYSTEM_PARAM_LANG_JAPANESE → I18N_LANG_JA`。CJK 字体随之从"单份"改为**按界面语言取地区版本**（简 `NotoSansCJKsc` / 繁 `NotoSansCJKtc` / 日 `NotoSansCJKjp`，三份都含全部 CJK 字形，差别只在同一码位默认取哪个地区字形），换语言时帧外重建字体对象（见 §5.5.1）。真机验证无文字溢出。
+- **未落地**：与 §4/§5 目标架构的规划差项（multipart 收件等）仍在路线中，动态清单见 docs/TODO.md（本地，不入库）。已销账（2026-09-07，理由见 TODO 闭环留痕）：session.c 拆分（会话职责由 proto/receive + proto/transfer 承担，见 §4.1）、自定义字体替换/追加、内存监控调试视图、发送入口外置卡浏览。中文字体已落地（见 §5.5）；字形冷启动已根治（d122 起字体从内存建、开屏与预热整体删除，见 §5.5.1）。
 - 本文按"目标架构"描述，部分命名与实际源码不同（如目标 `http_server.c` / `http_client.c` 实际为 `net/http.c` / `proto/transfer.c`）；**现状源码布局以 §4.1 模块树为准**（2026-09-07 起按依赖域分子目录）。
 
 ## 2. 总体架构（前后端分层）
@@ -182,7 +184,7 @@ void on_session_done(const Session *s);      // 完成 / 失败
 | 接收请求确认 | 来者名字/平台 + 文件数 + 预览（含取消态） | 接受 / 设置 / 拒绝；发送方取消 → 单个关闭 |
 | 接收设置 | 本次保存目录（可点进目录选择器改本次）+ 逐文件改名（系统键盘 SceIme）/勾选跳过 | 方向键选行、确认勾选、返回继续 |
 | 传输进度 | 会话列表 + 进度条 | 取消 |
-| 设置 | 主题、主色（色盘，**仅主题 = 自定义时显示**）、外观（深色/浅色）、布局（两栏左右互换）、界面语言（跟随系统 / English / 简体中文 / 繁中（台灣）/ 繁中（香港），左右改值）、确认键布局（用**左右方向键**切换）、主机名（系统键盘改设备名）、保存目录、检查更新/自动频率 | 上下选行、确认改值；进入时焦点落在首项并滚回顶部 |
+| 设置 | 主题、主色（色盘，**仅主题 = 自定义时显示**）、外观（深色/浅色）、布局（两栏左右互换）、界面语言（跟随系统 / English / 简体中文 / 繁中（台灣）/ 繁中（香港）/ 日本語，左右改值）、确认键布局（用**左右方向键**切换）、主机名（系统键盘改设备名）、保存目录、检查更新/自动频率 | 上下选行、确认改值；进入时焦点落在首项并滚回顶部 |
 
 ### 5.2 架构：事件驱动 + 状态机
 
@@ -223,37 +225,41 @@ void on_session_done(const Session *s);      // 完成 / 失败
 
 **决策（2026-09）：freetype + 内嵌开源字体，替代 PVF 作主渲染路径。** 依据：
 
-- libvita2d 的 `vita2d_font` 即 freetype 封装（内部 `FT_Init_FreeType` / `FT_New_Memory_Face`），支持从文件/内存加载任意 TTF/OTF
+- libvita2d 的 `vita2d_font` 即 freetype 封装（内部 `FT_Init_FreeType` + face 创建），支持从文件/内存加载任意 TTF/OTF：`vita2d_load_font_file` 走**文件 face**（`FT_New_Face`）、`vita2d_load_font_mem` 走**内存 face**（只存指针不拷贝，buffer 须常驻）——两者性能差 150~180×，见 §5.5.1
 - PVF 是固件内置字体（实为 otf/ttf 改名，位于 sa0 系统分区），覆盖范围固定且不可扩：即便用 `vita2d_load_system_pvf` 按语言组合注册（拉丁 + 简体中文），生僻字/非简体字符仍会缺字，只能算零体积过渡方案
 - 自带字库才能保证"对方发来任意中文名都能显示"
 
-**实现（2026-09-04 落地）：** 双字体逐段路由，均为 AOSP 字库（Apache-2.0，与项目同许可）：
+**实现（2026-09-04 落地；d124 起字体换 Noto Sans）：** 双字体逐段路由，均为 Google **Noto Sans**（SIL OFL 1.1，随仓库入库，见 `fonts/LICENSE-OFL.txt`）：
 
-- `fonts/DroidSans.ttf`（拉丁）+ `fonts/DroidSansFallbackFull.ttf`（CJK/全角，28629 字形），CMakeLists 打进 VPK `app0:/fonts/`
-- 单字码点 ≤ 0xFF（ASCII / Latin-1）与**通用标点 U+2000-206F**（省略号 U+2026、弯引号、破折号…——DroidSansFallbackFull 缺、DroidSans 含）走拉丁字体，其余走 CJK 字体；`widgets.c` 内按字符分成连续同字体段、整段一次绘制（保留 kerning、控制调用次数）。2026-09-07 修复：早期"码点>0xFF 一律 CJK"把省略号等发给缺字形的 CJK 字库 → 中文文案省略号渲染成方框
-- freetype 的 y 是**基线**、size 是像素字号；`w_text` 的 y 保持"行首升部线"语义，内部基线放在 `y + 0.81*size`（CJK 满格字形顶比例，实测 glyf yMax/upem；盒 ascender 1.043 含 em 上方行距空白，基线过高会整体偏下）。字号换算 `scale=1.0 → 20px`（`FONT_PX`/`FONT_ASC` 常量集中在 `widgets.c`，整体缩放只改一处）
+- `fonts/NotoSans-Regular.ttf`（拉丁）+ CJK 用 `fonts/NotoSansCJKsc/tc/jp-Regular.otf`（简 / 繁 / 日三份，各约 15.7MB，都含全部 CJK 字形），按**当前界面语言**取地区版本（`cjk_slot_current`：繁中台 / 港→tc、日→jp、其余→sc）；CMakeLists 打进 VPK `app0:/fonts/`
+- 单字码点 ≤ 0xFF（ASCII / Latin-1）与**通用标点 U+2000-206F**（省略号 U+2026、弯引号、破折号…——CJK 字库缺、拉丁字库含）走拉丁字体，其余走 CJK 字体；`widgets.c` 内按字符分成连续同字体段、整段一次绘制（保留 kerning、控制调用次数）。2026-09-07 修复：早期"码点>0xFF 一律 CJK"把省略号等发给缺字形的 CJK 字库 → 中文文案省略号渲染成方框
+- freetype 的 y 是**基线**、size 是像素字号；`w_text` 的 y 保持"行首升部线"语义，内部基线放在 `y + FONT_ASC*size`（CJK 满格字形顶比例，实测 glyf yMax/upem；盒 ascender 1.043 含 em 上方行距空白，基线过高会整体偏下）。字号换算 `scale=1.0 → 20px`（`FONT_PX`/`FONT_ASC` 常量集中在 `widgets.c`，整体缩放只改一处）。**换 Noto Sans 后 `FONT_ASC` 由 0.81 调至 0.88**（Noto CJK 满格字字形顶实测 0.875~0.90，见下「校准状态」）
 - **性能事实 + 按字号分槽（2026-09-04 晚落地）**：libvita2d freetype 后端自带**字形级 atlas 缓存**（FTC_ImageCache + 共享 texture atlas），同一字体对象内字形只栅格化一次、后续直接 blit；但 atlas 缓存**不分字号**——同一字形先以小字号缓存、再以更大字号绘制时会把小位图整体放大（draw_scale≠1），槽位间渗色一并放大，表现为大字笔画不均、横向条纹。这是真机"大字横线/参差"的根因，故改为**按像素字号分槽**：`ui.h` 暴露 `font_get(size, cjk)`，`ui_main.c` 按字号懒加载独立字体对象（各自 atlas、draw_scale 恒为 1），对 `widgets.c` 绘制 API 透明。早期"需字符串级缓存"的顾虑依旧不成立
 - 字库用纯 CJK fallback 单字体不够（无 ASCII），故拉丁/CJK 必须成对；字体本身无 GPL/许可冲突
 - 缺字行为：字符所在字库无字形时，freetype 的 `.notdef` 会被栅格成空框并显示（不是"跳过不渲染"）——所以字体路由必须保证常用字符都进含其字形的字库；生僻字（两库皆缺）才会真正空白/空框
 
-**校准状态（2026-09-04 真机确认）：** 升部按字形实测为 `FONT_ASC=0.81`（盒 ascender 1.043 不用，理由见上），字号基准 `FONT_PX=20px@scale1`，配合按字号分槽绘制后大字/小字均显示正常；若个别场景仍需微调，改 `widgets.c` 里这两个常量即可。`w_text_w` 返回行高 h=字号（近似）用于垂直居中，如需精确按字形度量再改。
+**校准状态（2026-09-04 首验；2026-09-14 换 Noto 后重标定）：** 升部按字形实测——Droid 时代 `FONT_ASC=0.81`，换 Noto Sans CJK 后满格字字形顶实测 **0.875~0.90**（16 / 20 / 26 / 34px 档分别为 0.875 / 0.900 / 0.885 / 0.882），取 **`FONT_ASC=0.88`**（盒 ascender 1.043 不用，理由见上）；字号基准 `FONT_PX=20px@scale1`，配合按字号分槽绘制后大字/小字均显示正常；若个别场景仍需微调，改 `widgets.c` 里这两个常量即可。`w_text_w` 返回行高 h=字号（近似）用于垂直居中，如需精确按字形度量再改。
 
 **自定义字体替换/追加已销账（2026-09-07）**：内嵌双字体已覆盖实际场景，无必要开放字体自定义（理由见 docs/TODO.md 闭环留痕）；若将来出现真实需求再按新里程碑评估。
 
-#### 5.5.1 字形冷启动与开机预热（2026-09-07 d38-d40 定案）
+#### 5.5.1 字形冷启动：根因与根治（2026-09-14 d120-d126 定案，取代 d38-d40 预热方案）
 
-首见字形光栅化成本真机实测：CJK 约 **20~32ms/字**、拉丁约 2~6ms/字，是"首次切页 / 滚动出新行"卡顿的根因；同一字形缓存后重绘几乎免费（约 5µs/字，0.3ms/64 字）。曾试路径与结论（代码：ui_main.c `ui_warm_pass` / pages.c `pages_warm_all`）：
+**现象**：首次切到某页 / 滚动出新行时卡顿——单字形现烤成本 CJK ≈20~32ms、拉丁 ≈2~6ms；同一字形缓存后重绘几乎免费（≈5µs/字）。d38-d40 曾以"开机预热高频页字形"规避：收窄到设备列表 / 文件浏览 / 设置顶+About（≈4.3s），期间停在 **LiveArea 壁纸开屏**、字形画进隐帧但**绝不 swap**（若 swap，display 会读到 GPU 还在异步回放的缓冲，表现为"开屏后一堆页面闪过"）；全静态页面预热（d37，6 页全烤 6226ms、屏幕全黑）与逐帧时间预算预热（d33/d34，掉帧）均因代价过高被否决。
 
-- **逐帧时间预算预热（d33 每帧 96 字形、d34 唯一字符集 + 12ms 预算）**：字形光栅化总量是几十秒级 CPU 成本，无法摊进 60fps 帧预算，预热期间界面持续掉帧 → 否决（d35 整体回退）
-- **全静态页面预热（d37）**：6 页全烤实测 **6226ms** 且屏幕全程纯黑 → 过长
-- **定案（d38-d40）**：收窄到高频页（设备列表 / 文件浏览 / 设置页顶 + About 滚底），实测约 **4.3s**。预热期间屏幕停留在 **LiveArea 壁纸开屏**（`app0:/sce_sys/livearea/contents/bg.png`，与桌面点开应用前的画面同源、启动衔接不跳变；开屏不加文字避免遮挡图面）。字形画进隐帧但**绝不 swap**（收尾只 `vita2d_wait_rendering_done` 等 GPU 画完）——若 swap，display 会去读 GPU 还在逐页异步回放的缓冲，表现为"开屏后一堆页面闪过"。低频页（收发确认 / 进度等）维持首开现烤（一次性几十 ms，可接受）。字体对象仍启动帧外建齐（`font_preload_all`，见 §1 渲染稳定条目；现于开屏上屏后执行），预热只烤字形位图。
+**真因（d121 探针坐实，推翻"libvita2d 内部冷插入慢"的旧推论）**：libvita2d 默认用 `vita2d_load_font_file` 开的是**文件 face**（`FT_New_Face("app0:/fonts/*.ttf")`），而字体放在 VPK 的 `app0:`——**deflate 压缩文件系统**；FreeType 每取一个**新**字形轮廓都要在包内随机读一块并解压，实测 **~40ms/字形**（同字同号对照：文件 face 43.5ms vs 内存 face 0.19ms，差 150~180×；且**与字号无关**，故"砍字号档位"无效）。libvita2d 的 atlas / FTC / 装箱本身清白，钱全花在"从 app0 读 glyf"。**方法论教训**：此前 d118/d119 探针用 `FT_New_Memory_Face` 测 freetype，与被测对象（libvita2d 的**文件** face）输入条件不一致，导致连续三轮把矛头指向 libvita2d 内部缓存。
+
+**根治（d122）**：启动时把字体文件一次性读进 RAM 常驻（UMA 架构，无需搬显存），字体对象改走 `vita2d_load_font_mem(buf, len)`（**只存指针不拷贝，buffer 必须常驻**）。真机 `warm total` **5315ms → 65ms**（81×），`font preload done 22/22` 正常，开机到主界面总开销 ≈665ms（其中读盘 ~435ms 占大头）。
+
+**随后清理（d123）**：预热已无意义，**删掉开屏画面与全部字形预热逻辑**（`pages_warm_all` / `ui_warm_pass` / `settings_scroll_to` / `SPLASH_BG_FILE` 等一并移除），`ui_run` 直接 `font_preload_all()` 建齐字号字体对象（`font_preload_all` 保留：它把字体对象的创建挪到帧外，堵住"渲染中途建 GPU 纹理"的隐患）。代价：读盘那 ~0.43s 无画面（黑屏），观感可接受。
+
+**字体对象与语言地区（d124-d126）**：字体换 Noto Sans（拉丁 + CJK 简/繁/日三份地区版本，见 §5.5）。字号槽 `g_fs[]` 一次建齐 lat+cjk 两份，CJK 槽按**当前界面语言**算（`cjk_slot_current`）、**不能沿用该次调用的 `cjk` 参数**——建槽通常由"要拉丁"(cjk=0) 的那次调用触发，若沿用参数会把 CJK 也建成拉丁字体，表现为**所有汉字渲染成方块**、且 `font preload` 仍报满数（d125 修复）。换语言时在每帧 `start_drawing` **之前帧外**重建 CJK 字体对象（`font_reload_cjk`：释放旧的、按新槽 `load_slot`）——`vita2d_load_font_mem` 会建 512×512 显存纹理，落在渲染 pass 中途有 GPU crash 风险；首次切到某地区读盘 ~1.6s（16MB），之后常驻 RAM。
 
 ### 5.6 文件组织
 
 ```
 src/ui/
 ├── ui.h            # App 全局状态、页面枚举(PageId)、Input 抽象、font_get
-├── ui_main.c       # 主循环：输入 → 事件 → 渲染 + 字体按字号分槽（font_get 实现）+ 开屏/预热
+├── ui_main.c       # 主循环：输入 → 事件 → 渲染 + 字体按字号分槽（font_get 实现，字体从内存建）
 ├── theme.c/.h      # 主题颜色表 + 切换（Theme 结构，OLED / Yaru / Custom 主色推导）
 ├── widgets.c       # 文本/列表/按钮/进度条/弹窗（FONT_PX / FONT_ASC 常量）
 ├── hintbar.c/.h    # 底部按键提示条：键位图标绘制 + 段排序 + 排版（HintKey / HintSeg / w_page_footer_segs）
@@ -277,7 +283,7 @@ src/ui/
 
 ## 6. 配置与存储
 
-- `ux0:data/psvsend/config`（JSON，键为驼峰）：alias（设备名）、fingerprint（随机身份串）、port、theme（0=Yaru / 1=OLED / 2=自定义）、lightMode（0=深色 / 1=浅色）、customH / customS / customV（自定义主色 HSV，h 0-359 / s 0-100 / v 0-100，默认 210/65/90；缺字段回默认、越界回默认）、confirmLayout（0=美式 / 1=日式）、paneSwap（主页两栏左右位置：0=设备在左默认 / 1=文件在左）、lang（0=跟随系统 / 1=English / 2=中文）、knownIps（历史在线设备 IP，逗号分隔、LRU、上限 24，主动扫描种子）、updateAuto（更新检查：0=关 / 1=每天 / 2=每周默认 / 3=每月）、updateLast（上次检查更新的网络 unix 秒，自动节流）、saveDir（默认接收目录，默认 `ux0:data/psvsend/downloads`；读回去尾斜杠、非法回退默认）
+- `ux0:data/psvsend/config`（JSON，键为驼峰）：alias（设备名）、fingerprint（随机身份串）、port、theme（0=Yaru / 1=OLED / 2=自定义）、lightMode（0=深色 / 1=浅色）、customH / customS / customV（自定义主色 HSV，h 0-359 / s 0-100 / v 0-100，默认 210/65/90；缺字段回默认、越界回默认）、confirmLayout（0=美式 / 1=日式）、paneSwap（主页两栏左右位置：0=设备在左默认 / 1=文件在左）、lang（0=跟随系统 / 1=English / 2=简体中文 / 3=繁中（台灣）/ 4=繁中（香港）/ 5=日本語；AUTO 由系统语言映射，系统繁体默认台灣）、knownIps（历史在线设备 IP，逗号分隔、LRU、上限 24，主动扫描种子）、updateAuto（更新检查：0=关 / 1=每天 / 2=每周默认 / 3=每月）、updateLast（上次检查更新的网络 unix 秒，自动节流）、saveDir（默认接收目录，默认 `ux0:data/psvsend/downloads`；读回去尾斜杠、非法回退默认）
 - `ux0:data/psvsend/downloads/`：接收文件的默认目录（config `saveDir` 可改；设置页持久改、接收 Setup 临时改本次）
 - 首次启动 `sceIoMkdir` 幂等创建（已存在返回 0x80410011，忽略）
 
@@ -299,7 +305,9 @@ src/ui/
 
 ## 9. 待定问题
 
-- [x] 中文字体：已落地（freetype 双字体 Droid Sans + Fallback，按字号分槽绘制，见 §5.5）；升部实测校准 0.81、字号基准 20px@scale1，2026-09-04 真机确认显示正常
+- [x] 中文字体：已落地（freetype 双字体逐段路由，按字号分槽绘制，见 §5.5）；字体 d124 起换 **Noto Sans**（拉丁 + CJK 简/繁/日三份地区版本，随仓库入库，SIL OFL 1.1），升部重标定 `FONT_ASC=0.88`、字号基准 20px@scale1
+- [x] 字形冷启动卡顿：已根治（2026-09-14 d120-d126，见 §5.5.1）——根因是 libvita2d 开的是**文件 face**、字体在 `app0:` 压缩包里每取一个新字形要随机读盘解压 **~40ms**；改为启动把字体读进 RAM + `vita2d_load_font_mem`，开屏预热 5315ms → **65ms**，随后删除开屏与全部预热逻辑
+- [x] 日语界面：已落地（2026-09-14 d126，见 §1「实现现状」）——语言行加「日本語」（共 6 项），译文表加日语列（意译），CJK 字体按界面语言取 jp 地区版本
 - [x] 深浅色切换：已落地（2026-09-13 d102，见 §5.4）——色系 × 明暗两正交轴，设置页「外观」行切深色/浅色（OLED 固定深色）；config `lightMode`
 - [x] 自定义主题色盘：已落地（2026-09-13 d108/d109，见 §5.4）——色系加 Custom，只存主色 HSV（`customH/customS/customV`）运行时推导整套；设置页「主色」行（仅 Custom 时显示）进色盘页，实时预览、确认落盘、取消还原
 - [x] HTTP 解析兼容清单最终确认：**chunked 已落地**——http.c 对无 Content-Length 的请求按 `Transfer-Encoding: chunked` 走 chunked 解码（upload_stream/chunked_stream），dio/官方客户端流式上传真机验证；大文件 upload 一律不进内存。2026-09-07 确认
