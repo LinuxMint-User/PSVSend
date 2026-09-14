@@ -54,10 +54,9 @@ vita2d_font *font_get(int size, int cjk)
 }
 
 /* UI 字号档位表 = 现有页面全部 w_text scale 经 font_px 取整的集合；
- * font_preload_all 启动建齐 + glyph warm 预热也按这份表逐字号烤。
- * 日后新增字号档请同步补进此表。 */
+ * font_preload_all 启动建齐。日后新增字号档请同步补进此表。 */
 static const int g_font_sizes[] = {
-    18, 20, 21, 22, 23, 24, 25, 26, 28, 30, 32, 34,
+    16, 18, 20, 21, 22, 23, 24, 25, 26, 30, 34,
 };
 #define FONT_SIZES_N ((int)(sizeof g_font_sizes / sizeof g_font_sizes[0]))
 
@@ -77,7 +76,8 @@ static void font_preload_all(void)
         if (font_get(g_font_sizes[i], 0)) ok++;   /* latin */
         if (font_get(g_font_sizes[i], 1)) ok++;   /* CJK  */
     }
-    dlog("font preload done: %d/%d fonts, sizes 18..34", ok, 2 * FONT_SIZES_N);
+    dlog("font preload done: %d/%d fonts, sizes %d..%d", ok, 2 * FONT_SIZES_N,
+         g_font_sizes[0], g_font_sizes[FONT_SIZES_N - 1]);
 }
 
 /* ---------- widget 命中表 ---------- */
