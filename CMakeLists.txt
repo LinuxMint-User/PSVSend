@@ -98,16 +98,18 @@ add_custom_command(OUTPUT ${_vpk}
           -a ${_pkgsce}/livearea/contents/bg.png=sce_sys/livearea/contents/bg.png
           -a ${_pkgsce}/livearea/contents/startup.png=sce_sys/livearea/contents/startup.png
           -a ${_pkgsce}/livearea/contents/template.xml=sce_sys/livearea/contents/template.xml
-          -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/DroidSans.ttf=fonts/DroidSans.ttf
-          -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/DroidSansFallbackFull.ttf=fonts/DroidSansFallbackFull.ttf
+          -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSans-Regular.ttf=fonts/NotoSans-Regular.ttf
+          -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKsc-Regular.otf=fonts/NotoSansCJKsc-Regular.otf
+          -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKtc-Regular.otf=fonts/NotoSansCJKtc-Regular.otf
           ${_vpk}
   DEPENDS ${_elf}
           ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/icon0.png
           ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/bg.png
           ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/startup.png
           ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/template.xml
-          ${CMAKE_CURRENT_SOURCE_DIR}/fonts/DroidSans.ttf
-          ${CMAKE_CURRENT_SOURCE_DIR}/fonts/DroidSansFallbackFull.ttf
+          ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSans-Regular.ttf
+          ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKsc-Regular.otf
+          ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKtc-Regular.otf
   COMMENT "Building vpk ${PROJECT_NAME}"
   VERBATIM
 )

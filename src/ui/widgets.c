@@ -17,14 +17,14 @@
  * 尺寸语义（libvita2d freetype 后端，见 vita2d_font.c）：
  *  - `vita2d_font_draw_text` 的 y 是"基线"，size 是像素字号（em 盒高）；
  *  - w_text 的 y 保持"行首升部线"语义：基线 = y + FONT_ASC*size。
- *    FONT_ASC 取 CJK 满格字（中/文/日）字形顶比例 ≈ 0.81em（实测
- *    glyf yMax/upem，非 1.043 的盒 ascender——盒顶在 em 上方留行距
- *    空白，用它基线会被压得过低）。拉丁大写顶 ≈ 0.717em，同基线
- *    下略低于中文顶 ~0.09em，视觉协调；
+ *    FONT_ASC 取 CJK 满格字（中/文/日）字形顶比例：Noto Sans CJK 实测
+ *    0.875~0.90em（16/20/26/34px 档分别 0.875/0.900/0.885/0.882，取 0.88；
+ *    非 1.16 的盒 ascender——盒顶在 em 上方留行距空白，用它基线会被压得
+ *    过低）。拉丁大写顶 ≈ 0.72em，同基线下略低于中文顶 ~0.16em，视觉协调；
  *  - scale→px：scale=1.0 → 20px（CJK 字形全高 ~0.91em + 少量下伸，
  *    行距观感与列表 26px 吻合）。整体嫌大/小只调 FONT_PX。 */
 #define FONT_PX   20.0f
-#define FONT_ASC  0.81f
+#define FONT_ASC  0.88f
 
 static int font_px(float scale)
 {
@@ -60,9 +60,9 @@ static const char *utf8_next_cp(const char *p, uint32_t *cp)
 
 /* 字体域判定：ASCII / Latin-1 与通用标点（U+2000-206F，含省略号 U+2026、
  * 弯引号 U+201C/201D、破折号 U+2014 等）走拉丁字体；其余（CJK 汉字、全角
- * 符号、假名…）走 CJK 字体。注意：DroidSansFallbackFull（CJK 字库）缺
- * U+2026 等通用标点，而 DroidSans（拉丁字库）反而含——早期按"码点 >0xFF
- * 一律 CJK"路由，把这些字符发给了缺字形的字库 → 中文文案渲染成方框。 */
+ * 符号、假名…）走 CJK 字体。这类通用标点只放在拉丁字库里（早期按"码点
+ * >0xFF 一律 CJK"路由，把省略号等发给了不带这些字形的 CJK 字库 → 中文文案
+ * 渲染成方框，故单列此段）。 */
 static int cp_domain(uint32_t cp)
 {
     if (cp <= 0xFF) return 0;

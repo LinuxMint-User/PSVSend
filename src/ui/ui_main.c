@@ -10,6 +10,7 @@
 #include "app/api.h"
 #include "app/update.h"
 #include "core/dlog.h"
+#include "core/i18n.h"
 
 App g_app;
 extern void pages_init(void);
@@ -23,11 +24,18 @@ extern void pages_init(void);
  * 独立字体对象（独立 atlas），draw_scale 恒为 1，全部原生光栅化。
  * 首次用到某字号才 load；同字号 latin/cjk 各一份。 */
 #define FONT_PATHS_BASE "app0:/fonts/"
-#define FONT_LAT_FILE   FONT_PATHS_BASE "DroidSans.ttf"
-#define FONT_CJK_FILE   FONT_PATHS_BASE "DroidSansFallbackFull.ttf"
+#define FONT_LAT_FILE   FONT_PATHS_BASE "NotoSans-Regular.ttf"
+#define FONT_SC_FILE    FONT_PATHS_BASE "NotoSansCJKsc-Regular.otf"
+#define FONT_TC_FILE    FONT_PATHS_BASE "NotoSansCJKtc-Regular.otf"
 #define MAX_FONT_SIZES 24
-static struct { int size; vita2d_font *lat; vita2d_font *cjk; } g_fs[MAX_FONT_SIZES];
+static struct {
+    int size;
+    int cjk_slot;      /* 本项 cjk 字体建自哪个地区槽（见 cjk_slot_current） */
+    vita2d_font *lat;
+    vita2d_font *cjk;
+} g_fs[MAX_FONT_SIZES];
 static int g_fs_n;
+static int g_font_lang = -1;   /* g_fs 的 cjk 字体是按哪个界面语言建的 */
 
 /* ---------- 字体文件的一次性内存副本 ----------
  * libvita2d 默认用 FT_New_Face 开"文件 face"（app0:/fonts/*.ttf）。app0: 是
@@ -37,20 +45,41 @@ static int g_fs_n;
  * 字越多越卡"，都出自这里；且成本与字号无关（轮廓数据量只跟字形复杂度有
  * 关），故砍字号档位、缩小标题字号都无效。
  * 机型是 UMA（无独立显存，无需把数据搬进显存），字体文件本身也不大，故启动
- * 时把两个 ttf 各读一份到 RAM，字体对象改从内存建：取轮廓退化为内存访问。
- * 注：vita2d_load_font_mem 只存指针不拷贝数据，这两个 buffer 必须常驻。 */
-static void *g_font_ram[2];        /* [0]=latin, [1]=CJK */
-static int   g_font_ram_len[2];
+ * 时把字体文件各读一份到 RAM，字体对象改从内存建：取轮廓退化为内存访问。
+ * 注：vita2d_load_font_mem 只存指针不拷贝数据，这些 buffer 必须常驻。
+ *
+ * 字体分三份：拉丁 NotoSans，CJK 用 Noto Sans CJK 的地区版本（简 sc / 繁 tc）。
+ * 两份 CJK 都含全部 CJK 字形，差别只在"同一码位默认取哪个地区的字形"
+ * （骨/道/直/繁…），故按当前界面语言只加载其中一份，换语言时才读另一份
+ * （见 font_reload_cjk）。 */
+static void *g_font_ram[3];        /* 0=拉丁 1=CJK简 2=CJK繁 */
+static int   g_font_ram_len[3];
 
-static void *font_ram(int cjk)
+static const char *font_path(int slot)
 {
-    const char *path = cjk ? FONT_CJK_FILE : FONT_LAT_FILE;
+    switch (slot) {
+    case 0:  return FONT_LAT_FILE;
+    case 1:  return FONT_SC_FILE;
+    default: return FONT_TC_FILE;
+    }
+}
+
+/* 当前界面语言对应的 CJK 地区槽（繁中台/港用 tc，简体与英文用 sc） */
+static int cjk_slot_current(void)
+{
+    int l = i18n_lang();
+    return (l == I18N_LANG_ZH_TW || l == I18N_LANG_ZH_HK) ? 2 : 1;
+}
+
+static void *font_ram(int slot)
+{
+    const char *path = font_path(slot);
     SceUID fd;
     int sz, got = 0;
     long long t0;
 
-    if (g_font_ram[cjk])
-        return g_font_ram[cjk];
+    if (g_font_ram[slot])
+        return g_font_ram[slot];
     fd = sceIoOpen(path, SCE_O_RDONLY, 0);
     if (fd < 0) {
         dlog("font ram: open failed %s", path);
@@ -67,18 +96,27 @@ static void *font_ram(int cjk)
             dlog("font ram: read failed %s size=%d got=%d", path, sz, got);
             free(buf);
         } else {
-            g_font_ram[cjk] = buf;
-            g_font_ram_len[cjk] = sz;
-            dlog("font ram: %s %d bytes in %lldus", cjk ? "cjk" : "lat", sz,
+            g_font_ram[slot] = buf;
+            g_font_ram_len[slot] = sz;
+            dlog("font ram: slot%d %s %d bytes in %lldus", slot, path, sz,
                  (long long)sceKernelGetSystemTimeWide() - t0);
         }
     }
     sceIoClose(fd);
-    return g_font_ram[cjk];
+    return g_font_ram[slot];
 }
 
-/* 返回 size 像素字号的字体：cjk=0 拉丁、1 CJK；加载失败返回 NULL。
- * 表满（UI 档位应远少于 MAX_FONT_SIZES）时回退 0 号槽。 */
+static vita2d_font *load_slot(int slot)
+{
+    void *buf = font_ram(slot);
+    return buf ? vita2d_load_font_mem(buf, (unsigned)g_font_ram_len[slot]) : NULL;
+}
+
+/* 返回 size 像素字号的字体：cjk=0 拉丁、1 CJK（地区随当前界面语言）；加载
+ * 失败返回 NULL。表满（UI 档位应远少于 MAX_FONT_SIZES）时回退 0 号槽。
+ * 注意：新槽一次建齐 lat+cjk 两份，故建槽可能在"要拉丁"的那次调用里发生——
+ * CJK 槽必须按当前界面语言算，不能沿用该次调用的 cjk 参数（否则两种字体
+ * 会被建成同一份）。 */
 vita2d_font *font_get(int size, int cjk)
 {
     int i;
@@ -86,23 +124,16 @@ vita2d_font *font_get(int size, int cjk)
         if (g_fs[i].size == size)
             return cjk ? g_fs[i].cjk : g_fs[i].lat;
     if (g_fs_n < MAX_FONT_SIZES) {
-        vita2d_font *lat, *cj;
-        font_ram(0);
-        font_ram(1);        /* 首次进来时把两个 ttf 读进 RAM，之后命中缓存 */
-        lat = g_font_ram[0]
-            ? vita2d_load_font_mem(g_font_ram[0], (unsigned)g_font_ram_len[0])
-            : NULL;
-        cj = g_font_ram[1]
-            ? vita2d_load_font_mem(g_font_ram[1], (unsigned)g_font_ram_len[1])
-            : NULL;
-        if (!lat || !cj)
+        int slot = cjk_slot_current();
+        g_fs[g_fs_n].size     = size;
+        g_fs[g_fs_n].cjk_slot = slot;
+        g_fs[g_fs_n].lat      = load_slot(0);
+        g_fs[g_fs_n].cjk      = load_slot(slot);
+        if (!g_fs[g_fs_n].lat || !g_fs[g_fs_n].cjk)
             dlog("font load failed size=%d lat=%p cjk=%p", size,
-                 (void *)lat, (void *)cj);
-        g_fs[g_fs_n].size = size;
-        g_fs[g_fs_n].lat  = lat;
-        g_fs[g_fs_n].cjk  = cj;
+                 (void *)g_fs[g_fs_n].lat, (void *)g_fs[g_fs_n].cjk);
         g_fs_n++;
-        return cjk ? cj : lat;
+        return cjk ? g_fs[g_fs_n - 1].cjk : g_fs[g_fs_n - 1].lat;
     }
     return cjk ? g_fs[0].cjk : g_fs[0].lat;
 }
@@ -126,12 +157,36 @@ static const int g_font_sizes[] = {
 static void font_preload_all(void)
 {
     int i, ok = 0;
+    g_font_lang = i18n_lang();
     for (i = 0; i < FONT_SIZES_N; i++) {
         if (font_get(g_font_sizes[i], 0)) ok++;   /* latin */
         if (font_get(g_font_sizes[i], 1)) ok++;   /* CJK  */
     }
-    dlog("font preload done: %d/%d fonts, sizes %d..%d", ok, 2 * FONT_SIZES_N,
-         g_font_sizes[0], g_font_sizes[FONT_SIZES_N - 1]);
+    dlog("font preload done: %d/%d fonts, sizes %d..%d, lang=%d cjk_slot=%d "
+         "lat=%p cjk=%p", ok, 2 * FONT_SIZES_N, g_font_sizes[0],
+         g_font_sizes[FONT_SIZES_N - 1], g_font_lang, cjk_slot_current(),
+         (void *)g_fs[0].lat, (void *)g_fs[0].cjk);
+}
+
+/* 界面语言换了地区（简↔繁；日后含日文）时，把各字号的 CJK 字体对象换成对应
+ * 地区那份：释放旧的、按新槽重建。必须帧外调用——vita2d_load_font_mem 会建
+ * 512x512 显存纹理，落在渲染 pass 中途有 GPU crash 风险（见 font_preload_all
+ * 注释）；ui_run 在每帧 start_drawing 之前检查一次。首次换到某地区会读盘
+ * ~1.6s（16MB），属一次性开销。 */
+static void font_reload_cjk(void)
+{
+    int i, slot;
+    g_font_lang = i18n_lang();
+    slot = cjk_slot_current();
+    for (i = 0; i < g_fs_n; i++) {
+        if (g_fs[i].cjk_slot == slot)
+            continue;
+        if (g_fs[i].cjk)
+            vita2d_free_font(g_fs[i].cjk);
+        g_fs[i].cjk = load_slot(slot);
+        g_fs[i].cjk_slot = slot;
+    }
+    dlog("font cjk reload: lang=%d slot=%d", g_font_lang, slot);
 }
 
 /* ---------- widget 命中表 ---------- */
@@ -225,6 +280,10 @@ void ui_run(void)
         update_tick();       /* 自动检查更新：到周期且网络就绪时后台触发 */
         page_ime_pump();     /* 系统键盘改名事务：帧间打开挂起键盘 / 轮询收尾
                               * （须非绘制中调用 + 打开期间持续出帧，见 ime.c d56） */
+
+        /* 设置页刚改过界面语言 → 帧外换 CJK 地区字体（见 font_reload_cjk） */
+        if (g_font_lang != i18n_lang())
+            font_reload_cjk();
 
         vita2d_start_drawing();
         vita2d_set_clear_color(theme->bg);
