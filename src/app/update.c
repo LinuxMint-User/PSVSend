@@ -740,7 +740,17 @@ static void upd_launch(int mode)
         g_busy = 0;
         return;
     }
-    sceKernelStartThread(th, (SceSize)sizeof mode, &mode);
+    {
+        int sr = sceKernelStartThread(th, (SceSize)sizeof mode, &mode);
+        if (sr < 0) {   /* 起不来：g_busy 若不复位，update_state() 永返 WORKING，
+                         * 设置页永久卡在 "Checking..."，手动检查也被 g_busy 挡掉，
+                         * 本会话再也恢复不了。回收线程对象并复位状态。 */
+            dlog("update: thread start fail 0x%08X", (unsigned)sr);
+            sceKernelDeleteThread(th);
+            g_st = UPD_FAIL;
+            g_busy = 0;
+        }
+    }
 }
 
 void update_init(void)

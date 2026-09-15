@@ -32,6 +32,9 @@
 static int    g_port = 0;           /* 实际绑定端口（0=未启动） */
 static int    g_lsock = -1;
 static SceUID g_thr = -1;           /* accept 线程（http_stop 要等它退） */
+static SceUID g_thr_zombie = -1;    /* stop 时没能等到的旧 accept 线程句柄：留着下次回收。
+                                     * 线程对象在退出后仍是 DORMANT 状态，不 delete 就永久占一个
+                                     * 句柄（每次断网重连泄漏一个，耗尽后 http_start 永远失败）。 */
 static volatile int g_run = 0;
 static volatile int g_gen = 0;      /* 服务器代次：stop/start 递增，旧线程据此收手 */
 static void (*g_cb)(const char *body, const char *src_ip) = NULL;
@@ -689,8 +692,10 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
  *  - worker 自找本槽（sceKernelGetThreadId 匹配）取 fd/ip/代次，处理完关
  *    fd、清槽、线程自删（ExitDeleteThread，无固定 join 者，避免泄漏）；
  *  - 换代（http_stop/restart）后旧 worker 在收头/收体轮询里感知 gen 变化
- *    尽早收手；worker 收尾时若代次已变，绝不关 fd——号可能已被新监听或
- *    新连接复用，宁可漏一个死 fd；
+ *    尽早收手；worker 收尾时照常关自己的 fd——该 fd 在它存活期间一直由它
+ *    持有，内核不会把仍打开的号分给新监听/新连接，故关闭不会误伤别人；
+ *    不关才是每次断网重连泄漏一个 socket fd（join 只有 500ms 预算，等不到
+ *    是常态）；
  *  - http_stop 关监听、join accept 线程后，对有预算地 join 仍在跑的 worker。 */
 static int conn_worker(SceSize args, void *argp)
 {
@@ -732,8 +737,7 @@ static int conn_worker(SceSize args, void *argp)
         }
     }
     conn_unlock();
-    if (my_gen == g_gen)             /* 换代后绝不关：号可能已被新代复用 */
-        sceNetSocketClose(c);
+    sceNetSocketClose(c);            /* 换代也照关：见上方头注（不关 = 泄漏 fd） */
     dlog("http: worker %d done", (int)me);
     sceKernelExitDeleteThread(0);
     return 0;
@@ -827,6 +831,19 @@ static int http_thr(SceSize args, void *argp)
     return 0;
 }
 
+/* 回收上一次 stop 没能等到的 accept 线程对象（见 g_thr_zombie 注释）。
+ * 线程已退出才删得掉；还在跑就留着句柄，下次启动再来一次。 */
+static void http_reap_zombie(void)
+{
+    SceUInt to = 0;
+    if (g_thr_zombie < 0) return;
+    if (sceKernelWaitThreadEnd(g_thr_zombie, NULL, &to) == 0) {
+        dlog("http: stale accept thread %d reclaimed", (int)g_thr_zombie);
+        sceKernelDeleteThread(g_thr_zombie);
+        g_thr_zombie = -1;
+    }
+}
+
 /* ---------- 启动 ---------- */
 int http_start(void)
 {
@@ -837,6 +854,8 @@ int http_start(void)
     int one = 1, i, s = -1, chosen = 0;
 
     if (g_port > 0) return g_port;   /* 已在跑 */
+
+    http_reap_zombie();              /* 顺手回收上次没删掉的旧 accept 线程对象 */
 
     if (g_conn_mtx < 0)              /* 连接登记表锁：随服务器首次启动创建，
                                       * 跨 stop/start 复用（stop 不销毁） */
@@ -891,6 +910,18 @@ int http_start(void)
         {
             int sr = sceKernelStartThread(t, 0, NULL);
             dlog("http: thread start -> 0x%08X", (unsigned)sr);
+            if (sr < 0) {   /* 起不来：端口已 bind 却没人 accept。此时不能只记日志——
+                             * 未启动的线程 http_alive 判不出死，看门狗永不重启，
+                             * 服务就这么静默死了。就地拆干净，让 watch 下次重试。 */
+                dlog("http: thread start FAILED -> tear down listener");
+                sceKernelDeleteThread(t);
+                g_thr = -1;
+                sceNetSocketClose(s);
+                g_lsock = -1;
+                g_port = 0;
+                g_run = 0;
+                return -4;
+            }
         }
     }
     dlog("http: up on port %d", g_port);
@@ -913,6 +944,7 @@ int http_alive(void)
         int st = sceKernelWaitThreadEnd(g_thr, NULL, &to);
         if (st == 0) {                     /* 线程已退出（自尽/异常） */
             dlog("http: accept thread exited unexpectedly");
+            sceKernelDeleteThread(g_thr);  /* 回收线程对象：不删则在 DORMANT 上永久占句柄 */
             g_thr = -1;
             return 0;
         }
@@ -963,8 +995,13 @@ void http_stop(void)
     if (g_thr >= 0) {
         SceUInt to = 500 * 1000;      /* 最多等 500ms（关监听后 accept 立即醒） */
         int st = sceKernelWaitThreadEnd(g_thr, NULL, &to);
-        if (st < 0)
+        if (st == 0) {
+            sceKernelDeleteThread(g_thr);   /* 已退出：回收线程对象（不删就每次重连泄漏一个） */
+        } else {
             dlog("http: wait thread end -> 0x%08X", (unsigned)st);
+            if (g_thr_zombie < 0) g_thr_zombie = g_thr;    /* 等不到：留句柄下次 start 再收 */
+            else dlog("http: unreclaimed accept thread %d dropped", (int)g_thr);
+        }
         g_thr = -1;
     }
     http_join_conns();               /* 有预算地等仍在跑的连接 worker */

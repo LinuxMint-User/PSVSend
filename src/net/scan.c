@@ -487,6 +487,10 @@ typedef struct {
 
 static ScanCtx g_ctx;
 static volatile int g_round = 0;
+/* 超预算被弃的 worker 句柄。它们还会跑一会儿（每个连着 80KB 栈），父轮若把句柄
+ * 丢在栈上的局部数组里就再也收不回来（每轮最多漏 8 个），故登记在此，
+ * 每轮开头顺手把已退出的那些线程对象删掉。 */
+static SceUID g_orphan[SCAN_WORKERS];
 
 #define SCAN_ROUND_BUDGET_US (120 * 1000000LL)  /* 一轮硬预算：超时视为 worker 挂死 */
 #define SCAN_ROUND_SLOW_US   (15 * 1000000LL)   /* 超过则周期性打慢速日志 */
@@ -518,10 +522,37 @@ static int scan_worker_thr(SceSize args, void *argp)
             sunlock();
         }
         slock();
-        g_done++;
+        if (g_round == my_round)      /* 被弃的旧轮不再计进度（父轮已把 g_done 钉成 254，
+                                       * 否则读数会超过总数） */
+            g_done++;
         sunlock();
     }
     return 0;
+}
+
+/* 回收被弃 worker 的线程对象：只有已退出的删得掉，还在跑的留到下次再试 */
+static void scan_reap_orphans(void)
+{
+    int i;
+    for (i = 0; i < SCAN_WORKERS; i++) {
+        SceUInt to = 0;
+        if (g_orphan[i] <= 0) continue;
+        if (sceKernelWaitThreadEnd(g_orphan[i], NULL, &to) == 0) {
+            dlog("scan: reaped abandoned worker %d", (int)g_orphan[i]);
+            sceKernelDeleteThread(g_orphan[i]);
+            g_orphan[i] = -1;
+        }
+    }
+}
+
+/* 登记一个被弃 worker 的句柄（表满则丢弃：最坏情形与修复前相同） */
+static void scan_track_orphan(SceUID t)
+{
+    int i;
+    if (t <= 0) return;
+    for (i = 0; i < SCAN_WORKERS; i++)
+        if (g_orphan[i] <= 0) { g_orphan[i] = t; return; }
+    dlog("scan: orphan table full, worker %d dropped", (int)t);
 }
 
 static void scan_round(void)
@@ -539,6 +570,7 @@ static void scan_round(void)
         dlog("scan: no usable local ip, skip round");
         return;
     }
+    scan_reap_orphans();               /* 顺手回收上一轮被弃的 worker 线程对象 */
     if (g_lock < 0)
         g_lock = sceKernelCreateMutex("psvsend_scan", 0, 0, NULL);
 
@@ -622,10 +654,13 @@ static void scan_round(void)
             }
             if (pending > 0) sceKernelDelayThread(SCAN_TICK_US);
         }
-        if (pending > 0)
+        if (pending > 0) {
             dlog("scan: round #%d budget exceeded, abandon %d worker(s) (found %d)",
                  my_round, pending, g_found);
-        /* 被废弃的 worker 恢复后会在下一轮（轮次号已变）到来前自己收手 */
+            for (i = 0; i < wn; i++)
+                if (alive[i]) scan_track_orphan(wt[i]);   /* 句柄登记，退出后回收 */
+        }
+        /* 被废弃的 worker 会在下一轮（轮次号已变）到来后自己收手 */
     }
 
     slock();                           /* 会话内镜像（下轮持久种子在 config） */

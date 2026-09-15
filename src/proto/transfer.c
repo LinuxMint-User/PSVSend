@@ -731,10 +731,10 @@ static int xfer_thr(SceSize args, void *argp)
     for (i = 0; i < g_j.count; i++) {
         int fd, rd, sr, blen;
         SceOff sent_file = 0;
-        if (g_j.cancel) { cancel_notify_peer(); finish_cancelled(); return 0; }
+        if (g_j.cancel) { cancel_notify_peer(); finish_cancelled(); goto out; }
         if (g_j.tokens[i][0] == 0) {
             fail_file(i, "no token for %s", g_j.files[i].name);
-            return 0;
+            goto out;
         }
         lock();
         g_j.v.cur = i;
@@ -745,7 +745,7 @@ static int xfer_thr(SceSize args, void *argp)
         fd = sceIoOpen(g_j.files[i].path, SCE_O_RDONLY, 0);
         if (fd < 0) {
             fail_file(i, "cannot open %s", g_j.files[i].path);
-            return 0;
+            goto out;
         }
         {
             char q[320];
@@ -762,7 +762,7 @@ static int xfer_thr(SceSize args, void *argp)
                 cancel_notify_peer(); /* 对方在等首文件流：先通知，别让它干等 */
                 sceIoClose(fd);
                 finish_cancelled();
-                return 0;
+                goto out;
             }
             if (sr < 0) {
                 sceIoClose(fd);
@@ -770,7 +770,7 @@ static int xfer_thr(SceSize args, void *argp)
                     fail_file(i, "TLS handshake with %s:%d failed", g_j.ip, g_j.port);
                 else
                     fail_file(i, "connect failed for %s", g_j.files[i].name);
-                return 0;
+                goto out;
             }
             while (sent_file < g_j.files[i].size) {
                 SceOff want = g_j.files[i].size - sent_file;
@@ -781,14 +781,14 @@ static int xfer_thr(SceSize args, void *argp)
                     conn_close(&c);
                     sceIoClose(fd);
                     finish_cancelled();
-                    return 0;
+                    goto out;
                 }
                 rd = sceIoRead(fd, chunk, (unsigned)want);
                 if (rd < 0) {
                     conn_close(&c);
                     sceIoClose(fd);
                     fail_file(i, "read error on %s", g_j.files[i].name);
-                    return 0;
+                    goto out;
                 }
                 if (rd == 0) {
                     /* 文件比声明的 size 短（读取期间被替换/截断）：再转下去
@@ -797,7 +797,7 @@ static int xfer_thr(SceSize args, void *argp)
                     conn_close(&c);
                     sceIoClose(fd);
                     fail_file(i, "%s shrank during send", g_j.files[i].name);
-                    return 0;
+                    goto out;
                 }
                 sr = conn_send_all(&c, chunk, rd);
                 if (sr < 0) {
@@ -806,7 +806,7 @@ static int xfer_thr(SceSize args, void *argp)
                     sceIoClose(fd);
                     if (sr == -2) finish_cancelled();
                     else fail_file(i, "send error on %s", g_j.files[i].name);
-                    return 0;
+                    goto out;
                 }
                 sent_file += rd;
                 set_file_state(i, 1, sent_file);
@@ -818,12 +818,12 @@ static int xfer_thr(SceSize args, void *argp)
                 cancel_notify_peer(); /* body 已发完等回执时取消：收尾前通知 */
                 sceIoClose(fd);
                 finish_cancelled();
-                return 0;
+                goto out;
             }
             if (blen < 0 || code < 200 || code >= 300) {
                 sceIoClose(fd);
                 fail_file(i, "%s upload failed (HTTP %d)", g_j.files[i].name, code);
-                return 0;
+                goto out;
             }
         }
         sceIoClose(fd);
@@ -831,7 +831,7 @@ static int xfer_thr(SceSize args, void *argp)
              (long long)g_j.files[i].size);
         set_file_state(i, 2, g_j.files[i].size);
     }
-    if (g_j.cancel) { cancel_notify_peer(); finish_cancelled(); return 0; }
+    if (g_j.cancel) { cancel_notify_peer(); finish_cancelled(); goto out; }
 
     lock();
     g_j.v.finished = true;
@@ -841,10 +841,13 @@ static int xfer_thr(SceSize args, void *argp)
     snprintf(g_j.v.msg, sizeof g_j.v.msg, "Complete");
     unlock();
     dlog("xfer: all done");
-    return 0;
+    goto out;
 out:
     free(body);
     free(prep);
+    /* 线程自删：线程结束若不删，线程对象连着 128KB 栈一直挂在 DORMANT 上，
+     * 而 g_j.th 下次 xfer_start 会被 memset 覆盖 → 句柄彻底丢失、再也收不回。 */
+    sceKernelExitDeleteThread(0);
     return 0;
 }
 

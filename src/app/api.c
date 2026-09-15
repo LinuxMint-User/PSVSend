@@ -27,6 +27,9 @@
 #define POKE_INTERVAL_MS 1000        /* 断网活性刺激间隔（d65）：发包非阻塞后靠高频
                                       * 重试命中"接口就绪"窗口，见 api_poke */
 
+static SceUID g_watch_thr = -1;      /* api_watch 巡检线程句柄（存活检测见 watch_keepalive） */
+static void watch_keepalive(void);   /* 定义在 api_watch_thr 之后，api_tick 先用 */
+
 /* 一次巡检。由 api_start（首次同步）与 api_watch 线程调用。
  * 链路自愈（Q2）：待机唤醒/断线重连后，旧监听 socket 与 UDP 发送 socket 可能
  * 已失效（netctl 不一定报断开）。这里盯三类信号并在恢复时拆旧建新：
@@ -146,9 +149,11 @@ static void watch_once(void)
 void api_tick(void)
 {
     static uint64_t last_ms = 0;
+    static unsigned n = 0;
     uint64_t now = (uint64_t)sceKernelGetSystemTimeWide() / 1000;
     if (now - last_ms < 500) return;
     last_ms = now;
+    if ((++n % 8) == 0) watch_keepalive();   /* 每 ~4s 探一次巡检线程的存活 */
     disc_tick_announce();
 }
 
@@ -200,12 +205,46 @@ static int api_watch_thr(SceSize args, void *argp)
     return 0;
 }
 
+/* 起巡检线程：api_start 首次、以及检测到它异常退出后重建 */
+static int watch_spawn(void)
+{
+    SceUID t = sceKernelCreateThread("psvsend_api_watch", api_watch_thr,
+                                     0x40, 0x10000, 0, 0, NULL);
+    dlog("api: watch thread create -> 0x%08X", (unsigned)t);
+    if (t < 0) { g_watch_thr = -1; return -1; }
+    {
+        int sr = sceKernelStartThread(t, 0, NULL);
+        dlog("api: watch thread start -> 0x%08X", (unsigned)sr);
+        if (sr < 0) {
+            sceKernelDeleteThread(t);
+            g_watch_thr = -1;
+            return -1;
+        }
+    }
+    g_watch_thr = t;
+    return 0;
+}
+
+/* 巡检线程存活检测（api_tick 每 ~4s 调一次）：它一旦消失，网络自愈（重连、
+ * 重绑 http、重启发现）全停摆，而 UI 看不出任何异常（真机 d12 出现过该线程
+ * 凭空不见）。探到已退出就回收句柄、重建一个。 */
+static void watch_keepalive(void)
+{
+    SceUInt to = 0;
+    if (g_watch_thr < 0) { watch_spawn(); return; }
+    if (sceKernelWaitThreadEnd(g_watch_thr, NULL, &to) != 0) return;   /* 还在跑 */
+    dlog("api: watch thread (uid %d) gone -> respawn", (int)g_watch_thr);
+    sceKernelDeleteThread(g_watch_thr);
+    g_watch_thr = -1;
+    watch_spawn();
+}
+
 void api_start(void)
 {
     int r;
     config_init();                       /* 先建目录/读配置（dlog 目录依赖它） */
     dlog_init();
-    dlog("== psvsend boot [TAG:d127] ==");
+    dlog("== psvsend boot [TAG:d128] ==");
     {
         /* 版本标记 + 设备身份指纹：确认刷入的固件含 mTLS 客户端证书 */
         char f[65];
@@ -222,15 +261,7 @@ void api_start(void)
     r = net_start();
     dlog("watch: initial net_start -> %s", r == 0 ? "ok" : "fail");
     watch_once();                        /* 立即巡检一次：连着的 Wi-Fi 不用等 500ms */
-    {
-        SceUID t = sceKernelCreateThread("psvsend_api_watch", api_watch_thr,
-                                         0x40, 0x10000, 0, 0, NULL);
-        dlog("api: watch thread create -> 0x%08X", (unsigned)t);
-        if (t >= 0) {
-            int sr = sceKernelStartThread(t, 0, NULL);
-            dlog("api: watch thread start -> 0x%08X", (unsigned)sr);
-        }
-    }
+    watch_spawn();                       /* 起网络巡检线程（存活检测见 watch_keepalive） */
 }
 
 int api_device_snapshot(Device *out, int max)
