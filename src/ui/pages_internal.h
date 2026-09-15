@@ -168,7 +168,7 @@ void settings_open(void);           /* pages_settings.c：进设置页（焦点�
 /* 进度页当前文件清单：发送时每帧由 xfer 快照覆盖；接收由 start_recv 先以本地
  * 清单兜底首帧、再由 receive 会话快照覆盖（定义在 pages.c）。 */
 extern int    xf_count;
-extern char   xf_name[MAX_PICKED][128];
+extern char   xf_name[MAX_PICKED][192];
 extern SceOff xf_size[MAX_PICKED];
 extern int    xf_scroll;
 

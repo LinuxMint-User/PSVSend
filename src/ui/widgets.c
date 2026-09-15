@@ -176,6 +176,55 @@ void w_text_clip(float x, float y, float scale, uint32_t color,
         w_text(x, y, scale, color, "%s", buf);
 }
 
+/* 中间省略：整串放不下 max_w 时画成"头…尾"（尾部保留，超长文件名的扩展名
+ * 才看得见），返回实际绘制宽度；放得下则整串照画。头尾各占可用宽的一半。 */
+int w_text_mid(float x, float y, float scale, uint32_t color,
+               const char *text, int max_w)
+{
+    const char *off[200], *tail;
+    int cw[200];
+    char cbuf[8], out[576];
+    int ncp = 0, i, j, tw = 0, ew = 0, avail, lw = 0, rw = 0, o;
+    const char *p = text;
+    if (!text || !*text) return 0;
+    w_text_w(scale, text, &tw, NULL);
+    if (tw <= max_w) {
+        w_text(x, y, scale, color, "%s", text);
+        return tw;
+    }
+    if (strlen(text) >= sizeof out - 4) {          /* 极端长：退回尾部裁剪 */
+        w_text_clip(x, y, scale, color, text, max_w);
+        return max_w;
+    }
+    while (*p && ncp < (int)(sizeof off / sizeof off[0])) {
+        const char *nx = utf8_skip(p);
+        int n = (int)(nx - p), w = 0;
+        if (n > (int)sizeof cbuf - 1) n = (int)sizeof cbuf - 1;
+        memcpy(cbuf, p, n);
+        cbuf[n] = 0;
+        w_text_w(scale, cbuf, &w, NULL);
+        off[ncp] = p;
+        cw[ncp] = w;
+        ncp++;
+        p = nx;
+    }
+    w_text_w(scale, "…", &ew, NULL);
+    avail = max_w - ew;
+    if (avail <= 0) return 0;
+    for (i = 0; i < ncp && lw + cw[i] <= avail / 2; i++) lw += cw[i];
+    for (j = ncp - 1; j >= i && rw + cw[j] <= avail - lw; j--) rw += cw[j];
+    tail = (j + 1 < ncp) ? off[j + 1] : text + strlen(text);
+    o = (int)(off[i] - text);
+    memcpy(out, text, (size_t)o);
+    memcpy(out + o, "…", 3);
+    o += 3;
+    memcpy(out + o, tail, strlen(tail));
+    o += (int)strlen(tail);
+    out[o] = 0;
+    w_text(x, y, scale, color, "%s", out);
+    return lw + ew + rw;
+}
+
 /* ---------- 图形 ---------- */
 void w_rect(Rect r, uint32_t color)
 {

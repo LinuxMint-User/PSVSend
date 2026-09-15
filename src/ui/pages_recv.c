@@ -111,21 +111,36 @@ void page_recv_confirm_render(void)
                  sz, seln, n);
     w_text(48, 190, 1.0f, theme->text_dim, "%s", line);
 
+    /* 名字过长、接收后会被自动缩短的文件数（后端在 prepare 时就算好了 trunc；
+     * 用户自己改过名的行按新名算，不再提示）。缩短口径=保后缀、截主名。 */
+    int toolong = 0;
+    for (i = 0; i < n; i++)
+        if (g_app.inc_files[i].trunc && !g_app.inc_files[i].rname[0]) toolong++;
+    int warn = 0;
     if (g_app.recv_overflow > 0) {
         snprintf(line, sizeof line,
                  tr("%d more file(s) exceed the receive limit and will be skipped."),
                  g_app.recv_overflow);
         w_text(48, 212, 0.9f, theme->warn, "%s", line);
+        warn++;
+    }
+    if (toolong > 0) {
+        snprintf(line, sizeof line,
+                 tr("%d file name(s) too long, will be shortened"), toolong);
+        w_text(48, 212 + warn * 20, 0.9f, theme->warn, "%s", line);
+        warn++;
     }
 
     /* 文件预览（前几条） */
     int show = n < 5 ? n : 5;
-    int py = g_app.recv_overflow > 0 ? 244 : 240;
+    int py = 240 + warn * 20;
     for (i = 0; i < show; i++) {
-        char m[256];
+        int sw = 0, nw;
         w_human_size(g_app.inc_files[i].size, sz);
-        snprintf(m, sizeof m, "  %s  (%s)", g_app.inc_files[i].name, sz);
-        w_text_clip(60, py + i * 26, 1.0f, theme->text, m, card.w - 140);
+        w_text_w(1.0f, sz, &sw, NULL);
+        nw = w_text_mid(72, py + i * 26, 1.0f, theme->text,
+                        g_app.inc_files[i].name, card.w - 160 - sw);
+        w_text(72 + nw + 12, py + i * 26, 1.0f, theme->text_dim, "(%s)", sz);
     }
     if (n > show)
         w_text(60, py + show * 26, 1.0f, theme->text_dim,
@@ -305,31 +320,21 @@ static int  ime_tx = IME_TX_NONE;  /* 当前挂起/打开的事务（NONE=空闲
 static int  ime_tx_fi = -1;        /* RENAME 的目标行（HOST 不使用） */
 static char ime_out[128];          /* 键盘结果落点（须存活到 poll 结束，ime 异步写） */
 
-/* 把键盘输入净化后写入 rname 并同步后端（净化规则与后端 sanitize 一致，
- * 保证行上显示的即落盘名）。无效输入 → 沿用原名。 */
+/* 把键盘输入净化后写入 rname 并同步后端。净化/截断统一走 api_recv_sanitize_name
+ * （后端落盘同一函数），保证行上显示的即落盘名。无效输入 → 沿用原名。 */
 static void rename_apply(int fi, const char *in)
 {
     char cur[128];
-    int i, o;
-    bool any = false;
     if (fi < 0 || fi >= g_app.inc_count) return;
-    for (i = 0, o = 0; in[i] && o < (int)sizeof cur - 1 && i < 159; i++) {
-        unsigned char c = (unsigned char)in[i];
-        if (c < 0x20 || c == 0x7F || c == '/' || c == '\\' || c == ':' ||
-            c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
-            c = '_';
-        cur[o++] = (char)c;
-        if (c != '_') any = true;
-    }
-    while (o > 0 && (cur[o - 1] == ' ' || cur[o - 1] == '.')) o--;
-    cur[o] = 0;
-    if (!any || !cur[0] || strcmp(cur, ".") == 0 || strcmp(cur, "..") == 0) {
+    api_recv_sanitize_name(in, cur, sizeof cur);
+    if (!cur[0] || strcmp(cur, "unnamed") == 0) {
         g_app.inc_files[fi].rname[0] = 0;   /* 净化后无效：沿用原名 */
         api_recv_set_name(fi, "");
         return;
     }
     if (strcmp(cur, g_app.inc_files[fi].name) == 0)
         cur[0] = 0;                         /* 等于原名：无需改名 */
+    g_app.inc_files[fi].trunc = false;      /* 用户已自己定名，不再提示"过长" */
     snprintf(g_app.inc_files[fi].rname, sizeof g_app.inc_files[fi].rname,
              "%s", cur);
     api_recv_set_name(fi, cur);
@@ -487,8 +492,8 @@ void page_recv_setup_render(void)
              * 它此前用 accent_text，而选中行底色其实是 card（只有左侧一条
              * accent 竖条），浅色主题下白字白底完全不可见。 */
             w_text(60, top + 8, 1.0f, theme->text_dim, "%s", tr("Save to"));
-            w_text_clip(60, top + 30, 1.1f, sel ? theme->text : theme->text_dim,
-                        g_app.recv_dir, 780);
+            w_text_mid(60, top + 30, 1.1f, sel ? theme->text : theme->text_dim,
+                       g_app.recv_dir, 780);
             continue;
         }
 
@@ -498,15 +503,15 @@ void page_recv_setup_render(void)
         w_human_size(g_app.inc_files[idx].size, sz);
         if (g_app.inc_files[idx].rname[0]) {
             /* 已改名：上行小字原名，下行保存名 */
-            w_text_clip(60, top + 4, 0.8f, theme->text_dim,
-                        g_app.inc_files[idx].name, 460);
-            w_text_clip(60, top + 22, 1.0f, nc,
-                        g_app.inc_files[idx].rname, 460);
+            w_text_mid(60, top + 4, 0.8f, theme->text_dim,
+                       g_app.inc_files[idx].name, 460);
+            w_text_mid(60, top + 22, 1.0f, nc,
+                       g_app.inc_files[idx].rname, 460);
         } else {
             int th = 0;
             w_text_w(1.0f, g_app.inc_files[idx].name, NULL, &th);
-            w_text_clip(60, top + (RSS_ROW_H - th) / 2 - 2, 1.0f, nc,
-                        g_app.inc_files[idx].name, 460);
+            w_text_mid(60, top + (RSS_ROW_H - th) / 2 - 2, 1.0f, nc,
+                       g_app.inc_files[idx].name, 460);
         }
         int sw = 0, sh = 0;
         w_text_w(1.0f, sz, &sw, &sh);
@@ -643,6 +648,7 @@ static void open_recv_request(const RecvPending *rp)
         snprintf(g_app.inc_files[i].name, sizeof g_app.inc_files[i].name,
                  "%s", rp->files[i].name);
         g_app.inc_files[i].rname[0] = 0;
+        g_app.inc_files[i].trunc = rp->files[i].trunc;   /* 名字过长被缩短过 */
         g_app.inc_files[i].inc = true;      /* 默认全收，Setup 里可取消勾选 */
         g_app.inc_files[i].size = rp->files[i].size;
     }

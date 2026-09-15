@@ -60,8 +60,9 @@ typedef struct {
 
 #define MAX_INF 64
 typedef struct {
-    char  name[128];    /* 原始文件名 */
+    char  name[192];    /* 名字（后端已规整：净化 + 超长保后缀截断，即落盘名） */
     char  rname[128];   /* 接收时的保存名：Setup 页系统键盘改名后非空，否则沿用原名 */
+    bool  trunc;        /* 名字过长被缩短过（确认页提示用；用户改名后清掉） */
     bool  inc;          /* 勾选接收（默认勾上） */
     SceOff size;
 } InFile;
@@ -185,6 +186,10 @@ void page_ime_pump(void);   /* 主循环每帧帧间调用：打开挂起键盘 
 /* ---------- 控件绘制（widgets.c） ---------- */
 void w_text(float x, float y, float scale, uint32_t color, const char *fmt, ...);
 void w_text_w(float scale, const char *text, int *w, int *h);
+/* 中间省略绘制（放不下 max_w 时画"头…尾"，尾部保留以露出扩展名），
+ * 返回实际绘制宽度 */
+int  w_text_mid(float x, float y, float scale, uint32_t color,
+                const char *text, int max_w);
 void w_text_clip(float x, float y, float scale, uint32_t color,
                  const char *text, int max_w);
 void w_rect(Rect r, uint32_t color);

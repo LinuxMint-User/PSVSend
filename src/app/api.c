@@ -244,7 +244,7 @@ void api_start(void)
     int r;
     config_init();                       /* 先建目录/读配置（dlog 目录依赖它） */
     dlog_init();
-    dlog("== psvsend boot [TAG:d128] ==");
+    dlog("== psvsend boot [TAG:d134] ==");
     {
         /* 版本标记 + 设备身份指纹：确认刷入的固件含 mTLS 客户端证书 */
         char f[65];
@@ -256,7 +256,7 @@ void api_start(void)
 
     http_set_register_cb(discovery_peer_registered);   /* 对方 register → 设备表 */
     http_set_recv_ops(recv_http_ops());   /* 接收侧路由实现注册给 http 层（依赖倒置） */
-    recv_init();                         /* 接收模块：建锁 + 清扫残留 *.part */
+    recv_init();                         /* 接收模块：建锁 + 清扫残留 *.psvsend.tmp */
 
     r = net_start();
     dlog("watch: initial net_start -> %s", r == 0 ? "ok" : "fail");
@@ -356,6 +356,11 @@ void api_recv_set_include(const bool inc[RECV_MAX_FILES])
 void api_recv_set_name(int idx, const char *name)
 {
     recv_set_name(idx, name);
+}
+
+void api_recv_sanitize_name(const char *in, char *out, int n)
+{
+    recv_sanitize_name(in, out, n);
 }
 
 void api_recv_set_dir(const char *dir)

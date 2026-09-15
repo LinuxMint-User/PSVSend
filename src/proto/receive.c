@@ -10,11 +10,11 @@
  * UI 线程通过 *_pull/_decide/_abort 访问同一份锁内状态。
  *
  * 边界处理（用户约定）：
- *  - 大文件绝不全量入内存：upload 由 http.c 提供流读回调，边收边写 .part 临时文件，
- *    收完（sha256 可选校验通过后）改名成正式文件；
+ *  - 大文件绝不全量入内存：upload 由 http.c 提供流读回调，边收边写临时文件
+ *    （<正式名>.psvsend.tmp），收完（sha256 可选校验通过后）改名成正式文件；
  *  - 磁盘空间不足：每次开收前 devctl 查 ux0: 剩余，不够直接失败；
- *  - 中断残留：断流/校验失败/取消都立即删当前 .part；开机 recv_init 再清扫一遍
- *    上次崩溃遗留的 *.part。 */
+ *  - 中断残留：断流/校验失败/取消都立即删当前临时文件；开机 recv_init 再清扫
+ *    一遍上次崩溃遗留的 *.psvsend.tmp。 */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -35,7 +35,11 @@
 #define RECV_DECIDE_TIMEOUT_US (60 * 1000000LL)  /* prepare 等 UI 决定的上限 */
 #define RECV_IDLE_TIMEOUT_US   (120 * 1000000LL) /* 接受后/文件间没动静 → TIMEOUT */
 #define RECV_CHUNK             65536             /* 流式写盘缓冲（每个 upload 各自一份，见下） */
-#define RECV_PART_SUFFIX       ".part"
+/* 收体中临时文件名后缀。曾用 ".part"：落盘正式名沿用对端原名，对端若发来一个
+ * 正好叫 "x.part" 的文件，它会被正常保存成正式文件，而开机清扫按后缀匹配又会
+ * 把它当残留删掉——永久丢数据。改成一个正常文件名里基本不会出现的后缀。
+ * 注：不再顺带清扫旧版遗留的 *.part（宁可留垃圾也不误删用户文件）。 */
+#define RECV_PART_SUFFIX       ".psvsend.tmp"
 
 /* 会话生命周期：无 / 待决定 / 活动（接受后直到 recv_clear） */
 enum { PH_NONE = 0, PH_PENDING, PH_ACTIVE };
@@ -44,9 +48,9 @@ enum { PH_NONE = 0, PH_PENDING, PH_ACTIVE };
 typedef struct {
     char fileid[160];     /* 对方文件 ID（upload query 用） */
     char token[72];       /* 我方签发给对方的令牌 */
-    char name[192];       /* 落盘用名（已 sanitize + 冲突排重） */
+    char name[192];       /* 展示用名（sanitize/排重后的落盘名，UI 与实际一致） */
     char final[800];      /* 正式路径（收完改名到这儿；目录可长，缓冲随目录放宽） */
-    char part[800];       /* 临时路径（.part） */
+    char part[800];       /* 临时路径（final + RECV_PART_SUFFIX） */
     SceOff size;          /* 期望字节数 */
     SceOff got;           /* 已收字节（锁保护） */
     char sha256[65];      /* 期望 sha256（准备报文里给了才校验，空串=不校验） */
@@ -62,7 +66,7 @@ static struct {
     int  n;                  /* 列入清单的文件数（≤ RECV_MAX_FILES） */
     int  overflow;           /* 超上限被丢弃的可用文件数（确认页明示用） */
     struct { char fileid[160]; char name[192]; SceOff size; char sha256[65];
-             char rname[192]; } f[RECV_MAX_FILES];
+             char rname[192]; bool trunc; } f[RECV_MAX_FILES];
     bool inc[RECV_MAX_FILES];   /* UI 勾选（默认全选） */
 } g_pend;
 
@@ -83,6 +87,11 @@ static struct {
 } g_sess;
 
 static int  g_phase = PH_NONE;      /* 当前生命周期 */
+/* prepare 的占位序号：每次占上 PH_PENDING 就 +1。等待 UI 决定的 prepare 只在
+ * "序号仍等于自己那次" 时才回写 g_phase/g_pend_result——否则它可能把一个已经
+ * 换了新会话的状态改回自己的结论（recv_clear 撤销占位、新 prepare 又占上来的
+ * ABA 竞态：老的醒来会把新会话清掉，表现为新确认页点 Accept 无效、60s 后 403）。 */
+static unsigned g_gen = 0;
 static int  g_pend_result = 0;      /* 0=未决 1=接受 2=拒绝 3=超时 */
 static volatile int g_abort = 0;    /* 用户中止请求（http 收体循环轮询） */
 static SceUID g_mtx = -1;
@@ -133,25 +142,85 @@ static void gen_hex(char *out, int bytes)
     out[bytes * 2] = 0;
 }
 
-/* 把对方给的原始文件名净化成可落盘的单级名字 */
-static void sanitize_name(const char *in, char *out, int n)
+/* 落盘名单个名字的字节上限：RFile / RecvPending / RecvStatus 的 name[] 都是 192。
+ * ux0: 单文件名上限（exFAT 255 个 UTF-16 码元）远高于此，故这里只受自身缓冲约束。 */
+#define RECV_NAME_MAX 191
+/* 截断时"值得保留的后缀"最大长度（含 '.'）；比这更长的尾巴不当后缀看待 */
+#define RECV_EXT_MAX  16
+
+/* 名字里单个字节的净化：路径分隔符 / 控制字符 → '_'（其余原样，多字节序列各字节
+ * 都 ≥0x80、不会被误伤） */
+static unsigned char name_byte(unsigned char c)
 {
-    int o = 0, i;
+    if (c < 0x20 || c == 0x7F || c == '/' || c == '\\' || c == ':' ||
+        c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+        return '_';
+    return c;
+}
+
+/* 返回 s 中不超过 n 字节的最大"完整 UTF-8 字符"前缀长度（不切出半个字） */
+static int utf8_floor(const char *s, int n)
+{
+    int k = n;
+    while (k > 0 && ((unsigned char)s[k - 1] & 0xC0) == 0x80) k--;   /* 退到首字节 */
+    if (k > 0) {
+        unsigned char c = (unsigned char)s[k - 1];
+        int need = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 1;
+        if (k - 1 + need > n) return k - 1;      /* 末字不完整：整个丢掉 */
+    }
+    return n;
+}
+
+/* 把对方给的（或 UI 改名的）名字净化成可落盘的单级文件名。落盘与 UI 改名共用
+ * 本函数，保证"行上显示的即落盘名"。
+ * 净化只按 ux0: 的合法性（路径分隔符、控制字符、尾点/尾空格、空名），不替
+ * Windows 保留名（CON/PRN…）改任何东西——那在 ux0 上完全合法，擅自改只会让
+ * 发送端和接收端对不上名。
+ * 超长时按用户约定的"保完整后缀、从前往后截断主名"缩短；绝不切出半个多字节
+ * 字符（非法 UTF-8 会让 sceIoOpen 直接返 EINVAL、整批接收失败）。 */
+void recv_sanitize_name(const char *in, char *out, int n)
+{
+    int lim, o = 0, i, keep, elen = 0;
     bool any = false;
-    const char *slash;
+    const char *slash, *dot = NULL;
+    int len;
     if (!in) in = "";
     slash = strrchr(in, '/');
     if (slash) in = slash + 1;
     while (*in == ' ') in++;                     /* 去前导空白 */
-    for (i = 0; *in && o < n - 1 && i < 160; i++, in++) {
-        unsigned char c = (unsigned char)*in;
-        if (c < 0x20 || c == 0x7F || c == '/' || c == '\\' || c == ':' ||
-            c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
-            c = '_';
+    lim = n - 1;
+    if (lim > RECV_NAME_MAX) lim = RECV_NAME_MAX;
+    if (lim < 1) { out[0] = 0; return; }
+    len = (int)strlen(in);
+    if (len <= lim) {
+        keep = len;                              /* 放得下：原样保留 */
+    } else {
+        dot = strrchr(in, '.');
+        if (dot && dot != in && (int)strlen(dot) <= RECV_EXT_MAX &&
+            (int)strlen(dot) < lim)
+            elen = (int)strlen(dot);             /* 像真后缀：留着，其余让给主名 */
+        else
+            dot = NULL;
+        keep = lim - elen;
+        if (keep < 0) keep = 0;
+    }
+    /* 边界校正（无条件做）：截断点可能落在多字节字符中间；且上游按固定缓冲拷贝
+     * 名字时（name[192]）也可能已经把尾巴截成半个字——那样交出去的仍是非法
+     * UTF-8，sceIoOpen 直接返 EINVAL、整批接收失败。 */
+    keep = utf8_floor(in, keep);
+    for (i = 0; i < keep; i++) {
+        unsigned char c = name_byte((unsigned char)in[i]);
         out[o++] = (char)c;
         if (c != '_') any = true;
     }
     while (o > 0 && (out[o - 1] == ' ' || out[o - 1] == '.')) o--;  /* 去尾空白/点 */
+    if (dot) {                                   /* 拼回后缀（同样净化） */
+        for (i = 0; i < elen; i++) {
+            unsigned char c = name_byte((unsigned char)dot[i]);
+            out[o++] = (char)c;
+            if (c != '_') any = true;
+        }
+    }
     out[o] = 0;
     if (!any || !out[0] || strcmp(out, ".") == 0 || strcmp(out, "..") == 0)
         snprintf(out, n, "unnamed");
@@ -174,9 +243,12 @@ static void split_ext(const char *name, char *base, int bn, const char **ext)
     }
 }
 
-/* 生成唯一正式名路径 + 对应 .part 路径。同名冲突（磁盘上已存在，或本
+/* 生成唯一正式名路径 + 对应临时文件路径。同名冲突（磁盘上已存在，或本
  * 会话 prev[0..prev_n) 已分配的 final）则在扩展名前插 " (k)"。
- * prev 中 final 为空串的条目表示未落盘，跳过。 */
+ * prev 中 final 为空串的条目表示未落盘，跳过。
+ * 下面的 sceIoGetstat 探测是在 g_mtx 内做的：调用点只有"accept 组装会话"一处，
+ * 此时仍是 PH_PENDING（没有并发 upload 会被拖住，UI 的 pending_pull 也只被挡
+ * 这一下），正常情况 1~2 次探测就命中，故不为此拆锁。 */
 static void alloc_paths(const char *raw, char *final, int fn,
                         char *part, int pn,
                         const RFile *prev, int prev_n)
@@ -185,7 +257,7 @@ static void alloc_paths(const char *raw, char *final, int fn,
     const char *ext;
     SceIoStat st;
     int k = 0, t;
-    sanitize_name(raw, clean, sizeof clean);
+    recv_sanitize_name(raw, clean, sizeof clean);
     split_ext(clean, base, sizeof base, &ext);
     for (;;) {
         if (k == 0) snprintf(cand, sizeof cand, "%s%s", base, ext);
@@ -219,8 +291,13 @@ static int disk_free(SceOff *free_size)
     return -1;
 }
 
-/* 删掉还没完成/失败的文件的 .part（会话结束清理用；持有锁时调用）。
- * busy 的文件正被另一个 worker 写盘，跳过——由该 worker 自己清理。 */
+/* 删掉还没完成/失败的文件的临时文件（会话结束/失败清理用；持有锁时调用）。
+ * busy 的文件正被另一个 worker 写盘，跳过——由该 worker 自己收尾时再清。
+ * ★ 失败/取消路径的清理一律走这里（或 sess_fail_locked 内的它），worker 不要在
+ *   锁外自行 sceIoRemove(f->part)：那会与新会话正在写的同名 .part 撞车（TOCTOU），
+ *   而且这里本来就覆盖了同一路径。
+ * 注：本函数在锁内做文件系统 IO，故只用于"失败/取消/清场"这类一次性路径；
+ *     UI 每帧轮询的 recv_status_pull 不再调用它（见那里的说明）。 */
 static void cleanup_parts(void)
 {
     int i;
@@ -325,8 +402,10 @@ void recv_init(void)
     g_phase = PH_NONE;
     g_abort = 0;
     unlock();
-    /* 清扫上次异常退出残留的 .part（接收中断只会留下 .part，不会出正式文件；
-     * 只扫当前默认/设置目录——临时目录里的崩溃残留是孤儿 .part，不追扫） */
+    /* 清扫上次异常退出残留的临时文件（接收中断只会留下 <名>.psvsend.tmp，不会
+     * 留下正式文件；只扫当前默认/设置目录——临时目录里的崩溃残留是孤儿，不追扫）。
+     * 注：不清理旧版遗留的 *.part —— 那正是"对端发来叫 x.part 的合法文件被当
+     * 残留删掉"的根源（见 RECV_PART_SUFFIX 处说明）。 */
     d = sceIoDopen(g_dir);
     if (d >= 0) {
         memset(&de, 0, sizeof de);
@@ -359,6 +438,7 @@ int recv_pending_pull(RecvPending *out)
             snprintf(out->files[i].name, sizeof out->files[i].name, "%s",
                      g_pend.f[i].name);
             out->files[i].size = g_pend.f[i].size;
+            out->files[i].trunc = g_pend.f[i].trunc;
             out->total += g_pend.f[i].size;
         }
         }                        /* if (out) */
@@ -427,6 +507,7 @@ static int recv_http_prepare(const char *body, const char *ip, char *resp, int r
     char tmp[192];
     long long sz;
     int i, n = 0, code = 200, r;
+    unsigned my_gen = 0;                     /* 本次占位的序号（见 g_gen） */
     SceLong64 dl;
     bool pend_accept;
 
@@ -455,6 +536,7 @@ static int recv_http_prepare(const char *body, const char *ip, char *resp, int r
         return 409;
     }
     g_phase = PH_PENDING;                    /* 先占位：锁内的并发 prepare 409 */
+    my_gen = ++g_gen;                        /* 本次占位的身份（见 g_gen） */
     g_pend.alias[0] = 0;
     g_pend.type[0] = 0;
     snprintf(g_pend.ip, sizeof g_pend.ip, "%s", ip ? ip : "");
@@ -466,10 +548,14 @@ static int recv_http_prepare(const char *body, const char *ip, char *resp, int r
     g_pend.overflow = 0;
     if (json_iter_first(filesv, &it)) {
         do {
-            char nm[192], sh[65];
-            nm[0] = sh[0] = 0;
+            char raw[512], nm[192], sh[65];
+            raw[0] = nm[0] = sh[0] = 0;
             p = json_get_val(it.val, "fileName");
-            if (p) json_val_str(p, nm, sizeof nm);
+            if (p) json_val_str(p, raw, sizeof raw);
+            /* 名字在此就规整：净化 + 超长保后缀截断（与落盘同一函数）。若拖到后面
+             * 靠 192 缓冲 snprintf 拷贝，尾巴会被截成半个 UTF-8 字符，落盘时
+             * sceIoOpen 直接 EINVAL（真机 d133 的失败根因）。 */
+            recv_sanitize_name(raw, nm, sizeof nm);
             p = json_get_val(it.val, "size");
             sz = 0;
             if (p) json_val_int(p, &sz);
@@ -485,6 +571,8 @@ static int recv_http_prepare(const char *body, const char *ip, char *resp, int r
             }
             snprintf(g_pend.f[n].fileid, sizeof g_pend.f[n].fileid, "%s", it.key);
             snprintf(g_pend.f[n].name, sizeof g_pend.f[n].name, "%s", nm);
+            /* 名字被缩短了？（确认页据此提示"文件名过长，将自动缩短"） */
+            g_pend.f[n].trunc = strlen(raw) > strlen(nm);
             g_pend.f[n].size = (SceOff)sz;
             snprintf(g_pend.f[n].sha256, sizeof g_pend.f[n].sha256, "%s", sh);
             g_pend.f[n].rname[0] = 0;    /* 默认沿用对方文件名；UI 可改（recv_set_name） */
@@ -516,6 +604,7 @@ static int recv_http_prepare(const char *body, const char *ip, char *resp, int r
     for (;;) {
         lock();
         r = g_pend_result;
+        if (g_gen != my_gen) r = 3;          /* 占位已被 recv_clear 撤销/被新 prepare 顶替 */
         unlock();
         if (r) break;
         if ((SceLong64)now_us() >= dl) { r = 3; break; }
@@ -523,6 +612,11 @@ static int recv_http_prepare(const char *body, const char *ip, char *resp, int r
     }
 
     lock();
+    if (g_gen != my_gen) {                   /* 占位已失效：状态归别人，绝不能回写 */
+        unlock();
+        dlog("recv: prepare (gen %u) superseded, drop", my_gen);
+        return 403;
+    }
     r = g_pend_result;                       /* 醒来后再取一次，可能 UI 刚决定 */
     pend_accept = (r == 1);
     if (pend_accept) {
@@ -548,11 +642,35 @@ static int recv_http_prepare(const char *body, const char *ip, char *resp, int r
             f->size = g_pend.f[i].size;
             snprintf(f->sha256, sizeof f->sha256, "%s", g_pend.f[i].sha256);
             if (f->size == 0) {
-                f->st = 1;                   /* 空文件无需收体，视为已完成 */
+                /* 空文件不需收体，但必须在盘上留下一个 0 字节文件：对端对空文件也
+                 * 会（也可能不）发一次空体 upload。曾经的写法是"直接标完成、不建
+                 * 文件"→ 界面显示收到、目录里却找不到（真机 d129 实测如此）。 */
+                SceUID fd0;
+                alloc_paths(f->name, f->final, sizeof f->final,
+                            f->part, sizeof f->part, g_sess.f, m);
+                fd0 = sceIoOpen(f->final,
+                                SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+                if (fd0 < 0) {
+                    /* 建不出来（磁盘满/权限）：退回普通待收文件，让对端随后的
+                     * upload 走正常落盘路径；它不发的话会话以空闲超时收尾，不会静默丢。 */
+                    dlog("recv: create empty file fail 0x%08X (%s)",
+                         (unsigned)fd0, f->final);
+                    has_pending = 1;
+                } else {
+                    sceIoClose(fd0);
+                    f->st = 1;
+                }
             } else {
                 alloc_paths(f->name, f->final, sizeof f->final,
                             f->part, sizeof f->part, g_sess.f, m);
                 has_pending = 1;
+            }
+            /* 落盘名经 sanitize + 冲突排重后可能与原名不同（对端名含 '/'、
+             * 控制字符，或与本会话/磁盘既有文件重名时）。显示名回填实际
+             * 落盘名，否则界面显示的和用户能在目录里找到的不是一回事。 */
+            {
+                const char *bn = strrchr(f->final, '/');
+                snprintf(f->name, sizeof f->name, "%s", bn ? bn + 1 : f->final);
             }
             tot += f->size;
             m++;
@@ -616,7 +734,7 @@ static bool hex_eq_nocase(const char *a, const unsigned char *b, int n)
     return true;
 }
 
-/* 标记会话整体失败并清理残留 .part（持有锁时调用；fd 由调用点先关闭）。
+/* 标记会话整体失败并清理残留临时文件（持有锁时调用；fd 由调用点先关闭）。
  * 已是终态（如并发中另一个文件已先失败/被取消）则只做清理、不覆盖原终态。 */
 static void sess_fail_locked(const char *err)
 {
@@ -648,23 +766,25 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
 
     lock();
     if (g_phase == PH_ACTIVE && g_sess.session[0] &&
-        strcmp(g_sess.session, sid) == 0 &&
-        g_sess.state != RECV_ST_DONE && g_sess.state != RECV_ST_FAIL &&
-        g_sess.state != RECV_ST_CANCEL && g_sess.state != RECV_ST_TIMEOUT) {
+        strcmp(g_sess.session, sid) == 0) {
         if (!g_sess.peer_ip[0] || strcmp(g_sess.peer_ip, ip) == 0)
             for (i = 0; i < g_sess.n; i++)
                 if (strcmp(g_sess.f[i].fileid, fid) == 0) { idx = i; break; }
         if (idx >= 0 && strcmp(g_sess.f[idx].token, tok) != 0) idx = -2;
+    }
+    /* 已完成文件的重传 / 已终态会话：只在"零字节文件的幂等重传"上放行 200。
+     * 终态也必须走这条判定——整批都是空文件的会话 accept 即 DONE（见 prepare
+     * 收尾），对端仍会为每个空文件发一次 upload，按终态一律 403 会让对方报错。 */
+    if (idx >= 0 && (sess_is_terminal(g_sess.state) || g_sess.f[idx].st == 1)) {
+        int rc = (g_sess.f[idx].st == 1 && g_sess.f[idx].size == 0) ? 200 : 403;
+        unlock();
+        return rc;
     }
     if (idx < 0) {
         unlock();
         return 403;                          /* 会话/令牌/IP 不符 */
     }
     f = &g_sess.f[idx];
-    if (f->st == 1) {                        /* 重复上传：空文件幂等成功 */
-        unlock();
-        return f->size == 0 ? 200 : 403;
-    }
     if (f->busy) {                           /* 同一文件被重复并发上传（同会话多文件
                                               * 并发是允许的，仅同文件自身重入要拒） */
         unlock();
@@ -715,11 +835,11 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             sceIoClose(fd); fd = -1;
             lock();
             f->busy = false;
-            cleanup_parts();
-            sess_terminal(RECV_ST_CANCEL, "用户取消");
+            cleanup_parts();                 /* 含本文件的临时文件 */
+            if (!sess_is_terminal(g_sess.state))     /* 别覆盖别处已判定的终态原因 */
+                sess_terminal(RECV_ST_CANCEL, "用户取消");
             unlock();
             if (check_sha) mbedtls_sha256_free(&hctx);
-            sceIoRemove(f->part);
             return 500;
         }
         if (f->got >= f->size) break;
@@ -733,13 +853,13 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             f->busy = false;
             if (g_abort) {                   /* http 层看到中止标志提前退出 → 取消 */
                 cleanup_parts();
-                sess_terminal(RECV_ST_CANCEL, "用户取消");
+                if (!sess_is_terminal(g_sess.state))     /* 别覆盖已判定的终态原因 */
+                    sess_terminal(RECV_ST_CANCEL, "用户取消");
             } else {
                 sess_fail_locked(f->got > 0 ? "传输中断" : "对方未发送数据");
             }
             unlock();
             if (check_sha) mbedtls_sha256_free(&hctx);
-            sceIoRemove(f->part);
             return 500;
         }
         if (check_sha) mbedtls_sha256_update(&hctx, buf, (unsigned)n);
@@ -751,7 +871,6 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             sess_fail_locked("写入失败（磁盘空间不足？）");
             unlock();
             if (check_sha) mbedtls_sha256_free(&hctx);
-            sceIoRemove(f->part);
             return 500;
         }
         lock();
@@ -770,7 +889,6 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         f->busy = false;
         sess_fail_locked("sha256 校验失败");
         unlock();
-        sceIoRemove(f->part);
         return 422;
     }
     if (sceIoRename(f->part, f->final) < 0) {
@@ -778,7 +896,6 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         f->busy = false;
         sess_fail_locked("文件落盘失败");
         unlock();
-        sceIoRemove(f->part);
         return 500;
     }
     lock();
@@ -816,10 +933,12 @@ static int recv_http_cancel(const char *query, const char *ip)
     query_get(query, "sessionId", sid, sizeof sid);
     lock();
     if (g_phase == PH_ACTIVE && sid[0] &&
-        strcmp(g_sess.session, sid) == 0) {
+        strcmp(g_sess.session, sid) == 0 &&
+        !sess_is_terminal(g_sess.state)) {   /* 已终态就忽略：别把 DONE 改写成 CANCEL，
+                                              * 更别覆盖 FAIL/TIMEOUT 的失败原因 */
         if (any_busy_locked()) {
             /* 正在流式收体（http 并发连接）：直接清场会删掉收体中那些
-             * .part；置中止位，让收体循环在锁内统一收尾（与 UI 取消一致） */
+             * 临时文件；置中止位，让收体循环在锁内统一收尾（与 UI 取消一致） */
             g_abort = 1;
             dlog("recv: session %s cancel by sender during body -> abort",
                  g_sess.session);
@@ -840,10 +959,12 @@ int recv_status_pull(RecvStatus *out)
     if (!out) return 0;
     lock();
     if (g_phase == PH_ACTIVE) {
-        /* 空闲超时：没有文件在收体且超过 IDLE 无动静 → TIMEOUT（清残留） */
+        /* 空闲超时：没有文件在收体且超过 IDLE 无动静 → TIMEOUT。
+         * 这里不删残留临时文件：本函数是 UI 每帧轮询的热路径，不该在锁内做
+         * 文件系统 IO（慢盘掉帧 + 阻塞 worker 的收体提交）。残留交给 recv_clear
+         * （用户离开结束页时的清场）或下次开机 recv_init 清扫。 */
         if (!any_busy_locked() && !sess_is_terminal(g_sess.state) &&
             now - g_sess.last_us > (uint64_t)RECV_IDLE_TIMEOUT_US) {
-            cleanup_parts();
             sess_terminal(RECV_ST_TIMEOUT, "等待对方传输超时");
         }
         out->state = g_sess.state;
@@ -878,6 +999,8 @@ void recv_clear(void)
         cleanup_parts();
     } else if (g_phase == PH_PENDING) {
         g_pend_result = 2;                   /* http 等待循环醒来按拒绝处理 */
+        g_gen++;                             /* 同时撤销占位：等待中的 prepare 万一错过
+                                              * 这次结果（50ms 轮询窗口）也不会回写状态 */
     }
     g_phase = PH_NONE;
     g_abort = 0;

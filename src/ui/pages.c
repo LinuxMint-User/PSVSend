@@ -20,7 +20,7 @@
  * xfer 快照覆盖；接收由 start_recv（pages_recv.c）先以本地清单兜底首帧、
  * 再由 receive 会话快照覆盖（渲染在 pages_progress.c）。 */
 int    xf_count = 0;
-char   xf_name[MAX_PICKED][128];
+char   xf_name[MAX_PICKED][192];
 SceOff xf_size[MAX_PICKED];
 int    xf_scroll = 0;
 

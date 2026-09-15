@@ -69,6 +69,9 @@ int  api_recv_pending_pull(RecvPending *out);
 void api_recv_set_include(const bool inc[RECV_MAX_FILES]);
 /* 接受前逐文件指定"保存名"（idx 与 pending 一致；空串=保持原名） */
 void api_recv_set_name(int idx, const char *name);
+/* 名字 → 可落盘的单级文件名（净化 + 超长保后缀截断）；UI 改名与列表预演用，
+ * 与后端落盘同一口径，保证显示名即落盘名 */
+void api_recv_sanitize_name(const char *in, char *out, int n);
 /* 接受前设定"本次保存目录"（内存态；NULL/空 → 回退 config 默认） */
 void api_recv_set_dir(const char *dir);
 /* 决定（仅 PENDING 有效）：accept=1 接受 / 0 拒绝 */

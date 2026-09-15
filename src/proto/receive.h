@@ -2,8 +2,8 @@
  * 对方(发送方)按我们 announce 里的 http 端口 POST 过来：
  *   prepare-upload  文件清单 JSON → 挂起等 UI 接受/拒绝（回 200 {sessionId,files{id:token}}
  *                   或 403；已有活动会话时 409）
- *   upload?sessionId&fileId&token  裸文件字节流 → 边收边写盘保存目录（临时 .part，
- *                   收完改名；sha256 校验失败 422）。保存目录：config saveDir
+ *   upload?sessionId&fileId&token  裸文件字节流 → 边收边写盘保存目录（临时文件
+ *                   <名>.psvsend.tmp，收完改名；sha256 校验失败 422）。保存目录：config saveDir
  *                   持久默认，UI 可在接受前 recv_set_dir 覆盖为本次目录（内存态）。
  *   cancel?sessionId  发送方放弃会话
  * UI 轮询拉取"待确认请求 / 传输状态"，把勾选集合与接受决定写回；http 线程轮询唤醒。
@@ -26,7 +26,9 @@ typedef struct {
     char peer_ip[16];
     int  count;                  /* 列入清单的文件数（≤ RECV_MAX_FILES） */
     int  overflow;               /* 发送方实际文件数超过上限、被丢弃的个数 */
-    struct { char name[192]; SceOff size; } files[RECV_MAX_FILES];
+    /* name 已经是"规整后的落盘名"（净化 + 超长保后缀截断），不是对方原样给的
+     * 原始字符串——确认页显示与实际落盘一致。trunc=名字过长被缩短过。 */
+    struct { char name[192]; SceOff size; bool trunc; } files[RECV_MAX_FILES];
     SceOff total;
 } RecvPending;
 
@@ -55,7 +57,7 @@ typedef struct {
     char err[192];                 /* FAIL/CANCEL/TIMEOUT 原因（其它状态空） */
 } RecvStatus;
 
-/* 后端初始化（建锁 + 清扫上次中断残留的 *.part）；api_start 调用 */
+/* 后端初始化（建锁 + 清扫上次中断残留的 *.psvsend.tmp）；api_start 调用 */
 void recv_init(void);
 
 /* UI 轮询：有"等待决定"的接收请求？返回 1 并拷贝 out（out==NULL 时仅探测
@@ -71,6 +73,11 @@ void recv_set_include(const bool inc[RECV_MAX_FILES]);
  * 仅 PENDING 生效；不改名的文件不必调用。 */
 void recv_set_name(int idx, const char *name);
 
+/* 名字 → 可落盘的单级文件名：按 ux0: 合法性净化 + 超长时"保后缀、截主名"，
+ * 见 receive.c。落盘与 UI 改名共用，保证"界面上显示的即落盘名"；
+ * UI 侧只经 api_recv_sanitize_name 调用。 */
+void recv_sanitize_name(const char *in, char *out, int n);
+
 /* UI 在接受前设定"本次保存目录"（内存态，仅本会话；NULL/空 → 回退
  * config saveDir 默认）。不持久化，下次会话由 UI 重新给出默认值。 */
 void recv_set_dir(const char *dir);
@@ -80,7 +87,7 @@ void recv_set_dir(const char *dir);
 void recv_decide(bool accept);
 
 /* 用户中止进行中的接收：正在流式收体时置标志让 http 线程尽快收尾
- * （删 .part、回 CANCEL 态），空闲（READY/文件间）时立即生效。 */
+ * （删临时文件、回 CANCEL 态），空闲（READY/文件间）时立即生效。 */
 void recv_abort(void);
 
 /* UI 轮询会话状态；返回 1=有会话（含终态）0=空闲 */

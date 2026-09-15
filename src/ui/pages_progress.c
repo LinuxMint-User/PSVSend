@@ -160,7 +160,7 @@ void page_progress_render(void)
         int tw = 0, th = 0;
         w_text_w(1.1f, pctlb, &tw, &th);
         w_text(920 - tw, top + 2, 1.1f, nc, "%s", pctlb);
-        w_text_clip(40, top + 2, 1.1f, nc, xf_name[i], 650);
+        w_text_mid(40, top + 2, 1.1f, nc, xf_name[i], 650);
         w_bar((Rect){ 40, top + 30, 660, 10 }, theme->card, theme->accent, fp);
     }
     vita2d_disable_clipping();
