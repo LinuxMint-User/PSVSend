@@ -121,13 +121,33 @@ static bool hdr_value(const char *buf, int he, const char *name, SceLong64 *v)
             const char *q = ln + nl + 1;
             while (*q == ' ' || *q == '\t') q++;
             *v = 0;
-            while (*q >= '0' && *q <= '9')
-                *v = *v * 10 + (*q - '0'), q++;
+            while (*q >= '0' && *q <= '9') {
+                /* 溢出保护：对端可发任意长数字，累加回绕后变负会被下游当"没有此头"
+                 * 或"超长 body"处理，语义不确定 → 溢出即标 -1（不可信）。 */
+                if (*v > (0x7FFFFFFFFFFFFFFFLL - (*q - '0')) / 10) {
+                    *v = -1;
+                    return true;
+                }
+                *v = *v * 10 + (*q - '0');
+                q++;
+            }
             return true;
         }
         i = (int)(eol - buf) + 1;      /* 下一行从 \n 之后开始 */
     }
     return false;
+}
+
+/* Content-Length 安全解析（scan.c / transfer.c 的响应读取共用）。
+ * 返回 >=0 长度；-1 = 无该头/溢出/超 int 范围。调用方一律 `if (cl < 0) cl = 0;`
+ * 后再用上界 guard 判 `cl > cap-1-body_off`，绝不能拿负值去算索引。 */
+int http_hdr_content_length(const char *buf, int he)
+{
+    SceLong64 v = 0;
+    if (he <= 0) return -1;
+    if (!hdr_value(buf, he, "content-length", &v)) return -1;
+    if (v < 0 || v > 0x7FFFFFFFLL) return -1;
+    return (int)v;
 }
 
 /* 同上，但把头的值拷成字符串（用于 transfer-encoding 等） */
@@ -185,6 +205,7 @@ typedef struct {
     int  llen;
     int  chunked;       /* Transfer-Encoding: chunked（dio 无 CL 流式上传） */
     int  ph;            /* chunked: 0=chunk 大小行 1=chunk 数据 2=终块 trailer */
+    int  n_tr;          /* chunked: 终块后已吃的 trailer 行数（上限保护，见下） */
     SceLong64 c_rem;    /* chunked: 当前 chunk 剩余数据字节 */
     unsigned char sbuf[4096];  /* chunked 解码输入暂存 */
     int  s_n, s_pos;
@@ -289,7 +310,8 @@ static int u_readline(UploadCtx *u, char *line, int cap)
         while (u->s_pos < u->s_n) {
             char ch = (char)u->sbuf[u->s_pos++];
             if (ch == '\n') { line[n] = 0; return 1; }
-            if (ch != '\r' && n < cap - 1) line[n++] = ch;
+            if (n >= cap - 1) return -1;   /* 超长行：畸形，别无限吃数据占着 worker 槽 */
+            if (ch != '\r') line[n++] = ch;
         }
     }
 }
@@ -310,9 +332,17 @@ static int chunked_stream(void *ctx, unsigned char *out, int max)
             {
                 const char *p = line;
                 int h;
-                while (*p && (h = hexv(*p)) >= 0) { sz = sz * 16 + h; p++; }
+                while (*p && (h = hexv(*p)) >= 0) {
+                    /* 位数上限：INT64_MAX/16 = 0x07FFFFFFFFFFFFFF，再乘 16 加 h 也
+                     * 不会越过 INT64_MAX。对端可送 16 个 F，裸累加会回绕成负值，
+                     * 之后 `c_rem` 恒负、`on` 被减成负数，状态机卡死且返回值不可信。 */
+                    if (sz > 0x07FFFFFFFFFFFFFFLL) { sz = -1; break; }
+                    sz = sz * 16 + h;
+                    p++;
+                }
             }
             if (sz == 0) { u->ph = 3; continue; } /* 终止块 */
+            if (sz < 0) return -1;               /* 溢出/畸形：整条流作废 */
             u->c_rem = sz;
             u->ph = 1;
         } else if (u->ph == 1) {                 /* chunk 数据 */
@@ -346,6 +376,7 @@ static int chunked_stream(void *ctx, unsigned char *out, int max)
             int r = u_readline(u, line, sizeof line);
             if (r <= 0) return on > 0 ? on : 0;  /* 流结束 */
             if (line[0] == 0) return 0;          /* 空行：收尾完成 */
+            if (++u->n_tr > 32) return -1;       /* 条数上限：否则对端能一直送行占着 worker */
         }
     }
 }

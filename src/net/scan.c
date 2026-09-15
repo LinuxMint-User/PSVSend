@@ -268,25 +268,11 @@ static int s_read_resp(SConn *c, int *code, char *buf, int cap, SceLong64 wait_u
             if (buf[i] == '\r' && buf[i + 1] == '\n' &&
                 buf[i + 2] == '\r' && buf[i + 3] == '\n') he = i;
         if (he >= 0 && cl < 0) {
-            int ls = 0;
-            long v = 0;
-            int found = 0;
-            while (ls < he) {
-                int le;
-                const char *pn;
-                for (le = ls; le < he && buf[le] != '\n'; le++) ;
-                pn = memchr(buf + ls, ':', (size_t)(le - ls));
-                if (pn && (int)(pn - (buf + ls)) == 14 &&
-                    strncasecmp(buf + ls, "content-length", 14) == 0) {
-                    const char *q = pn + 1;
-                    while (*q == ' ' || *q == '\t') q++;
-                    while (*q >= '0' && *q <= '9') { v = v * 10 + (*q - '0'); q++; }
-                    found = 1;
-                    break;
-                }
-                ls = le + 1;
-            }
-            cl = found ? (int)v : 0;
+            /* Content-Length：必须走溢出安全的解析。此前用 32 位 long 裸累加，
+             * 对端回 `Content-Length: 3000000000` 之类会回绕成负值 → :296 立即
+             * break、旧 guard 只挡上界放行负值 → buf[body_off+cl]=0 写到缓冲之前。 */
+            cl = http_hdr_content_length(buf, he);
+            if (cl < 0) cl = 0;      /* 无/畸形/超范围：当 0 长，调用方按解析失败处理 */
             if (strncmp(buf, "HTTP/1.", 7) == 0) {
                 const char *cs = strchr(buf, ' ');
                 if (cs) *code = atoi(cs + 1);
@@ -295,7 +281,7 @@ static int s_read_resp(SConn *c, int *code, char *buf, int cap, SceLong64 wait_u
         }
         if (he >= 0 && n >= body_off + cl) break;
     }
-    if (cl > cap - 1 - body_off) return -1;
+    if (cl < 0 || cl > cap - 1 - body_off) return -1;
     buf[body_off + cl] = 0;
     if (body_off > 0)
         /* body 移到 buf 头部——之前漏了这步，调用方拿到的是整段响应头，

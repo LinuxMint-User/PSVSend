@@ -306,18 +306,6 @@ static int conn_recv_poll(Conn *c, char *buf, int cap, SceLong64 dl)
     }
 }
 
-/* 头字段名匹配（ASCII 大小写不敏感；ref 为期望的小写字段名） */
-static int hdr_name_eq(const char *s, int n, const char *ref)
-{
-    int i;
-    for (i = 0; i < n; i++) {
-        char a = s[i];
-        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
-        if (a != ref[i]) return 0;
-    }
-    return 1;
-}
-
 /* 读响应：把"头 + Content-Length body"整段累积进调用方 buf（cap 容量）。
  * 头结束符之后就是 body，buf[body_end]=0 收尾（解析直接对 buf 用 strstr）。
  * 返回 body 长度；-1=错误/超时/连接关/缓冲不足；-2=已取消。*code 填状态码。 */
@@ -340,26 +328,12 @@ static int read_resp(Conn *c, int *code, char *buf, int cap, SceLong64 wait_us)
             if (buf[i] == '\r' && buf[i + 1] == '\n' &&
                 buf[i + 2] == '\r' && buf[i + 3] == '\n') he = i;
         if (he >= 0 && cl < 0) {
-            long v = 0;
-            int found = 0, ls = 0;
-            /* LocalSend 实际返回全小写头（content-length），须大小写不敏感
-             * 逐行匹配，否则把 body 长度当 0 → "empty prepare reply"。 */
-            while (ls < he) {
-                int le;
-                const char *pn;
-                for (le = ls; le < he && buf[le] != '\n'; le++) ;
-                pn = memchr(buf + ls, ':', (size_t)(le - ls));
-                if (pn && (pn - (buf + ls)) == 14 &&
-                    hdr_name_eq(buf + ls, 14, "content-length")) {
-                    const char *q = pn + 1;
-                    while (*q == ' ' || *q == '\t') q++;
-                    while (*q >= '0' && *q <= '9') { v = v * 10 + (*q - '0'); q++; }
-                    found = 1;
-                    break;
-                }
-                ls = le + 1;
-            }
-            cl = found ? (int)v : 0;
+            /* LocalSend 实际返回全小写头（content-length）：走 http 层的溢出安全
+             * 解析（大小写不敏感）。此前用 32 位 long 裸累加，对端回超长数字会
+             * 回绕成负值 → :369 立即 break、旧 guard 只挡上界放行负值 →
+             * buf[body_off+cl]=0 负索引写越界。 */
+            cl = http_hdr_content_length(buf, he);
+            if (cl < 0) cl = 0;      /* 无/畸形/超范围：当 0 长 → 调用方报空回执 */
             if (strncmp(buf, "HTTP/1.", 7) == 0) {
                 const char *cs = strchr(buf, ' ');
                 if (cs) *code = atoi(cs + 1);
@@ -368,7 +342,7 @@ static int read_resp(Conn *c, int *code, char *buf, int cap, SceLong64 wait_us)
         }
         if (he >= 0 && n >= body_off + cl) break;
     }
-    if (cl > cap - 1 - body_off) return -1;   /* body 超出缓冲 */
+    if (cl < 0 || cl > cap - 1 - body_off) return -1;   /* body 超出缓冲 */
     buf[body_off + cl] = 0;
     return cl;
 }
@@ -814,6 +788,15 @@ static int xfer_thr(SceSize args, void *argp)
                     conn_close(&c);
                     sceIoClose(fd);
                     fail_file(i, "read error on %s", g_j.files[i].name);
+                    return 0;
+                }
+                if (rd == 0) {
+                    /* 文件比声明的 size 短（读取期间被替换/截断）：再转下去
+                     * conn_send_all(len=0) 立即返回、sent_file 不增 → 100% CPU
+                     * 空转，对端一直等声明的字节数，只能靠用户取消。 */
+                    conn_close(&c);
+                    sceIoClose(fd);
+                    fail_file(i, "%s shrank during send", g_j.files[i].name);
                     return 0;
                 }
                 sr = conn_send_all(&c, chunk, rd);

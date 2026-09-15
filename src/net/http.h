@@ -32,6 +32,12 @@ int http_restart(void);
 /* register POST 到达时的回调（body=对方 JSON，src_ip=对方来源 IP） */
 void http_set_register_cb(void (*cb)(const char *body, const char *src_ip));
 
+/* 解析 header 区（buf[0..he]，he = "\r\n\r\n" 的偏移）里的 Content-Length。
+ * 头名大小写不敏感（Dart/Go 客户端发小写）。返回值：>=0 为长度；-1 = 无该头、
+ * 数值溢出或超出 int 范围（调用方必须当"0 长/不可信"处理，绝不能拿去索引）。
+ * 32 位 long 的裸累加会被 Content-Length: 3000000000 之类回绕成负值 → 负索引越界。 */
+int http_hdr_content_length(const char *buf, int he);
+
 /* ---------- 接收方向路由：注册式（依赖倒置） ----------
  * http 层只做 HTTP 语义与连接读写，不认 LocalSend 协议；接收侧的处理实现住在
  * proto/receive.c，由组合层（app/api.c）启动时注册进来。这样 net 层不必

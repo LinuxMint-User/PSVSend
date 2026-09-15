@@ -532,6 +532,11 @@ static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn,
             if (r <= 0) break;        /* 连接关闭/错误：body 到此为止 */
             for (i = 0; i < r && !done; i++) {
                 char c = (char)seg[i];
+                /* 窗口边界：单次 ssl_read 最多 sizeof(seg)=512B，外层只保证"下次
+                 * 读之前"窗口还剩 256B → 逐字节写最多越界 255B（chunk 分支另有
+                 * 检查，头部 :535 与普通 body :590 原来没有）。窗口满即收尾，
+                 * :596 的 win[bn]=0 也随之落在界内。 */
+                if (bn >= UPD_WIN - 1) { done = 1; break; }
                 if (!hs) {
                     win[bn++] = c;
                     if (bn >= 4 && win[bn - 4] == '\r' &&
@@ -578,7 +583,7 @@ static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn,
                         continue;
                     }
                     if (ch_state == 1) {          /* chunk 数据 */
-                        if (ch_left > 0 && bn < UPD_WIN - 256) {
+                        if (ch_left > 0) {        /* 上界由本循环开头的窗口检查保证 */
                             win[bn++] = c;
                             ch_left--;
                             if (ch_left == 0) ch_state = 2;
