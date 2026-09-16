@@ -268,6 +268,9 @@ static const TrEntry s_tr[] = {
     { "Monthly", "每月", "每月", "每月", "毎月" },
 
     /* ---- 其它 ---- */
+    /* 语言项"跟随系统"：列表其余项都是各语言自述，而 AUTO 不是语言名、没有自述
+     * 形态，只能跟随界面语言（见 i18n_lang_name）。 */
+    { "System", "跟随系统", "跟隨系統", "跟隨系統", "システム" },
     { "unknown", "未知", "未知", "未知", "不明" },
 };
 
@@ -328,7 +331,10 @@ int i18n_lang_pref(void) { return g_cfg.lang; }
 const char *i18n_lang_name(int id)
 {
     switch (id) {
-    case I18N_LANG_AUTO:  return "System";
+    /* 其余项用各语言自述（界面语言看不懂也能认出自己那项）；AUTO 不是语言名、
+     * 没有自述形态，只能跟随界面语言 —— 选 AUTO 时 s_lang 即系统探到的语言，
+     * 所以显示的正好是"该系统语言自己的说法"，不会出现语言错配。 */
+    case I18N_LANG_AUTO:  return tr("System");
     case I18N_LANG_EN:    return "English";
     case I18N_LANG_ZH:    return "中文";
     case I18N_LANG_ZH_TW: return "繁體中文（台灣）";
