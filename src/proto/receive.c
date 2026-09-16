@@ -384,7 +384,7 @@ void recv_set_dir(const char *dir)
         }
         dlog("recv: dir set %s", g_dir);
     } else {
-        snprintf(g_dir, sizeof g_dir, "%s", g_cfg.save_dir);
+        config_get_save_dir(g_dir, sizeof g_dir);
     }
 }
 
@@ -397,7 +397,7 @@ void recv_init(void)
     if (g_mtx < 0)
         g_mtx = sceKernelCreateMutex("psvsend_recv", 0, 0, NULL);
     if (g_mtx < 0) return;
-    if (!g_dir[0]) snprintf(g_dir, sizeof g_dir, "%s", g_cfg.save_dir);
+    if (!g_dir[0]) config_get_save_dir(g_dir, sizeof g_dir);
     lock();
     g_phase = PH_NONE;
     g_abort = 0;

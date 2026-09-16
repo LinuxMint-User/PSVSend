@@ -380,11 +380,14 @@ static void s_close(SConn *c)
 /* 拼本机 member info（register 请求体 + 我们入对方表的依据） */
 static void self_info_json(char *out, int outsz)
 {
+    char al[sizeof g_cfg.alias], fp[sizeof g_cfg.fingerprint];
     char ae[2 * sizeof g_cfg.alias];
     char fe[2 * sizeof g_cfg.fingerprint];
     int port = http_port();
-    json_escape(g_cfg.alias, ae, sizeof ae);
-    json_escape(g_cfg.fingerprint, fe, sizeof fe);
+    config_get_alias(al, sizeof al);         /* 锁内取快照：UI 可能正在改名 */
+    config_get_fingerprint(fp, sizeof fp);
+    json_escape(al, ae, sizeof ae);
+    json_escape(fp, fe, sizeof fe);
     snprintf(out, outsz,
              "{\"alias\":\"%s\",\"version\":\"2.0\","
              "\"deviceModel\":\"PlayStation Vita\",\"deviceType\":\"mobile\","
@@ -407,9 +410,12 @@ static int parse_member(const char *body, int tls, const char *ip, Device *out,
         if (tls && leaf_fp && leaf_fp[0])
             snprintf(out->fingerprint, sizeof out->fingerprint, "%s", leaf_fp);
     }
-    if (out->fingerprint[0] &&
-        strcmp(out->fingerprint, g_cfg.fingerprint) == 0)
-        return 0;                            /* 自己 */
+    if (out->fingerprint[0]) {
+        char mine[sizeof g_cfg.fingerprint];
+        config_get_fingerprint(mine, sizeof mine);
+        if (strcmp(out->fingerprint, mine) == 0)
+            return 0;                        /* 自己 */
+    }
     snprintf(out->ip, sizeof out->ip, "%s", ip);
     if (!json_get_str(body, "protocol", out->protocol, sizeof out->protocol))
         snprintf(out->protocol, sizeof out->protocol, "%s", tls ? "https" : "http");

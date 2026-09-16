@@ -6,6 +6,8 @@
 #include <psp2/kernel/threadmgr/thread.h>
 #include <psp2/kernel/processmgr.h>
 #include "config.h"
+#include "i18n.h"          /* I18N_LANG_*（读盘值域钳制用；i18n.h 不反向依赖本头） */
+#include "dlog.h"          /* 写盘失败的诊断（不再静默） */
 #include "json_util.h"
 #include <psp2/kernel/threadmgr/mutex.h>
 
@@ -13,6 +15,12 @@ Config g_cfg = { 0 };          /* 默认值见 cfg_defaults()（逐字段赋值�
 static SceUID g_mtx = -1;          /* 保护 g_cfg：UI 改设置 / 发现·扫描记 IP 并发 */
 static uint64_t g_last_save_us = 0;
 
+#define CFG_TMP    PSVSEND_CONFIG ".tmp"   /* 原子替换用临时文件（同目录，rename 不跨卷） */
+#define CFG_THEME_MAX 2                    /* = ui/theme.h 的 THEME_COUNT-1；
+                                            * core 层不引用 ui 头，加色系时两处同步 */
+
+/* 锁由 config_init() 预先建立（惰性创建在首次并发下可能两个线程各建一把 →
+ * 一把锁形同虚设 + SceUID 泄漏）；下面仅作兜底，正常路径不会再建。 */
 static void cfg_lock(void)
 {
     if (g_mtx < 0) g_mtx = sceKernelCreateMutex("psvsend_cfg", 0, 0, NULL);
@@ -62,9 +70,22 @@ void config_init(void)
     int n;
     long long v;
 
+    /* 锁在这里预建（见 cfg_lock 说明）：本函数在启动早期单线程执行 */
+    if (g_mtx < 0) g_mtx = sceKernelCreateMutex("psvsend_cfg", 0, 0, NULL);
     ensure_dir(PSVSEND_DATA_DIR);
     ensure_dir(PSVSEND_DL_DIR);
     cfg_defaults();
+
+    {   /* 自愈：上次保存死在"删旧配置 → 改名"两步之间时，盘上没有 config，却有
+         * 写完并已 sync 的 config.tmp（见 config_write_locked）——那就是完整的
+         * 新配置，改名回来即恢复。写盘走的始终是 tmp，config 只可能"完整"或
+         * "不存在"，故只需判读不到的情况。 */
+        SceIoStat st;
+        if (sceIoGetstat(PSVSEND_CONFIG, &st) < 0 &&
+            sceIoGetstat(CFG_TMP, &st) == 0 &&
+            sceIoRename(CFG_TMP, PSVSEND_CONFIG) == 0)
+            dlog("cfg: recovered from tmp (config was missing)");
+    }
 
     SceUID fd = sceIoOpen(PSVSEND_CONFIG, SCE_O_RDONLY, 0);
     if (fd >= 0) {
@@ -120,6 +141,12 @@ void config_init(void)
     if (!g_cfg.alias[0]) strncpy(g_cfg.alias, DEFAULT_ALIAS, sizeof g_cfg.alias - 1);
     if (g_cfg.upd_auto < 0 || g_cfg.upd_auto > 3) g_cfg.upd_auto = 2;
     if (g_cfg.upd_last < 0) g_cfg.upd_last = 0;
+    /* 值域钳制收在"读盘入口"统一做：config 是外部可编辑的文件，非法值会直达
+     * theme_names[g_cfg.theme_id] 等索引。UI 侧不必再各自防（那里的钳制会被
+     * 本函数按盘上原值覆盖回来，等于没钳）。 */
+    if (g_cfg.theme_id < 0 || g_cfg.theme_id > CFG_THEME_MAX) g_cfg.theme_id = 0;
+    if (g_cfg.lang < I18N_LANG_AUTO || g_cfg.lang >= I18N_LANG_COUNT)
+        g_cfg.lang = I18N_LANG_AUTO;
     /* saveDir：去尾斜杠（但保留 ux0:/ 根的自带斜杠，勿剥成 "ux0:"）；
      * 空/非法（非 ux0: 开头或不足 ux0:/）回退默认 downloads */
     {
@@ -132,15 +159,20 @@ void config_init(void)
     }
 }
 
-void config_save(void)
+/* 调用者必须已持锁：构造 JSON → 写临时文件 → rename 原子替换。
+ * 直接 O_TRUNC 写目标文件的话，与另一线程的写并发会落出半截 JSON（下次启动
+ * 解析失败即回退默认值，丢 alias/knownIps）；写失败则保留盘上旧配置——旧实现
+ * 不看 sceIoWrite 返回值，一次磁盘满就把全部设置清空。 */
+static void config_write_locked(void)
 {
     char a[2 * sizeof g_cfg.alias];
     char f[2 * sizeof g_cfg.fingerprint];
     char d[2 * sizeof g_cfg.save_dir];
     char k[KNOWN_MAX * 17];        /* "ip,ip,...,ip" 最长 = 24*(15+1)-1 */
     char out[4096];
-    int len, i;
-    cfg_lock();
+    int len, i, w;
+    SceUID fd;
+
     json_escape(g_cfg.alias, a, sizeof a);
     json_escape(g_cfg.fingerprint, f, sizeof f);
     json_escape(g_cfg.save_dir, d, sizeof d);
@@ -171,13 +203,119 @@ void config_save(void)
                    g_cfg.custom_h, g_cfg.custom_s, g_cfg.custom_v,
                    g_cfg.confirm_layout, g_cfg.pane_swap,
                    g_cfg.lang, g_cfg.upd_auto, g_cfg.upd_last, d, k);
-    cfg_unlock();
-    if (len < 0 || len >= (int)sizeof out) return;
-    SceUID fd = sceIoOpen(PSVSEND_CONFIG, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC,
-                          0777);
-    if (fd < 0) return;
-    sceIoWrite(fd, out, (unsigned)len);
+    if (len < 0 || len >= (int)sizeof out) {
+        dlog("cfg: json overflow (%d)", len);
+        return;
+    }
+    fd = sceIoOpen(CFG_TMP, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd < 0) {
+        dlog("cfg: tmp open fail 0x%08X", (unsigned)fd);
+        return;
+    }
+    w = sceIoWrite(fd, out, (unsigned)len);
+    /* 先把内容真正刷到卡上再动旧配置：启动自愈的前提是 tmp 里的字节已完整落盘，
+     * 否则"改名完成但数据还在缓存里就掉电"仍会留下 0 长度/半截的 config。 */
+    if (w == len) sceIoSyncByFd(fd, 0);
     sceIoClose(fd);
+    if (w != len) {
+        dlog("cfg: write %d/%d -> keep old config", w, len);
+        sceIoRemove(CFG_TMP);
+        return;
+    }
+    /* uX0 的 sceIoRename 不支持覆盖已存在文件（真机 d135：恒返失败、每次保存都
+     * 落进下面的直写兜底），故先删旧配置再改名 —— FAT 上没有原子替换可用。两次
+     * 调用之间断电留下的局面是"config 缺失 + 完整 tmp"，由 config_init 的自愈逻辑
+     * 改名恢复，所以设置不会丢；而写 tmp 期间旧配置始终完好（旧实现 O_TRUNC 直写
+     * 时写一半断电，落的是半截 JSON，更难察觉）。 */
+    sceIoRemove(PSVSEND_CONFIG);
+    if (sceIoRename(CFG_TMP, PSVSEND_CONFIG) < 0) {
+        /* rename 仍失败（占用/只读等）时兜底直写：宁可非原子也要把设置存下来 */
+        dlog("cfg: rename fail -> direct write");
+        fd = sceIoOpen(PSVSEND_CONFIG, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC,
+                       0777);
+        if (fd >= 0) {
+            w = sceIoWrite(fd, out, (unsigned)len);
+            sceIoClose(fd);
+            if (w != len) dlog("cfg: direct write %d/%d fail", w, len);
+        } else {
+            dlog("cfg: direct open fail 0x%08X", (unsigned)fd);
+        }
+        sceIoRemove(CFG_TMP);
+    }
+}
+
+void config_save(void)
+{
+    cfg_lock();
+    config_write_locked();
+    cfg_unlock();
+}
+
+/* ---- 跨线程共享字段的加锁访问（说明见 config.h） ---- */
+
+void config_get_alias(char *out, int n)
+{
+    cfg_lock();
+    snprintf(out, (size_t)n, "%s", g_cfg.alias);
+    cfg_unlock();
+}
+
+void config_set_alias(const char *alias)
+{
+    cfg_lock();
+    snprintf(g_cfg.alias, sizeof g_cfg.alias, "%s", alias ? alias : "");
+    if (!g_cfg.alias[0])
+        snprintf(g_cfg.alias, sizeof g_cfg.alias, "%s", DEFAULT_ALIAS);
+    config_write_locked();
+    cfg_unlock();
+}
+
+void config_get_fingerprint(char *out, int n)
+{
+    cfg_lock();
+    snprintf(out, (size_t)n, "%s", g_cfg.fingerprint);
+    cfg_unlock();
+}
+
+void config_get_save_dir(char *out, int n)
+{
+    cfg_lock();
+    snprintf(out, (size_t)n, "%s", g_cfg.save_dir);
+    cfg_unlock();
+}
+
+void config_set_save_dir(const char *dir)
+{
+    cfg_lock();
+    snprintf(g_cfg.save_dir, sizeof g_cfg.save_dir, "%s", dir ? dir : "");
+    config_write_locked();
+    cfg_unlock();
+}
+
+void config_set_lang(int lang)
+{
+    cfg_lock();
+    if (lang < I18N_LANG_AUTO || lang >= I18N_LANG_COUNT) lang = I18N_LANG_AUTO;
+    g_cfg.lang = lang;
+    config_write_locked();
+    cfg_unlock();
+}
+
+void config_set_upd_auto(int v)
+{
+    cfg_lock();
+    if (v < 0 || v > 3) v = 2;
+    g_cfg.upd_auto = v;
+    config_write_locked();
+    cfg_unlock();
+}
+
+void config_set_upd_last(int t)
+{
+    cfg_lock();
+    g_cfg.upd_last = t < 0 ? 0 : t;
+    config_write_locked();
+    cfg_unlock();
 }
 
 /* 记录最近在线的设备 IP：去重、最新在前；写盘节流避免扫描一轮狂写 */

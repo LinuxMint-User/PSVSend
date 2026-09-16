@@ -208,10 +208,10 @@ static void settings_change(int item, int dir)
     } else if (item == SET_ITEM_CHECK) {
         update_check_now();      /* 动作行：左右/确认/点任意半都触发检查（dir 无意义） */
     } else if (item == SET_ITEM_AUTO) {
-        g_cfg.upd_auto += dir;
-        if (g_cfg.upd_auto < 0) g_cfg.upd_auto = 3;
-        if (g_cfg.upd_auto > 3) g_cfg.upd_auto = 0;
-        config_save();
+        int v = g_cfg.upd_auto + dir;
+        if (v < 0) v = 3;
+        if (v > 3) v = 0;
+        config_set_upd_auto(v);    /* 锁内写入并落盘：更新线程会读该项 */
     }
     /* SET_ITEM_HOSTNAME：动作在 input 里走 ask_ime_host（系统键盘），不落档位循环 */
 }
@@ -508,8 +508,7 @@ static void dpick_up(void)
 static void dpick_save(void)
 {
     if (dpick_persist) {
-        snprintf(g_cfg.save_dir, sizeof g_cfg.save_dir, "%s", g_app.cur_dir);
-        config_save();
+        config_set_save_dir(g_app.cur_dir);   /* 锁内写入并落盘：接收线程读该目录 */
     } else {
         snprintf(g_app.recv_dir, sizeof g_app.recv_dir, "%s", g_app.cur_dir);
     }

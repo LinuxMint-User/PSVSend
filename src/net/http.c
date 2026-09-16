@@ -91,10 +91,13 @@ static bool recv_abort_q(void)
 
 static void member_info_json(char *out, int outsz)
 {
+    char al[sizeof g_cfg.alias], fp[sizeof g_cfg.fingerprint];
     char ae[2 * sizeof g_cfg.alias];
     char fe[2 * sizeof g_cfg.fingerprint];
-    json_escape(g_cfg.alias, ae, sizeof ae);
-    json_escape(g_cfg.fingerprint, fe, sizeof fe);
+    config_get_alias(al, sizeof al);         /* 锁内取快照：UI 可能正在改名 */
+    config_get_fingerprint(fp, sizeof fp);
+    json_escape(al, ae, sizeof ae);
+    json_escape(fp, fe, sizeof fe);
     snprintf(out, outsz,
              "{\"alias\":\"%s\",\"version\":\"2.0\","
              "\"deviceModel\":\"PlayStation Vita\",\"deviceType\":\"mobile\","

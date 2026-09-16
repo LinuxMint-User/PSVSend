@@ -355,6 +355,7 @@ static void ask_rename(int fi)
 static void host_apply(const char *in)
 {
     char cur[sizeof g_cfg.alias];
+    char old[sizeof g_cfg.alias];
     int i = 0, o = 0, s;
 
     while (in[i] && o < (int)sizeof cur - 1) {
@@ -377,9 +378,9 @@ static void host_apply(const char *in)
     cur[o - s] = 0;
     if (!cur[0])
         snprintf(cur, sizeof cur, "%s", DEFAULT_ALIAS);  /* 空输入 → 默认名 */
-    if (strcmp(cur, g_cfg.alias) == 0) return;
-    snprintf(g_cfg.alias, sizeof g_cfg.alias, "%s", cur);
-    config_save();
+    config_get_alias(old, sizeof old);
+    if (strcmp(cur, old) == 0) return;
+    config_set_alias(cur);       /* 锁内写入并落盘：worker 广播正在读 alias */
 }
 
 /* 请求打开系统键盘改本机设备名（alias）。登记时机同 ask_rename。 */
@@ -420,8 +421,9 @@ void page_ime_pump(void)
                           ime_out, sizeof ime_out, RN_IME_LIMIT_US) != 1)
             ime_tx = IME_TX_NONE;           /* 打开失败：放弃（dlog 已记） */
     } else if (ime_tx == IME_TX_HOST) {
-        if (ime_ask_begin(tr("Hostname"),
-                          g_cfg.alias[0] ? g_cfg.alias : DEFAULT_ALIAS,
+        char al[sizeof g_cfg.alias];
+        config_get_alias(al, sizeof al);
+        if (ime_ask_begin(tr("Hostname"), al[0] ? al : DEFAULT_ALIAS,
                           ime_out, sizeof ime_out, 0) != 1)   /* 0=不限时 */
             ime_tx = IME_TX_NONE;
     }
@@ -652,7 +654,7 @@ static void open_recv_request(const RecvPending *rp)
         g_app.inc_files[i].inc = true;      /* 默认全收，Setup 里可取消勾选 */
         g_app.inc_files[i].size = rp->files[i].size;
     }
-    snprintf(g_app.recv_dir, sizeof g_app.recv_dir, "%s", g_cfg.save_dir);
+    config_get_save_dir(g_app.recv_dir, sizeof g_app.recv_dir);
     g_app.inc_sel = 0;
     rs_scroll = 0;
     rename_pop = false;

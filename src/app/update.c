@@ -714,10 +714,8 @@ static int upd_run(SceSize a1, void *a2)
     /* 4) 有网络时间才落 upd_last：授时成功网络即通，完整检查失败也算
      *    "此刻查过"，防半开/解析类问题按周期高频重试；手动且全失败
      *    （无任何 Date）则不记，用户可立即再点重试。 */
-    if (t_net > 0) {
-        g_cfg.upd_last = (int)t_net;
-        config_save();
-    }
+    if (t_net > 0)
+        config_set_upd_last((int)t_net);   /* 锁内写入并落盘 */
     g_st = fin;
     g_busy = 0;
     dlog("update: done state=%d src=%s%s", fin, src_host,

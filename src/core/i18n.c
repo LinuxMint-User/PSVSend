@@ -308,15 +308,17 @@ static int lang_of_system(void)
 void i18n_init(void)
 {
     int pref = g_cfg.lang;
-    if (pref < I18N_LANG_AUTO || pref >= I18N_LANG_COUNT) pref = I18N_LANG_AUTO;
+    if (pref < I18N_LANG_AUTO || pref >= I18N_LANG_COUNT) {
+        pref = I18N_LANG_AUTO;
+        config_set_lang(pref);   /* 钳制结果写回 g_cfg + 盘：旧实现只钳局部变量，
+                                  * 非法值会一直留在配置里被反复读回 */
+    }
     s_lang = (pref == I18N_LANG_AUTO) ? lang_of_system() : pref;
 }
 
 void i18n_set_lang(int pref)
 {
-    if (pref < I18N_LANG_AUTO || pref >= I18N_LANG_COUNT) pref = I18N_LANG_AUTO;
-    g_cfg.lang = pref;
-    config_save();
+    config_set_lang(pref);       /* 写 g_cfg + 落盘（内部持锁、含越界钳制） */
     i18n_init();
 }
 

@@ -31,7 +31,7 @@ typedef struct {
     int  custom_v;           /* 自定义主色 HSV：明度 0-100 */
     int  confirm_layout;     /* 0=美式 1=日式 */
     int  pane_swap;          /* 发送主页两栏布局：0=设备在左 1=文件在左（照顾左撇子） */
-    int  lang;               /* 界面语言偏好：0=跟随系统 1=English 2=中文 */
+    int  lang;               /* 界面语言偏好：I18N_LANG_*（0=跟随系统，见 core/i18n.h） */
     int  known_n;            /* 历史设备 IP 条数（最近发现优先，作扫描种子） */
     char known_ips[KNOWN_MAX][16]; /* 历史设备 IP，最新在前 */
     char save_dir[512];  /* 保存目录（设置页可选，持久化；默认 downloads）。
@@ -43,13 +43,29 @@ typedef struct {
 
 extern Config g_cfg;
 
-/* 建数据目录 + 填默认值 + 读盘覆盖；失败静默用默认 */
+/* 建数据目录 + 填默认值 + 读盘覆盖 + 值域钳制；失败静默用默认 */
 void config_init(void);
-/* 把当前配置写回磁盘（幂等，失败静默） */
+/* 把当前配置写回磁盘：内部持锁，写临时文件 + rename 原子替换；
+ * 写失败保留盘上旧配置并记 dlog（不再静默丢设置） */
 void config_save(void);
 /* 记录一个最近在线的设备 IP（去重滚动、最新在前；内部节流落盘） */
 void config_note_ip(const char *ip);
 /* 取与 a.b.c. 前缀匹配的历史主机号列表（供扫描优先），返回数量 */
 int config_known_hosts(unsigned a, unsigned b, unsigned c, int *out, int max);
+
+/* 跨线程共享字段的加锁访问：alias/fingerprint/saveDir 由 UI 线程改写、
+ * worker 线程（HTTP 广播、扫描、接收落盘目录）读取，直接访问会读到改到
+ * 一半的字符串（广播里发出半截设备名、接收落到半截目录名）；一律走这里。
+ * setter 内部同时落盘，返回即已持久化。
+ * 仅供 UI 线程读写的字段（theme/light/custom/confirmLayout/paneSwap）与
+ * int 项（updAuto/updLast）可直接访问 g_cfg。 */
+void config_get_alias(char *out, int n);
+void config_set_alias(const char *alias);        /* 空串 → DEFAULT_ALIAS */
+void config_get_fingerprint(char *out, int n);
+void config_get_save_dir(char *out, int n);
+void config_set_save_dir(const char *dir);
+void config_set_lang(int lang);                  /* 越界 → AUTO */
+void config_set_upd_auto(int v);                 /* 越界 → 每周 */
+void config_set_upd_last(int t);
 
 #endif

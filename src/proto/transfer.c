@@ -626,12 +626,15 @@ static int find_obj_str(const char *doc, const char *key, char *out, int outsz)
 static char *build_prepare_json(void)
 {
     int cap = TX_SOCK_BUF + XFER_MAX_FILES * 420;
+    char al[sizeof g_cfg.alias], fp[sizeof g_cfg.fingerprint];
     char ae[2 * sizeof g_cfg.alias], fe[2 * sizeof g_cfg.fingerprint];
     char *b = (char *)malloc((size_t)cap);
     int o = 0, i;
     if (!b) return NULL;
-    json_escape(g_cfg.alias, ae, sizeof ae);
-    json_escape(g_cfg.fingerprint, fe, sizeof fe);
+    config_get_alias(al, sizeof al);         /* 锁内取快照：UI 可能正在改名 */
+    config_get_fingerprint(fp, sizeof fp);
+    json_escape(al, ae, sizeof ae);
+    json_escape(fp, fe, sizeof fe);
     o += snprintf(b + o, (size_t)(cap - o),
                   "{\"info\":{\"alias\":\"%s\",\"version\":\"2.0\","
                   "\"deviceModel\":\"PlayStation Vita\",\"deviceType\":\"mobile\","

@@ -117,9 +117,12 @@ void discovery_peer_registered(const char *body, const char *src_ip)
     if (!body || !body[0]) return;
     if (!json_get_str(body, "alias", dev.alias, sizeof dev.alias)) return;
     json_get_str(body, "fingerprint", dev.fingerprint, sizeof dev.fingerprint);
-    if (g_cfg.fingerprint[0] && dev.fingerprint[0] &&
-        strcmp(dev.fingerprint, g_cfg.fingerprint) == 0)
-        return;                                /* 自己 */
+    if (dev.fingerprint[0]) {
+        char mine[sizeof g_cfg.fingerprint];
+        config_get_fingerprint(mine, sizeof mine);
+        if (mine[0] && strcmp(dev.fingerprint, mine) == 0)
+            return;                            /* 自己 */
+    }
     if (src_ip)
         snprintf(dev.ip, sizeof dev.ip, "%s", src_ip);
     json_get_str(body, "deviceModel", dev.model, sizeof dev.model);
@@ -137,9 +140,11 @@ void discovery_peer_registered(const char *body, const char *src_ip)
 /* 公开：扫描线程发现设备后入表（带自排除：指纹与自己的设备忽略） */
 void discovery_upsert_peer(const Device *dev)
 {
+    char mine[sizeof g_cfg.fingerprint];
     if (!dev || !dev->alias[0]) return;
-    if (g_cfg.fingerprint[0] && dev->fingerprint[0] &&
-        strcmp(dev->fingerprint, g_cfg.fingerprint) == 0)
+    config_get_fingerprint(mine, sizeof mine);
+    if (mine[0] && dev->fingerprint[0] &&
+        strcmp(dev->fingerprint, mine) == 0)
         return;                                /* 自己 */
     table_upsert(dev);
 }
@@ -157,11 +162,14 @@ static bool ipv4_from_str(const char *str, unsigned int *netorder)
 
 static void announce_payload(char *out, int n)
 {
+    char al[sizeof g_cfg.alias], fp[sizeof g_cfg.fingerprint];
     char ae[2 * sizeof g_cfg.alias];
     char fe[2 * sizeof g_cfg.fingerprint];
     int port = http_port();
-    json_escape(g_cfg.alias, ae, sizeof ae);
-    json_escape(g_cfg.fingerprint, fe, sizeof fe);
+    config_get_alias(al, sizeof al);         /* 锁内取快照：UI 可能正在改名 */
+    config_get_fingerprint(fp, sizeof fp);
+    json_escape(al, ae, sizeof ae);
+    json_escape(fp, fe, sizeof fe);
     snprintf(out, n,
              "{\"alias\":\"%s\",\"version\":\"2.0\","
              "\"deviceModel\":\"PlayStation Vita\",\"deviceType\":\"mobile\","
