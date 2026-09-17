@@ -113,8 +113,9 @@ static void fail(const char *fmt, ...)
     dlog("xfer: FAIL %s", g_j.v.err);
 }
 
-/* 标记第 i 个文件失败并整体收尾 */
-static void fail_file(int i, const char *fmt, ...)
+/* 标记第 i 个文件失败（不结束整个任务）：逐文件独立成败下，单文件失败只标它
+ * 自己（state=3）并记下原因，循环接着发剩下的；任务终态等循环结束时统一判定。 */
+static void mark_file_failed(int i, const char *fmt, ...)
 {
     char tmp[160];
     va_list ap;
@@ -123,6 +124,29 @@ static void fail_file(int i, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(tmp, sizeof tmp, fmt, ap);
     va_end(ap);
+    lock();
+    snprintf(g_j.v.err, sizeof g_j.v.err, "%s", tmp);
+    unlock();
+    dlog("xfer: file %d failed: %s", i, tmp);
+}
+
+/* 连接级失败（连不上 / TLS 握手失败 / 中途断流 / 等不到回执）：判"对端不在"，
+ * 把本文件与所有还没成功的文件一起标失败并立刻收尾——否则剩下每个文件都要
+ * 各等一遍连接/回执超时（几十个文件就是几分钟界面停摆）。HTTP 4xx/5xx 不是
+ * 连接级，走单文件失败（mark_file_failed），继续发剩下的。 */
+static void abort_files_from(int i, const char *fmt, ...)
+{
+    char tmp[160];
+    va_list ap;
+    int k;
+    va_start(ap, fmt);
+    vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    for (k = i; k < g_j.count; k++) {
+        if (g_j.v.f[k].state == 2) continue;      /* 已成功的不动 */
+        set_file_state(k, 3, g_j.v.f[k].sent);
+    }
+    dlog("xfer: abort from file %d/%d: %s", i + 1, g_j.count, tmp);
     fail("%s", tmp);
 }
 
@@ -730,14 +754,21 @@ static int xfer_thr(SceSize args, void *argp)
     free(body); body = NULL;
     free(prep); prep = NULL;
 
-    /* 阶段 2：逐文件上传 */
+    /* 阶段 2：逐文件上传。逐文件独立成败：
+     * - 对端只接受子集（回执没给该文件 token）→ 只标这个文件失败，继续发别的；
+     * - 单文件失败（打不开/读失败/文件变短、HTTP 4xx/5xx）→ 同上；
+     * - 连接级失败（连不上 / 握手失败 / 中途断流 / 等不到回执）→ 判"对端不在"，
+     *   剩余文件一起标失败并立刻收尾。
+     * 终态不在这里定：循环结束后按"有没有失败文件"统一判定。 */
     for (i = 0; i < g_j.count; i++) {
-        int fd, rd, sr, blen;
+        int fd = -1, rd, sr, blen;
         SceOff sent_file = 0;
+        int fres = 0;                /* 0=成功 1=本文件失败 2=取消 3=连接级失败 */
         if (g_j.cancel) { cancel_notify_peer(); finish_cancelled(); goto out; }
         if (g_j.tokens[i][0] == 0) {
-            fail_file(i, "no token for %s", g_j.files[i].name);
-            goto out;
+            /* 协议 4.1 明确允许对端只回执收下的子集：没 token = 这个文件被拒 */
+            mark_file_failed(i, "receiver did not accept %s", g_j.files[i].name);
+            continue;
         }
         lock();
         g_j.v.cur = i;
@@ -747,8 +778,8 @@ static int xfer_thr(SceSize args, void *argp)
 
         fd = sceIoOpen(g_j.files[i].path, SCE_O_RDONLY, 0);
         if (fd < 0) {
-            fail_file(i, "cannot open %s", g_j.files[i].path);
-            goto out;
+            mark_file_failed(i, "cannot open %s", g_j.files[i].path);
+            continue;
         }
         {
             char q[320];
@@ -763,17 +794,16 @@ static int xfer_thr(SceSize args, void *argp)
             sr = conn_open(&c, q, g_j.files[i].size);
             if (sr == -2) {           /* conn_open 取消已自关 */
                 cancel_notify_peer(); /* 对方在等首文件流：先通知，别让它干等 */
-                sceIoClose(fd);
-                finish_cancelled();
-                goto out;
+                fres = 2;
+                goto file_end;
             }
             if (sr < 0) {
-                sceIoClose(fd);
                 if (sr == -3)
-                    fail_file(i, "TLS handshake with %s:%d failed", g_j.ip, g_j.port);
+                    abort_files_from(i, "TLS handshake with %s:%d failed", g_j.ip, g_j.port);
                 else
-                    fail_file(i, "connect failed for %s", g_j.files[i].name);
-                goto out;
+                    abort_files_from(i, "connect failed for %s", g_j.files[i].name);
+                fres = 3;
+                goto file_end;
             }
             while (sent_file < g_j.files[i].size) {
                 SceOff want = g_j.files[i].size - sent_file;
@@ -782,34 +812,39 @@ static int xfer_thr(SceSize args, void *argp)
                     cancel_notify_peer(); /* 先通知再断流：对方收到 cancel 主动收尾，
                                            * 不会把随后的连接断流判成字节错误 */
                     conn_close(&c);
-                    sceIoClose(fd);
                     finish_cancelled();
-                    goto out;
+                    fres = 2;
+                    goto file_end;
                 }
                 rd = sceIoRead(fd, chunk, (unsigned)want);
                 if (rd < 0) {
                     conn_close(&c);
-                    sceIoClose(fd);
-                    fail_file(i, "read error on %s", g_j.files[i].name);
-                    goto out;
+                    mark_file_failed(i, "read error on %s", g_j.files[i].name);
+                    fres = 1;
+                    goto file_end;
                 }
                 if (rd == 0) {
                     /* 文件比声明的 size 短（读取期间被替换/截断）：再转下去
                      * conn_send_all(len=0) 立即返回、sent_file 不增 → 100% CPU
                      * 空转，对端一直等声明的字节数，只能靠用户取消。 */
                     conn_close(&c);
-                    sceIoClose(fd);
-                    fail_file(i, "%s shrank during send", g_j.files[i].name);
-                    goto out;
+                    mark_file_failed(i, "%s shrank during send", g_j.files[i].name);
+                    fres = 1;
+                    goto file_end;
                 }
                 sr = conn_send_all(&c, chunk, rd);
                 if (sr < 0) {
                     if (sr == -2) cancel_notify_peer(); /* 发送中被取消：断流前通知 */
                     conn_close(&c);
-                    sceIoClose(fd);
-                    if (sr == -2) finish_cancelled();
-                    else fail_file(i, "send error on %s", g_j.files[i].name);
-                    goto out;
+                    if (sr == -2) {
+                        finish_cancelled();
+                        fres = 2;
+                    } else {
+                        /* 上传中途断流：对端没了（连接级），剩余文件别逐个再试 */
+                        abort_files_from(i, "send error on %s", g_j.files[i].name);
+                        fres = 3;
+                    }
+                    goto file_end;
                 }
                 sent_file += rd;
                 set_file_state(i, 1, sent_file);
@@ -819,31 +854,49 @@ static int xfer_thr(SceSize args, void *argp)
             conn_close(&c);
             if (blen == -2) {
                 cancel_notify_peer(); /* body 已发完等回执时取消：收尾前通知 */
-                sceIoClose(fd);
                 finish_cancelled();
-                goto out;
+                fres = 2;
+                goto file_end;
             }
-            if (blen < 0 || code < 200 || code >= 300) {
-                sceIoClose(fd);
-                fail_file(i, "%s upload failed (HTTP %d)", g_j.files[i].name, code);
-                goto out;
+            if (blen < 0) {
+                /* 等不到回执（超时/连接被关）同样是连接级失败 */
+                abort_files_from(i, "no reply for %s", g_j.files[i].name);
+                fres = 3;
+                goto file_end;
+            }
+            if (code < 200 || code >= 300) {
+                /* HTTP 4xx/5xx：只算这一个文件失败，继续发剩下的 */
+                mark_file_failed(i, "%s upload failed (HTTP %d)",
+                                 g_j.files[i].name, code);
+                fres = 1;
+                goto file_end;
             }
         }
-        sceIoClose(fd);
+    file_end:
+        if (fd >= 0) sceIoClose(fd);
+        if (fres == 2 || fres == 3) goto out;
+        if (fres != 0) continue;
         dlog("xfer: file %d/%d done (%lld bytes)", i + 1, g_j.count,
              (long long)g_j.files[i].size);
         set_file_state(i, 2, g_j.files[i].size);
     }
     if (g_j.cancel) { cancel_notify_peer(); finish_cancelled(); goto out; }
 
-    lock();
-    g_j.v.finished = true;
-    g_j.v.active = false;
-    g_j.v.ok = true;
-    g_j.v.cur = -1;
-    snprintf(g_j.v.msg, sizeof g_j.v.msg, "Complete");
-    unlock();
-    dlog("xfer: all done");
+    /* 全部文件处理完：按"有没有失败文件"定终态（部分失败的展示交给页面：
+     * 页面按行状态自己区分"完成但有 N 个失败"与"全部失败"）。 */
+    {
+        int nfail = 0;
+        lock();
+        for (i = 0; i < g_j.count; i++)
+            if (g_j.v.f[i].state == 3) nfail++;
+        g_j.v.finished = true;
+        g_j.v.active = false;
+        g_j.v.cur = -1;
+        g_j.v.ok = (nfail == 0);
+        if (nfail == 0) snprintf(g_j.v.msg, sizeof g_j.v.msg, "Complete");
+        unlock();
+        dlog("xfer: all files processed, %d/%d failed", nfail, g_j.count);
+    }
     goto out;
 out:
     free(body);

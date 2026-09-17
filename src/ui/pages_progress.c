@@ -34,9 +34,10 @@ void page_progress_render(void)
 {
     int i;
     SceOff done[MAX_PICKED];
+    bool rfail[MAX_PICKED] = { false };  /* 每行是否失败（发送路径：逐文件独立成败） */
     SceOff total = 0;
-    int fin = 0, active = -1;
-    bool fail_state = false;
+    int fin = 0, nfail = 0, active = -1;
+    bool fail_state = false, partial = false;
     XferInfo xv;
     const char *msg = NULL;
     uint32_t msg_col = theme->text_dim;
@@ -50,8 +51,10 @@ void page_progress_render(void)
                      xv.f[i].name[0] ? xv.f[i].name : "?");
             xf_size[i] = xv.f[i].size;
             done[i] = xv.f[i].sent < xv.f[i].size ? xv.f[i].sent : xv.f[i].size;
-            if (xf_size[i] == 0 || done[i] >= xf_size[i]) fin++;
-            else if (active < 0) active = i;
+            rfail[i] = xv.f[i].state == 3;   /* 这个文件独立失败（被拒收 / HTTP 错） */
+            if (rfail[i]) nfail++;
+            else if (xv.f[i].state == 2) fin++;
+            if (xv.f[i].state == 1 && active < 0) active = i;
         }
         if (xv.active)
             g_app.prog_ms = (int)((sceKernelGetSystemTimeWide() - xv.start_us) / 1000);
@@ -63,9 +66,10 @@ void page_progress_render(void)
         g_app.prog_done = xv.finished && xv.ok;
         g_app.prog_cancel = xv.cancelled;
         fail_state = xv.finished && !xv.ok && !xv.cancelled;
+        partial = fail_state && fin > 0;     /* 部分失败：有成功的也有失败的 */
         if (fail_state) {
             msg = xv.err[0] ? xv.err : tr("Transfer failed");
-            msg_col = theme->danger;
+            msg_col = partial ? theme->warn : theme->danger;
         } else if (xv.active && xv.total_sent == 0 && xv.cur < 0) {
             msg = xv.msg[0] ? xv.msg : tr("Waiting for receiver to accept...");
         } else if (xv.active && xv.cur >= 0) {
@@ -152,16 +156,20 @@ void page_progress_render(void)
         int top = XF_TOP + i * XF_ROW_H - xf_scroll;
         if (top >= XF_BOTTOM) break;
         bool is_active = (i == active) && g_app.prog_running;
+        bool is_fail = rfail[i];              /* 该文件独立失败 → 标红 */
         int fp = xf_size[i] > 0 ? (int)(done[i] * 100 / xf_size[i]) : 100;
         if (fp > 100) fp = 100;
         char pctlb[16];
         snprintf(pctlb, sizeof pctlb, "%d%%", fp);
-        uint32_t nc = is_active ? theme->text : theme->text_dim;
+        const char *pctxt = is_fail ? tr("Failed") : pctlb;
+        uint32_t nc = is_fail ? theme->danger
+                              : (is_active ? theme->text : theme->text_dim);
         int tw = 0, th = 0;
-        w_text_w(1.1f, pctlb, &tw, &th);
-        w_text(920 - tw, top + 2, 1.1f, nc, "%s", pctlb);
+        w_text_w(1.1f, pctxt, &tw, &th);
+        w_text(920 - tw, top + 2, 1.1f, nc, "%s", pctxt);
         w_text_mid(40, top + 2, 1.1f, nc, xf_name[i], 650);
-        w_bar((Rect){ 40, top + 30, 660, 10 }, theme->card, theme->accent, fp);
+        w_bar((Rect){ 40, top + 30, 660, 10 }, theme->card,
+              is_fail ? theme->danger : theme->accent, fp);
     }
     vita2d_disable_clipping();
 
@@ -182,9 +190,23 @@ void page_progress_render(void)
     snprintf(ov, sizeof ov, tr("Total   %d%%"), g_app.prog_pct);
     w_text(40, 376, 1.15f, theme->text, "%s", ov);
     if (g_app.prog_done || g_app.prog_cancel || fail_state) {
-        const char *st = g_app.prog_done ? tr("Complete")
-                       : (g_app.prog_cancel ? tr("Cancelled") : tr("Failed"));
-        uint32_t sc = g_app.prog_done ? theme->success : theme->danger;
+        char stbuf[48];
+        const char *st;
+        uint32_t sc;
+        if (g_app.prog_done) {
+            st = tr("Complete");
+            sc = theme->success;
+        } else if (partial) {                  /* 完成，但有 N 个文件失败（警示色） */
+            snprintf(stbuf, sizeof stbuf, tr("Complete, %d failed"), nfail);
+            st = stbuf;
+            sc = theme->warn;
+        } else if (g_app.prog_cancel) {
+            st = tr("Cancelled");
+            sc = theme->danger;
+        } else {
+            st = tr("Failed");
+            sc = theme->danger;
+        }
         int tw = 0, th = 0;
         w_text_w(1.15f, st, &tw, &th);
         w_text(920 - tw, 376, 1.15f, sc, "%s", st);
