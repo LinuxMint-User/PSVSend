@@ -41,4 +41,9 @@ const char *json_get_val(const char *obj, const char *key);
  * 返回写入字节数（不含结尾 0），outsz>0 时保证结尾 0。 */
 int json_escape(const char *in, char *out, int outsz);
 
+/* 把 src 复制进 dst[cap]（最多 cap-1 字节 + 结尾 0）。空间不够而必须截断时，
+ * 截断点落在 UTF-8 字符边界上——不把一个多字节字符切成半个（半个字符在 JSON 里
+ * 是非法序列，对端解析会出错）。返回实际写入字节数；cap<=0 时不动 dst 返回 0。 */
+int str_copy_utf8(char *dst, int cap, const char *src);
+
 #endif

@@ -19,6 +19,7 @@
 #include "ui/pages_internal.h"
 #include "ui/theme.h"
 #include "core/i18n.h"
+#include "core/json_util.h"
 #include "app/api.h"
 
 static int dev_scroll = 0;         /* 主页设备栏内容像素偏移 */
@@ -544,9 +545,10 @@ static void toggle_pick(int idx)
         return;
     }
     if (g_app.picked_count >= MAX_PICKED) return;
-    strncpy(g_app.picked[g_app.picked_count].name, g_app.files[idx].name,
-            sizeof g_app.picked[0].name - 1);
-    g_app.picked[g_app.picked_count].name[sizeof g_app.picked[0].name - 1] = 0;
+    /* 按 UTF-8 边界截断：256 字节的名字塞进 128 字节的已选栏，若切在半个汉字上，
+     * 这个非法序列会一路带到 prepare 的 JSON 里。 */
+    str_copy_utf8(g_app.picked[g_app.picked_count].name,
+                  (int)sizeof g_app.picked[0].name, g_app.files[idx].name);
     snprintf(g_app.picked[g_app.picked_count].path, sizeof g_app.picked[0].path,
              "%s", path);
     g_app.picked[g_app.picked_count].size = g_app.files[idx].size;
@@ -765,6 +767,12 @@ static void start_send(int dev_idx)
         ff[n].size = g_app.picked[i].size;
         n++;
     }
+    if (api_send_start(g_app.dev_ip[dev_idx], g_app.dev_port[dev_idx],
+                       g_app.dev_proto[dev_idx], g_app.dev_fp[dev_idx], ff, n) != 0) {
+        /* 启动被拒（上一次传输还在收尾）：留在本页，不要切等待页——等待页读的是
+         * xfer 的共享快照，那还是上一批的状态，看着会像"这次发失败了"。 */
+        return;
+    }
     g_app.dev_target = dev_idx;   /* 仅用于进度页返回时恢复选中行 */
     g_app.prog_dir = 0;
     xf_scroll = 0;
@@ -776,8 +784,6 @@ static void start_send(int dev_idx)
     g_app.prog_running = true;
     g_app.prog_start = sceKernelGetSystemTimeWide();
     xf_count = n;
-    api_send_start(g_app.dev_ip[dev_idx], g_app.dev_port[dev_idx],
-                   g_app.dev_proto[dev_idx], g_app.dev_fp[dev_idx], ff, n);
     g_app.page = PAGE_SEND_WAIT;   /* 先进等待页；对端接受后由 pages_tick 切进度页 */
 }
 

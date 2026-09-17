@@ -38,6 +38,15 @@ void http_set_register_cb(void (*cb)(const char *body, const char *src_ip));
  * 32 位 long 的裸累加会被 Content-Length: 3000000000 之类回绕成负值 → 负索引越界。 */
 int http_hdr_content_length(const char *buf, int he);
 
+/* 响应头里是否声明了 chunked 传输（transfer-encoding: chunked，头名/值大小写
+ * 不敏感）。读响应用：没有 Content-Length 时不能一律当"body 为空"。返回 1/0。 */
+int http_hdr_chunked(const char *buf, int he);
+
+/* 就地解开 chunked 编码：body[0..len) 是分块数据，解出的内容写回 body 开头。
+ * 返回解出的长度；-1 = 数据还没收齐或格式畸形（调用方继续收或报错）。
+ * 允许分多次收到数据后反复调用（每次都从头重解），所以可以边收边试。 */
+int http_chunked_decode(char *body, int len);
+
 /* ---------- 接收方向路由：注册式（依赖倒置） ----------
  * http 层只做 HTTP 语义与连接读写，不认 LocalSend 协议；接收侧的处理实现住在
  * proto/receive.c，由组合层（app/api.c）启动时注册进来。这样 net 层不必

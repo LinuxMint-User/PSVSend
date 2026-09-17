@@ -196,6 +196,67 @@ static bool str_has_ci(const char *s, const char *sub)
     return false;
 }
 
+int http_hdr_chunked(const char *buf, int he)
+{
+    char v[64];
+    if (he <= 0) return 0;
+    if (!hdr_copy(buf, he, "transfer-encoding", v, (int)sizeof v)) return 0;
+    return str_has_ci(v, "chunked") ? 1 : 0;
+}
+
+/* 跳过 CRLF/LF：返回下一行的起点（未到行尾就返回原位置） */
+static int skip_eol(const char *s, int len, int i)
+{
+    while (i < len) {
+        if (s[i] == '\r') { i++; continue; }
+        if (s[i] == '\n') return i + 1;
+        return i;
+    }
+    return i;
+}
+
+/* 遍历分块数据。copy=0：只校验并算长度，不动数据；copy=1：顺便把数据搬到 out。
+ * 返回解出的长度；-1 = 数据还没收齐或格式畸形。 */
+static int chunk_walk(char *in, int len, char *out, int copy)
+{
+    int p = 0, o = 0;
+    while (p < len) {
+        int sz = 0, digits = 0, i = p;
+        while (i < len) {
+            unsigned char ch = (unsigned char)in[i];
+            int v;
+            if (ch == ';' || ch == '\r' || ch == '\n') break;  /* 块扩展/行尾 */
+            if (ch >= '0' && ch <= '9') v = ch - '0';
+            else if (ch >= 'a' && ch <= 'f') v = ch - 'a' + 10;
+            else if (ch >= 'A' && ch <= 'F') v = ch - 'A' + 10;
+            else return -1;                        /* 不是合法的分块数据 */
+            if (sz > (1 << 20)) return -1;         /* 离谱块大小：拒绝 */
+            sz = sz * 16 + v;
+            digits++;
+            i++;
+        }
+        if (!digits) return -1;
+        i = skip_eol(in, len, i);
+        if (sz == 0) return o;                     /* 末块 0：解出的就是全部 */
+        if (i + sz > len) return -1;               /* 块数据还没收齐 */
+        if (copy) memmove(out + o, in + i, (size_t)sz);
+        o += sz;
+        i += sz;
+        p = skip_eol(in, len, i);
+        if (p == len) return -1;                   /* 块尾 CRLF 未到齐：等更多数据 */
+    }
+    return -1;
+}
+
+int http_chunked_decode(char *body, int len)
+{
+    /* 两遍走：先只扫描。调用方会边收边反复调用本函数，若第一遍就逐个块就地搬运，
+     * 未收齐时缓冲已被动过，下次重解会把搬过的数据当成新的块大小（分块长度是
+     * 十六进制，"hello" 这种内容也能被当成合法数字）→ 解出垃圾。 */
+    if (chunk_walk(body, len, NULL, 0) < 0) return -1;
+    return chunk_walk(body, len, body, 1);         /* 确认收齐了再原地搬运 */
+}
+
 /* ---------- 连接读写抽象 ----------
  * 连接现在就是裸 fd；收发都经 conn_read/conn_write（定义见下）。将来 TLS 化
  * 时把 mbedTLS 上下文挂进 Conn、在这两个函数里分派即可，调用点不必再改。 */

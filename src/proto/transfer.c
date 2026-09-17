@@ -330,21 +330,26 @@ static int conn_recv_poll(Conn *c, char *buf, int cap, SceLong64 dl)
     }
 }
 
-/* 读响应：把"头 + Content-Length body"整段累积进调用方 buf（cap 容量）。
- * 头结束符之后就是 body，buf[body_end]=0 收尾（解析直接对 buf 用 strstr）。
- * 返回 body 长度；-1=错误/超时/连接关/缓冲不足；-2=已取消。*code 填状态码。 */
+/* 读一个 HTTP 响应。返回 body 长度（body 在 buf 里头部之后，调用方的 JSON 解析
+ * 器会自己跳过头部）；-1 = 读失败/超时/缓冲装不下；-2 = 用户取消。 */
 static int read_resp(Conn *c, int *code, char *buf, int cap, SceLong64 wait_us)
 {
-    int n = 0, he = -1, cl = -1, body_off = 0;
+    int n = 0, he = -1, cl = -1, body_off = 0, chunked = 0;
     SceLong64 dl = sceKernelGetSystemTimeWide() + wait_us;
     *code = 0;
     for (;;) {
         int i, r;
         if (g_j.cancel) return -2;
-        if (n >= cap - 1) return -1;
+        if (n >= cap - 1) {
+            dlog("resp: reply does not fit in %d-byte buffer", cap);
+            return -1;
+        }
         r = conn_recv_poll(c, buf + n, cap - 1 - n, dl);
         if (r == -2) return -2;
-        if (r <= 0) return -1;
+        if (r <= 0) {
+            dlog("resp: incomplete reply (%d byte(s) in, r=%d)", n, r);
+            return -1;              /* 读错误 / 超时 / 对端提前关闭 */
+        }
         n += r;
         buf[n] = 0;
         /* 扫整个缓冲找头结束符（勿只扫末尾——历史 bug） */
@@ -354,21 +359,39 @@ static int read_resp(Conn *c, int *code, char *buf, int cap, SceLong64 wait_us)
         if (he >= 0 && cl < 0) {
             /* LocalSend 实际返回全小写头（content-length）：走 http 层的溢出安全
              * 解析（大小写不敏感）。此前用 32 位 long 裸累加，对端回超长数字会
-             * 回绕成负值 → :369 立即 break、旧 guard 只挡上界放行负值 →
+             * 回绕成负值 → 立即 break、旧 guard 只挡上界放行负值 →
              * buf[body_off+cl]=0 负索引写越界。 */
             cl = http_hdr_content_length(buf, he);
-            if (cl < 0) cl = 0;      /* 无/畸形/超范围：当 0 长 → 调用方报空回执 */
+            if (cl <= 0) {
+                cl = 0;             /* 无/畸形/超范围：暂按 0 长 */
+                /* 没有 Content-Length 不等于 body 为空：对端可能用 chunked
+                 * （旧写法一律当 0 长，会把带 body 的回执误报成"空回执"）。 */
+                if (http_hdr_chunked(buf, he)) chunked = 1;
+            }
             if (strncmp(buf, "HTTP/1.", 7) == 0) {
                 const char *cs = strchr(buf, ' ');
                 if (cs) *code = atoi(cs + 1);
             }
             body_off = he + 4;
         }
-        if (he >= 0 && n >= body_off + cl) break;
+        if (he < 0) continue;                       /* 头还没收全 */
+        if (chunked) {
+            int blen = http_chunked_decode(buf + body_off, n - body_off);
+            if (blen >= 0) {                        /* 分块已收齐并解出 */
+                buf[body_off + blen] = 0;
+                return blen;
+            }
+            continue;                               /* 还有块没到：继续收 */
+        }
+        if (n >= body_off + cl) {
+            if (cl > cap - 1 - body_off) {
+                dlog("resp: body %d does not fit (cap %d, off %d)", cl, cap, body_off);
+                return -1;
+            }
+            buf[body_off + cl] = 0;
+            return cl;
+        }
     }
-    if (cl < 0 || cl > cap - 1 - body_off) return -1;   /* body 超出缓冲 */
-    buf[body_off + cl] = 0;
-    return cl;
 }
 
 /* 释放 TLS 上下文并关 socket（尽力 close_notify，失败忽略） */
@@ -646,35 +669,58 @@ static int find_obj_str(const char *doc, const char *key, char *out, int outsz)
     return 1;
 }
 
-/* 组装 prepare-upload 请求体（成员信息 + 待发文件元数据） */
+/* 往缓冲里追加一段 JSON：返回新的写入位置；放不下（会被截断）返回 -1。
+ * 必须靠 vsnprintf 返回值判断——它返回的是"本来想写多长"，截断时远大于剩余空间，
+ * 若直接累加，o 会越过 cap，随后的 b[o]=0 就是越界写（旧写法 o < cap-64 的余量
+ * 判断挡不住单条最长约 344 字节的条目）。 */
+static int jcat(char *b, int cap, int o, const char *fmt, ...)
+{
+    va_list ap;
+    size_t room;
+    int w;
+    if (o < 0 || o >= cap - 1) return -1;
+    room = (size_t)(cap - o);
+    va_start(ap, fmt);
+    w = vsnprintf(b + o, room, fmt, ap);
+    va_end(ap);
+    if (w < 0 || (size_t)w >= room) return -1;
+    return o + w;
+}
+
+/* 组装 prepare-upload 请求体（成员信息 + 待发文件元数据）。
+ * 任何一段装不下就返回 NULL：宁可不发，也不发一个截断的 JSON 出去。 */
 static char *build_prepare_json(void)
 {
     int cap = TX_SOCK_BUF + XFER_MAX_FILES * 420;
     char al[sizeof g_cfg.alias], fp[sizeof g_cfg.fingerprint];
     char ae[2 * sizeof g_cfg.alias], fe[2 * sizeof g_cfg.fingerprint];
     char *b = (char *)malloc((size_t)cap);
-    int o = 0, i;
+    int o, i;
     if (!b) return NULL;
     config_get_alias(al, sizeof al);         /* 锁内取快照：UI 可能正在改名 */
     config_get_fingerprint(fp, sizeof fp);
     json_escape(al, ae, sizeof ae);
     json_escape(fp, fe, sizeof fe);
-    o += snprintf(b + o, (size_t)(cap - o),
-                  "{\"info\":{\"alias\":\"%s\",\"version\":\"2.0\","
-                  "\"deviceModel\":\"PlayStation Vita\",\"deviceType\":\"mobile\","
-                  "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"http\","
-                  "\"download\":false},\"files\":{",
-                  ae, fe, http_port());
-    for (i = 0; i < g_j.count && o < cap - 64; i++) {
+    o = jcat(b, cap, 0,
+             "{\"info\":{\"alias\":\"%s\",\"version\":\"2.0\","
+             "\"deviceModel\":\"PlayStation Vita\",\"deviceType\":\"mobile\","
+             "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"http\","
+             "\"download\":false},\"files\":{",
+             ae, fe, http_port());
+    for (i = 0; o >= 0 && i < g_j.count; i++) {
         char esc[2 * 128 + 8];
         json_escape(g_j.files[i].name, esc, sizeof esc);
-        o += snprintf(b + o, (size_t)(cap - o),
-                      "%s\"f%d\":{\"id\":\"f%d\",\"fileName\":\"%s\","
-                      "\"size\":%lld,\"fileType\":\"application/octet-stream\"}",
-                      i ? "," : "", i, i, esc, (long long)g_j.files[i].size);
+        o = jcat(b, cap, o,
+                 "%s\"f%d\":{\"id\":\"f%d\",\"fileName\":\"%s\","
+                 "\"size\":%lld,\"fileType\":\"application/octet-stream\"}",
+                 i ? "," : "", i, i, esc, (long long)g_j.files[i].size);
     }
-    if (o < cap - 4) o += snprintf(b + o, (size_t)(cap - o), "}}");
-    b[o] = 0;
+    o = jcat(b, cap, o, "}}");
+    if (o < 0) {                             /* 装不下：别发截断的 JSON */
+        dlog("xfer: prepare json does not fit in %d bytes", cap);
+        free(b);
+        return NULL;
+    }
     return b;
 }
 
@@ -693,8 +739,9 @@ static int xfer_thr(SceSize args, void *argp)
     /* 阶段 1：prepare-upload（长等接收方决定） */
     set_msg("Waiting for %s to accept...", g_j.ip);
     body = build_prepare_json();
-    prep = body ? (char *)malloc(RSP_BUF) : NULL;
-    if (!body || !prep) { fail("out of memory"); goto out; }
+    if (!body) { fail("cannot build prepare request"); goto out; }
+    prep = (char *)malloc(RSP_BUF);
+    if (!prep) { fail("out of memory"); goto out; }
     {
         Conn c;
         memset(&c, 0, sizeof c);
@@ -916,10 +963,11 @@ int xfer_start(const char *ip, int port, const char *proto, const char *fp,
         g_mtx = sceKernelCreateMutex("psvsend_xfer", 0, 0, NULL);
     lock();
     if (g_j.v.active) {
-        snprintf(g_j.v.err, sizeof g_j.v.err, "transfer already active");
-        g_j.v.finished = true;
-        g_j.v.ok = false;
+        /* 已有传输在跑（含"上一次刚取消、线程还在收尾"的窗口）：只报失败返回，
+         * 绝不往 g_j.v 里写——那是正在跑的那一次的共享快照，写 finished/ok 会把
+         * 在途任务误标成已失败，调用方若照旧切页还会显示上一批的清单。 */
         unlock();
+        dlog("xfer: refused, another transfer is still active");
         return -1;
     }
     memset(&g_j, 0, sizeof g_j);
@@ -945,10 +993,12 @@ int xfer_start(const char *ip, int port, const char *proto, const char *fp,
     g_j.port = port;
     g_j.count = n;
     for (i = 0; i < n; i++) {
-        strncpy(g_j.files[i].name, files[i].name, sizeof g_j.files[i].name - 1);
+        /* 名字按 UTF-8 边界截断：128 字节装不下的长名很常见，若切在半个汉字上，
+         * prepare 的 JSON 里就是非法序列，对端解析会出错。 */
+        str_copy_utf8(g_j.files[i].name, (int)sizeof g_j.files[i].name, files[i].name);
         strncpy(g_j.files[i].path, files[i].path, sizeof g_j.files[i].path - 1);
         g_j.files[i].size = files[i].size;
-        strncpy(g_j.v.f[i].name, files[i].name, sizeof g_j.v.f[i].name - 1);
+        str_copy_utf8(g_j.v.f[i].name, (int)sizeof g_j.v.f[i].name, files[i].name);
         g_j.v.f[i].size = files[i].size;
     }
     g_j.v.count = n;

@@ -339,3 +339,21 @@ int json_escape(const char *in, char *out, int outsz)
     out[n < outsz - 1 ? n : outsz - 1] = 0;
     return n;
 }
+
+int str_copy_utf8(char *dst, int cap, const char *src)
+{
+    size_t n, p = 0, o = 0;
+    if (!dst || cap <= 0) return 0;
+    if (!src) src = "";
+    n = strlen(src);
+    while (p < n && o + 1 < (size_t)cap) {
+        int l = utf8_len((unsigned char)src[p]);
+        if (l <= 1 || p + (size_t)l > n) l = 1;  /* 非法/残缺序列：按单字节透传 */
+        if (o + (size_t)l > (size_t)cap - 1) break;   /* 放不下整个字符 → 就此截断 */
+        memcpy(dst + o, src + p, (size_t)l);
+        o += (size_t)l;
+        p += (size_t)l;
+    }
+    dst[o] = 0;
+    return (int)o;
+}
