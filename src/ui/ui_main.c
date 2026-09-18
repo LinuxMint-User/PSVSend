@@ -266,6 +266,15 @@ void w_add(int id, Rect r)
         g_ids[g_wcount] = id;
         g_widgets[g_wcount] = r;
         g_wcount++;
+        return;
+    }
+    /* 表满：多出来的区域被丢掉，表现为"这块点不动"却又查不出原因。同一页只报
+     * 一次（列表页每帧都会注册，逐帧刷屏会把日志冲没）。 */
+    static int warned_page = -1;
+    if (g_app.page != warned_page) {
+        warned_page = g_app.page;
+        dlog("w_add: hit table full (%d), drop id=%d rect=%d,%d,%d,%d page=%d",
+             MAX_W, id, r.x, r.y, r.w, r.h, (int)g_app.page);
     }
 }
 

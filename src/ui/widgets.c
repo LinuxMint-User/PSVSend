@@ -129,11 +129,24 @@ void w_text_w(float scale, const char *text, int *w, int *h)
         int n = next_run(p, &cjk);
         vita2d_font *f = font_get(size, cjk);
         if (f) {
-            memcpy(seg, p, n);
-            seg[n] = 0;
-            int sw = 0;
-            vita2d_font_text_dimensions(f, size, seg, &sw, NULL);
-            pen += sw;
+            /* 本函数对入参长度无约束（如超长目录路径），一个 run 可能长于 seg：
+             * 按字符边界切成 ≤(sizeof seg - 1) 字节的片分别测宽累加，避免越界写栈
+             * （段与段之间无 kerning，切开的代价只是相邻字符间距不再微调）。 */
+            int off = 0;
+            while (off < n) {
+                int cn = 0, sw = 0;
+                while (off + cn < n) {
+                    uint32_t c2;
+                    const char *nx = utf8_next_cp(p + off + cn, &c2);
+                    if (cn + (int)(nx - (p + off + cn)) > (int)sizeof seg - 1) break;
+                    cn += (int)(nx - (p + off + cn));
+                }
+                memcpy(seg, p + off, cn);
+                seg[cn] = 0;
+                vita2d_font_text_dimensions(f, size, seg, &sw, NULL);
+                pen += sw;
+                off += cn;
+            }
         }
         p += n;
     }
@@ -145,27 +158,28 @@ void w_text_clip(float x, float y, float scale, uint32_t color,
                  const char *text, int max_w)
 {
     char buf[512] = {0};      /* 必须初始化：一个字都放不下时不能把未初始化内容画出去 */
-    char tmp[520];
-    int cur_w = 0;
+    char one[8];
+    int cur_w = 0, n = 0;
     const char *p = text;
-    int n = 0;
     while (*p) {
         uint32_t cp;
         /* 逐字符步进统一走 utf8_next_cp：它校验后继字节与 \0，非法/截断序列
          * 只前进 1 字节；早先这里另有一套"按首字节宽度盲进 2~4 字节"的实现，
          * 定长 name 数组被填满、结尾是半个汉字时它会越过 '\0' 继续读。 */
         const char *next = utf8_next_cp(p, &cp);
-        if (n + (int)(next - p) >= (int)sizeof buf) break;   /* 文本过长：截断 */
-        memcpy(tmp, buf, n);
-        memcpy(tmp + n, p, next - p);
-        tmp[n + (next - p)] = 0;
-        int w = 0, h = 0;
-        w_text_w(scale, tmp, &w, &h);
-        if (w > max_w) break;
-        memcpy(buf, tmp, n + (next - p));
-        n += (next - p);
+        int cl = (int)(next - p);
+        if (n + cl >= (int)sizeof buf) break;   /* 文本过长：截断 */
+        /* 单趟累加逐字宽度（同 w_text_mid 的取宽口径），不再每纳一字就重测整段前缀
+         * （旧写法对 n 个字要测 n(n+1)/2 次宽、2n 次前缀 memcpy）。 */
+        int cw = 0;
+        memcpy(one, p, cl);
+        one[cl] = 0;
+        w_text_w(scale, one, &cw, NULL);
+        if (cur_w + cw > max_w) break;
+        memcpy(buf + n, p, cl);
+        n += cl;
         buf[n] = 0;
-        cur_w = w;
+        cur_w += cw;
         p = next;
     }
     if (cur_w > 0)        /* 放不下任何一个字形 → 不画（原"n==0 也画"会输出垃圾） */

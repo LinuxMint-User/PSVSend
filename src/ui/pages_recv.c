@@ -89,10 +89,14 @@ void page_recv_confirm_render(void)
     w_rect(card, theme->card);
     int n = g_app.inc_count, seln = recv_included();
     int i;
-    /* 来者名字（右上是平台类型） */
-    w_text(48, 100, 1.5f, theme->text, "%s", g_app.recv_alias);
+    /* 来者名字（右上是平台类型）。对端别名长度不受本端控制（最长 64 字节，
+     * 1.5 号字下足以铺满整屏并与右上"平台类型"压盖/出屏），故先量出平台类型
+     * 宽度，别名按它左侧的剩余宽度裁尾。 */
     int tw = 0, th = 0;
     w_text_w(1.1f, tr(g_app.recv_type), &tw, &th);
+    int alias_max = card.x + card.w - 24 - tw - 16 - 48;
+    if (alias_max < 0) alias_max = 0;
+    w_text_clip(48, 100, 1.5f, theme->text, g_app.recv_alias, alias_max);
     w_text(card.x + card.w - tw - 24, 106, 1.1f, theme->text_dim, "%s",
            tr(g_app.recv_type));
 
@@ -211,8 +215,12 @@ void page_recv_confirm_input(const Input *in)
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id == 2) {
-            recv_focus = 2;
-            if (recv_included() > 0) start_recv();
+            /* Accept 在"一个文件都没勾选"时是禁用态：点它不搬焦点——否则焦点停在
+             * 禁用项上，页脚还写着 Accept，确认键就成了死键（DPAD 路径本就跳过它）。 */
+            if (recv_included() > 0) {
+                recv_focus = 2;
+                start_recv();
+            }
         } else if (id == 1) {
             recv_focus = 1;
             g_app.inc_sel = 0;
@@ -313,9 +321,12 @@ enum {
 };
 /* 接收改名的键盘时限：须赶在 prepare 等 UI 决定窗口（receive.c 的
  * RECV_DECIDE_TIMEOUT_US = 60s）内完成，窗口一过 pending 清场、改名白做；
- * 取 50s 略短于窗口，给关键盘后点接受/拒绝留时间。主机名是纯设置项、
- * 无业务时限，打开时传 0 不限（见 ime.h limit_us）。 */
-#define RN_IME_LIMIT_US (50ll * 1000 * 1000)
+ * 取 50s 略短于窗口，给关键盘后点接受/拒绝留时间。主机名是纯设置项、无业务
+ * 时限，但也不能完全不设限：键盘引擎一旦假死（d55-d58 真机遇过），"进行中"
+ * 会一直为真 → 输入被永久屏蔽、界面连同退出一起锁死；取 5 分钟当保险丝，
+ * 正常改名远用不到，真卡住时还能自己回来（见 ime.h limit_us）。 */
+#define RN_IME_LIMIT_US   (50ll * 1000 * 1000)
+#define HOST_IME_LIMIT_US (300ll * 1000 * 1000)
 static int  ime_tx = IME_TX_NONE;  /* 当前挂起/打开的事务（NONE=空闲） */
 static int  ime_tx_fi = -1;        /* RENAME 的目标行（HOST 不使用） */
 static char ime_out[128];          /* 键盘结果落点（须存活到 poll 结束，ime 异步写） */
@@ -424,7 +435,7 @@ void page_ime_pump(void)
         char al[sizeof g_cfg.alias];
         config_get_alias(al, sizeof al);
         if (ime_ask_begin(tr("Hostname"), al[0] ? al : DEFAULT_ALIAS,
-                          ime_out, sizeof ime_out, 0) != 1)   /* 0=不限时 */
+                          ime_out, sizeof ime_out, HOST_IME_LIMIT_US) != 1)
             ime_tx = IME_TX_NONE;
     }
 }
@@ -692,6 +703,10 @@ void pages_tick(void)
     }
 
     if (now_ms < g_recv_supp_ms) return;     /* 决定后的抑制窗内不弹 */
+    /* 系统键盘（IME 事务）打开中不切页：页栈被换成接收确认页后，IME 的收尾回调
+     * 仍按旧页（设置页/接收设置页）处理，两边状态就指向不同的页了。请求留在
+     * pending 里，等键盘关掉后下一帧照常弹。 */
+    if (page_ime_busy()) return;
     if (api_recv_pending_pull(&rp) != 1) return; /* 无"待决定"请求 */
     switch (g_app.page) {
     case PAGE_DEVICES:

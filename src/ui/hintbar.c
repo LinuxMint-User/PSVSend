@@ -170,14 +170,29 @@ void w_page_footer(const char *hint)
     w_text(28, f.y + 12, 1.0f, theme->text_dim, "%s", hint);
 }
 
+/* 提示条左右留白（左端起点 / 右端边界）、段间距（充裕时 / 压缩后） */
+#define HINT_MARGIN   28
+#define HINT_GAP      24
+#define HINT_GAP_MIN  12
+
+/* 段的图标部分宽度：无图标 0、单键 26、合并段（双键）57。
+ * 量宽与绘制两处都要用，抽成一处保证口径一致。 */
+static int seg_icon_w(const HintSeg *s)
+{
+    if (icon_of(s->key) == HICON_NONE) return 0;
+    return icon_of(s->key2) != HICON_NONE ? 57 : 26;
+}
+
 /* 底部按键提示条：页面给的段先排成默认键序再绘制。
  * 段的 key2 非 HKEY_NONE 时表示"两个键同一个动作"，画成「key / key2 文案」：
  * 两个键都显示出来（告知两条路子都能走），动作文案只写一次，避免同一句话写两遍；
- * 段内两个键之间也按同一默认键序排（○ 恒在 ✗ 前）。 */
+ * 段内两个键之间也按同一默认键序排（○ 恒在 ✗ 前）。
+ * 排版有右边界：段的起点出屏就不再画；文字超宽则裁尾（w_text_clip）——此前
+ * 只管把 x 往右推，段数多/文案长（长语言）时尾段会被推出屏幕、整段看不见。 */
 void w_page_footer_segs(const HintSeg *segs, int n)
 {
     HintSeg s[HINT_SEG_MAX];
-    int i, j, m = 0;
+    int i, j, m = 0, total = 0, gap = HINT_GAP;
     if (n > HINT_SEG_MAX) n = HINT_SEG_MAX;
     for (i = 0; i < n; i++) {                /* 插入排序：段数很少，够用且稳定 */
         j = m++;
@@ -188,14 +203,26 @@ void w_page_footer_segs(const HintSeg *segs, int n)
     Rect f = { 0, SCR_H - FOOTER_H, SCR_W, FOOTER_H };
     w_rect(f, theme->bg);
     w_rect((Rect){ 0, f.y, SCR_W, 2 }, theme->border);
-    int x = 28;
+    /* 先量总宽（段宽 = 图标宽 + 文字宽）：装不下就先把段间距压到最小，仍装不下由
+     * 下面的绘制循环裁尾兜底。 */
+    for (i = 0; i < m; i++) {
+        int tw = 0;
+        if (s[i].text && s[i].text[0]) w_text_w(1.0f, s[i].text, &tw, NULL);
+        total += seg_icon_w(&s[i]) + tw;
+    }
+    if (HINT_MARGIN * 2 + total + HINT_GAP * (m > 0 ? m - 1 : 0) > SCR_W)
+        gap = HINT_GAP_MIN;
+
+    int x = HINT_MARGIN;
     /* 图标中心对准文字的字形视觉中线：1.0 号字 20px、升部 0.81em，文字顶在
      * y+12（= f.y+12）→ 基线 f.y+28.2，满格字形视觉中心 ≈ f.y+20.1
      * （拉丁大写略低约 1px，取 20 折中）。 */
     int cy = f.y + 20;
     for (i = 0; i < m; i++) {
         HintIcon ic = icon_of(s[i].key);
-        int adv = 0;
+        int adv = seg_icon_w(&s[i]);
+        int room = SCR_W - HINT_MARGIN - x;   /* 本段可用宽（图标 + 文字） */
+        if (room < adv) break;                /* 连图标都放不下：本段及之后不画 */
         /* dim 段：图标/文字都用 border 灰，表示该动作当前不可用 */
         uint32_t ic_c = s[i].dim ? theme->border : theme->text;
         uint32_t tx_c = s[i].dim ? theme->border : theme->text_dim;
@@ -207,24 +234,28 @@ void w_page_footer_segs(const HintSeg *segs, int n)
                 HintIcon t = ic; ic = ic2; ic2 = t;
             }
             w_icon(ic, x + 11, cy, ic_c, s[i].dir_off);
-            adv = 26;
             if (ic2 != HICON_NONE) {
                 /* 第二个键：与第一个隔开，中间一个小号暗淡的 "/" 表示"或" */
                 int sw = 0;
                 w_text_w(0.9f, "/", &sw, NULL);
                 w_icon(ic2, x + 42, cy, ic_c, s[i].dir_off);
                 w_text(x + 26 - sw / 2, f.y + 12, 0.9f, tx_c, "/");
-                adv = 57;
             }
         }
         if (s[i].text && s[i].text[0]) {
-            int tw = 0, th = 0;
+            int tw = 0, th = 0, avail = room - adv;
             w_text_w(1.0f, s[i].text, &tw, &th);
-            w_text(x + adv, f.y + 12, 1.0f, tx_c, "%s", s[i].text);
-            x += adv + tw;
+            if (tw > avail) {                 /* 超出右边界：裁尾，宁可少几个字也不出屏 */
+                if (avail > 0)
+                    w_text_clip(x + adv, f.y + 12, 1.0f, tx_c, s[i].text, avail);
+                x += room;
+            } else {
+                w_text(x + adv, f.y + 12, 1.0f, tx_c, "%s", s[i].text);
+                x += adv + tw;
+            }
         } else {
             x += adv;
         }
-        x += 24;   /* 段间距 */
+        x += gap;
     }
 }
