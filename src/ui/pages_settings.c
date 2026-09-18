@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <vita2d.h>
+#include <psp2/kernel/processmgr.h>   /* sceKernelGetSystemTimeWide：面板滑入动画计时 */
 #include "ui/ui.h"
 #include "ui/pages_internal.h"
 #include "ui/theme.h"
@@ -16,7 +17,9 @@
  * 设置页行 = 分组标题(不可选) + 设置项。整页像素滚动（模型同设备/文件列表）：
  * 可视区 LIST_TOP..LIST_BOTTOM，内容总高超出时拖动跟手、方向键自动滚到选中项。
  * g_app.set_sel 存设置项 id（SET_ITEM_*）；分组标题不参与选择。
- * 每行触摸分成两半：左半=上一档，右半=下一档（主机名行点任意半开键盘改名）。 */
+ * 值行（主题/外观/语言/确认键/布局/并发数/自动检查）：点整行或焦点行按确认 → 右侧
+ * 滑出选项面板，面板内 ↑↓ 移光标、确认=应用并落盘、✗/点面板外=取消（见下方抽屉一节）。
+ * 动作行（主机名/保存目录/主色/检查更新）：点行/确认即执行，无档位。 */
 enum {
     SET_ITEM_THEME = 0,    /* 显示：主题（色系：Yaru / OLED / Custom） */
     SET_ITEM_LIGHT,        /* 显示：外观（明暗：深色 / 浅色；OLED 固定深色，不可改） */
@@ -32,7 +35,7 @@ enum {
     SET_ITEM_N
 };
 
-/* 渲染行槽（顺序即页面顺序）：HDR=分组标题 ITEM=设置项 HINT=提示行 */
+/* 渲染行槽（顺序即页面顺序）：HDR=分组标题 ITEM=设置项 */
 enum {
     SET_SLOT_HDR_A = 0,    /* 分组：设备 */
     SET_SLOT_HOST,
@@ -45,7 +48,6 @@ enum {
     SET_SLOT_KEY,
     SET_SLOT_PANE,
     SET_SLOT_PARALLEL,
-    SET_SLOT_HINT,
     SET_SLOT_HDR_ST,       /* 分组：存储 */
     SET_SLOT_SAVEDIR,
     SET_SLOT_HDR_UPD,      /* 分组：更新 */
@@ -59,12 +61,31 @@ enum {
 };
 #define SET_HDR_H   44        /* 分组标题行高（含上方留白） */
 #define SET_ROW_H   60        /* 设置项行步进（视觉行 56） */
-#define SET_HINT_H  30        /* 结尾提示行高 */
 #define SET_LOGO_H  60        /* 关于组 logo 行（大字，底部再留白） */
 #define SET_ADAPT_H 40        /* 关于组适配说明行 */
 
+/* ---------- 值行选项面板（抽屉式改值）----------
+ * 值行不再"点左右半屏 / 确认键循环"，而是点行（或焦点行按确认）从右侧滑出选项面板：
+ * 面板内 ↑↓ 移光标、确认 = 应用并落盘（面板留着好连着试）、✗ 或点面板外 = 取消。
+ * 动作行不受影响。 */
+#define SET_PANEL_W     320     /* 面板展开宽度 */
+#define SET_PANEL_X     616     /* 展开后左边界（= SCR_W - 24 - SET_PANEL_W） */
+#define SET_PANEL_R     936     /* 右边界（= SCR_W - 24） */
+#define SET_PANEL_SHRINK 336    /* 列表行收窄量（912 → 576） */
+#define SET_PANEL_MS    150     /* 滑入/滑出时长（毫秒） */
+#define SET_OPT_MAX     8       /* 面板档位上限（实际最多 6：语言 / 并发数） */
+#define SET_OPT_H       45      /* 面板选项行步进（视觉行 41） */
+#define WID_SET_OPT(i)  (0x4000 + (i))   /* 面板选项 i 的触摸 id */
+#define WID_SET_PANEL_BG    0x4100       /* 面板空白处：命中即吞掉，不关面板 */
+#define WID_SET_PANEL_CLOSE 0x4101       /* 面板右上 ✗：取消并关 */
+
 static int set_scroll = 0;        /* 设置页内容偏移 */
 static int set_press_scroll = 0;
+static int set_drawer_item = -1;  /* 面板正在编辑的值行 item（-1 = 没开面板） */
+static int set_drawer_vis  = -1;  /* 渲染用：滑出过程中仍要画内容，收起到底才清 */
+static int set_drawer_cur  = 0;   /* 面板内光标档位 */
+static int set_drawer_w    = 0;   /* 面板当前宽度（动画量，0..SET_PANEL_W） */
+static uint64_t set_drawer_t = 0; /* 上次动画步进时刻（微秒） */
 
 /* 进设置页：焦点落在第一个设置项（主机名），滚动回顶部。
  * 不能直接置 set_sel = 0——枚举值 0 是 SET_ITEM_THEME，而页面从上到下的第一项
@@ -74,6 +95,11 @@ void settings_open(void)
     g_app.set_sel = SET_ITEM_HOSTNAME;
     set_scroll = 0;
     set_press_scroll = 0;
+    set_drawer_item = -1;      /* 选项面板：关着进页面（宽度直接归零，不做滑出） */
+    set_drawer_vis  = -1;
+    set_drawer_cur  = 0;
+    set_drawer_w    = 0;
+    set_drawer_t    = 0;
 }
 
 static int slot_item(int slot)
@@ -123,7 +149,6 @@ static bool slot_visible(int slot)
 static int set_row_h(int slot)
 {
     if (!slot_visible(slot))     return 0;
-    if (slot == SET_SLOT_HINT)   return SET_HINT_H;
     if (slot == SET_SLOT_ABOUT_A) return SET_LOGO_H;
     if (slot == SET_SLOT_ABOUT_B) return SET_ADAPT_H;
     if (slot == SET_SLOT_ABOUT_C) return SET_ADAPT_H;
@@ -176,65 +201,282 @@ static void set_keep_visible(void)
     set_clamp_scroll();
 }
 
-/* 改设置项并落盘：主题/语言循环切换、键位翻转；dir=±1 上一档/下一档 */
-static void settings_change(int item, int dir)
+/* ---------- 值行档位：4 个原语 ----------
+ * 面板的光标定位 / 选项文案 / 应用都经这里。业务逻辑照搬原 settings_change 的
+ * 对应分支，只是把"±1 首尾循环"换成"直接置到第 idx 档"。 */
+
+/* 自动检查频率的档位名（面板选项与行右值共用一份） */
+static const char *set_upd_mode[] = { "Off", "Daily", "Weekly", "Monthly" };
+
+/* 档位数：动作行（主机名/保存目录/主色/检查更新）没有档位 → 0；
+ * OLED 下"外观"固定深色、无浅色变体 → 同样按 0 处理（面板开不出来）。 */
+static int set_opt_count(int item)
 {
-    if (item == SET_ITEM_THEME) {
-        g_app.theme_id += dir;
-        if (g_app.theme_id < 0) g_app.theme_id = THEME_COUNT - 1;
-        if (g_app.theme_id >= THEME_COUNT) g_app.theme_id = 0;
-        g_cfg.theme_id = g_app.theme_id;
+    switch (item) {
+    case SET_ITEM_THEME:    return THEME_COUNT;
+    case SET_ITEM_LIGHT:    return g_app.theme_id == THEME_OLED ? 0 : 2;
+    case SET_ITEM_LANG:     return I18N_LANG_COUNT;
+    case SET_ITEM_KEY:      return 2;
+    case SET_ITEM_PANE:     return 2;
+    case SET_ITEM_PARALLEL: return PARALLEL_MAX - PARALLEL_MIN + 1;
+    case SET_ITEM_AUTO:     return 4;
+    }
+    return 0;
+}
+
+/* 第 idx 档的显示文案（与行右值同一套说法） */
+static void set_opt_name(int item, int idx, char *buf, int n)
+{
+    switch (item) {
+    case SET_ITEM_THEME:
+        snprintf(buf, n, "%s", tr(theme_names[idx]));
+        break;
+    case SET_ITEM_LIGHT:
+        snprintf(buf, n, "%s", tr(idx ? "Light" : "Dark"));
+        break;
+    case SET_ITEM_LANG:
+        snprintf(buf, n, "%s", i18n_lang_name(idx));
+        break;
+    case SET_ITEM_KEY:
+        /* 档位名写全，与行右值同一口径：0 = 美式（X 确认 / O 返回） */
+        snprintf(buf, n, tr("%s confirm / %s back (%s)"),
+                 idx ? "O" : "X", idx ? "X" : "O", idx ? "JP" : "US");
+        break;
+    case SET_ITEM_PANE:
+        snprintf(buf, n, "%s", tr(idx ? "Files left" : "Devices left"));
+        break;
+    case SET_ITEM_PARALLEL:
+        snprintf(buf, n, "%d", PARALLEL_MIN + idx);
+        break;
+    case SET_ITEM_AUTO:
+        snprintf(buf, n, "%s", tr(set_upd_mode[idx]));
+        break;
+    default:
+        if (n > 0) buf[0] = 0;
+        break;
+    }
+}
+
+/* 当前档下标 */
+static int set_opt_cur(int item)
+{
+    switch (item) {
+    case SET_ITEM_THEME:    return g_cfg.theme_id;
+    case SET_ITEM_LIGHT:    return g_app.light_mode ? 1 : 0;
+    case SET_ITEM_LANG:     return i18n_lang_pref();
+    case SET_ITEM_KEY:      return g_app.confirm_layout ? 1 : 0;
+    case SET_ITEM_PANE:     return g_app.pane_swap ? 1 : 0;
+    case SET_ITEM_PARALLEL: return g_cfg.max_parallel - PARALLEL_MIN;
+    case SET_ITEM_AUTO:     return g_cfg.upd_auto;
+    }
+    return 0;
+}
+
+/* 落到第 idx 档：写 g_cfg/g_app + 立即生效 + 落盘 */
+static void set_opt_apply(int item, int idx)
+{
+    switch (item) {
+    case SET_ITEM_THEME:
+        g_app.theme_id = idx;
+        g_cfg.theme_id = idx;
         theme_set(g_app.theme_id, g_app.light_mode);
         config_save();
         /* 切离 Custom 后色盘行隐藏：焦点若正落在它上面，退回主题行 */
         if (g_app.theme_id != THEME_CUSTOM && g_app.set_sel == SET_ITEM_COLOR)
             g_app.set_sel = SET_ITEM_THEME;
-    } else if (item == SET_ITEM_LIGHT) {
-        /* 明暗（与色系正交）：OLED 固定深色，无浅色变体 → 该项对它不响应 */
-        if (g_app.theme_id == THEME_OLED) return;
-        g_app.light_mode = g_app.light_mode ? THEME_DARK : THEME_LIGHT;
+        break;
+    case SET_ITEM_LIGHT:
+        g_app.light_mode = idx ? THEME_LIGHT : THEME_DARK;
         g_cfg.light_mode = g_app.light_mode;
         theme_set(g_app.theme_id, g_app.light_mode);
         config_save();
-    } else if (item == SET_ITEM_LANG) {
-        int p = i18n_lang_pref() + dir;
-        if (p < I18N_LANG_AUTO) p = I18N_LANG_COUNT - 1;   /* 语言项首尾循环 */
-        if (p >= I18N_LANG_COUNT) p = I18N_LANG_AUTO;
-        i18n_set_lang(p);          /* 写 cfg + 存盘 + 重解析：立即生效 */
-    } else if (item == SET_ITEM_KEY) {
-        g_app.confirm_layout = g_app.confirm_layout ? 0 : 1;
-        g_cfg.confirm_layout = g_app.confirm_layout;
+        break;
+    case SET_ITEM_LANG:
+        i18n_set_lang(idx);            /* 写 cfg + 存盘 + 重解析：立即生效 */
+        break;
+    case SET_ITEM_KEY:
+        g_app.confirm_layout = idx;
+        g_cfg.confirm_layout = idx;
         config_save();
-    } else if (item == SET_ITEM_PANE) {
-        g_app.pane_swap = g_app.pane_swap ? 0 : 1;   /* 立即生效：主页下次渲染即换边 */
-        g_cfg.pane_swap = g_app.pane_swap;
+        break;
+    case SET_ITEM_PANE:
+        g_app.pane_swap = idx;         /* 立即生效：主页下次渲染即换边 */
+        g_cfg.pane_swap = idx;
         config_save();
-    } else if (item == SET_ITEM_PARALLEL) {
-        /* 并发上传数：1..6 首尾循环。1 = 逐文件串行；只影响"下一次"发送——正在
-         * 跑的那次传输已在启动时定好了 worker 数（xfer_thr 读的是一份值）。 */
-        int v = g_cfg.max_parallel + dir;
-        if (v < PARALLEL_MIN) v = PARALLEL_MAX;
-        if (v > PARALLEL_MAX) v = PARALLEL_MIN;
-        config_set_max_parallel(v);    /* 锁内写入并落盘：发送线程读该项 */
-    } else if (item == SET_ITEM_CHECK) {
-        update_check_now();      /* 动作行：左右/确认/点任意半都触发检查（dir 无意义） */
-    } else if (item == SET_ITEM_AUTO) {
-        int v = g_cfg.upd_auto + dir;
-        if (v < 0) v = 3;
-        if (v > 3) v = 0;
-        config_set_upd_auto(v);    /* 锁内写入并落盘：更新线程会读该项 */
+        break;
+    case SET_ITEM_PARALLEL:
+        /* 1 = 逐文件串行；只影响"下一次"发送——正在跑的那次传输已在启动时定好
+         * worker 数（xfer_thr 读的是一份值）。 */
+        config_set_max_parallel(PARALLEL_MIN + idx);
+        break;
+    case SET_ITEM_AUTO:
+        config_set_upd_auto(idx);
+        break;
     }
-    /* SET_ITEM_HOSTNAME：动作在 input 里走 ask_ime_host（系统键盘），不落档位循环 */
+}
+
+/* ---------- 选项面板：开 / 关 / 应用 / 动画 ---------- */
+
+/* 开面板：光标落在当前档（配置越界则归 0） */
+static void set_drawer_open(int item)
+{
+    int n = set_opt_count(item), c = set_opt_cur(item);
+    if (n <= 0) return;                /* 动作行 / OLED 外观行：没有面板可开 */
+    if (c < 0 || c >= n) c = 0;
+    set_drawer_item = item;
+    set_drawer_vis  = item;
+    set_drawer_cur  = c;
+    set_drawer_t    = 0;               /* 下一帧从"此刻"重新计时 */
+}
+
+/* 关面板（不应用）：宽度交给动画收，内容等收到底再清（见 set_drawer_step） */
+static void set_drawer_close(void)
+{
+    set_drawer_item = -1;
+    set_drawer_t = 0;
+}
+
+/* 面板内确认/点选项：应用该档。**面板不收起**——档位效果（主题配色、语言、
+ * 布局……）往往是"试出来"的，收起来就得重新点行开面板，所以留在这里好连着试；
+ * 关面板只走 ✗ / 点面板外（关且不应用，见 input）。 */
+static void set_drawer_apply(int idx)
+{
+    int item = set_drawer_item;
+    if (item >= 0 && idx >= 0 && idx < set_opt_count(item)) {
+        set_opt_apply(item, idx);
+        set_drawer_cur = idx;          /* 光标跟到刚应用的档 */
+    }
+}
+
+/* 宽度动画：向目标宽度（开 = SET_PANEL_W / 关 = 0）靠拢，SET_PANEL_MS 走完。
+ * 按真实时间步进（帧率波动时快慢一致），每帧至少走 1px 保证必定收敛。 */
+static void set_drawer_step(void)
+{
+    int target = set_drawer_item >= 0 ? SET_PANEL_W : 0;
+    uint64_t now = (uint64_t)sceKernelGetSystemTimeWide();
+    int step;
+
+    if (set_drawer_w == target) {
+        set_drawer_t = now;
+        if (target == 0) set_drawer_vis = -1;   /* 收到底：内容可以清了 */
+        return;
+    }
+    if (!set_drawer_t) set_drawer_t = now;
+    step = (int)((now - set_drawer_t) * SET_PANEL_W / ((uint64_t)SET_PANEL_MS * 1000));
+    if (step < 1) step = 1;
+    set_drawer_t = now;
+    if (set_drawer_w < target) {
+        set_drawer_w += step;
+        if (set_drawer_w > target) set_drawer_w = target;
+    } else {
+        set_drawer_w -= step;
+        if (set_drawer_w < 0) set_drawer_w = 0;
+    }
+}
+
+/* 面板头文案 = 该设置项的行名（复用页面里同一个 i18n key，不新增词条） */
+static const char *set_item_title(int item)
+{
+    switch (item) {
+    case SET_ITEM_THEME:    return tr("Theme");
+    case SET_ITEM_LIGHT:    return tr("Appearance");
+    case SET_ITEM_LANG:     return tr("Language");
+    case SET_ITEM_KEY:      return tr("Confirm key");
+    case SET_ITEM_PANE:     return tr("Layout");
+    case SET_ITEM_PARALLEL: return tr("Parallel uploads");
+    case SET_ITEM_AUTO:     return tr("Auto check");
+    }
+    return "";
+}
+
+/* 把面板内的命中区裁到"已滑进来"的部分（= 卡片可见区）：滑入动画中途，卡片还没
+ * 盖到的地方若也注册，会在看不见的位置点掉一个档位。返回 false = 整块还没露出来。
+ * 口径同列表行命中的可视区裁剪。 */
+static bool set_panel_hit(Rect r, Rect card, Rect *out)
+{
+    if (r.x < card.x) { r.w -= card.x - r.x; r.x = card.x; }
+    if (r.x + r.w > card.x + card.w) r.w = card.x + card.w - r.x;
+    if (r.w <= 0 || r.h <= 0) return false;
+    *out = r;
+    return true;
+}
+
+/* 面板：右侧贴边卡片，宽度随动画。内容按"展开态"坐标画，再用裁剪矩形把还没滑
+ * 进来的部分挡掉——效果是内容从中线向左拉开露出，文字不会在动画中途被压扁或溢出
+ * 卡片。只用 w_rect / w_text（本项目的 vita2d_draw_array 会 GPU fault 整机重启）。 */
+static void set_drawer_draw(void)
+{
+    int item = set_drawer_vis, n, i, oy;
+    Rect card, vis, close_hit;
+
+    if (item < 0 || set_drawer_w <= 0) return;
+    n = set_opt_count(item);
+    card = (Rect){ SCR_W - 24 - set_drawer_w, LIST_TOP, set_drawer_w, LIST_VIEW_H };
+    w_rect(card, theme->card);
+    w_rect_outline(card, theme->border);
+    w_add(WID_SET_PANEL_BG, card);          /* 面板空白处：命中即吞掉（不关面板） */
+    if (set_drawer_w < 24) return;          /* 太窄：内容画了也看不见 */
+
+    vita2d_enable_clipping();
+    vita2d_set_clip_rectangle(card.x, LIST_TOP, card.x + card.w, LIST_BOTTOM);
+
+    /* 面板头：行名 + 右上 ✗（等同一个"取消并关"）。
+     * w_text 的 y 是"字形顶"（基线 = y + 0.88*字号），1.0 号字视觉中线在 y+9：
+     * 取 LIST_TOP+19 让标题与 ✗（中心 LIST_TOP+28）落在同一条视觉中线上。 */
+    w_text(SET_PANEL_X + 16, LIST_TOP + 19, 1.0f, theme->text_dim, "%s",
+           set_item_title(item));
+    w_icon_cross((float)(SET_PANEL_R - 28), (float)(LIST_TOP + 28), 8.0f,
+                 theme->text_dim);
+    close_hit = (Rect){ SET_PANEL_R - 52, LIST_TOP + 6, 48, 44 };
+    if (set_panel_hit(close_hit, card, &vis)) w_add(WID_SET_PANEL_CLOSE, vis);
+    w_rect((Rect){ SET_PANEL_X + 16, LIST_TOP + 54, SET_PANEL_R - SET_PANEL_X - 32, 2 },
+           theme->border);
+
+    /* 选项：顶对齐（不做"对齐到该行 y"那种夹取）；当前档 = 左竖条 + 主色描边
+     * + 主色文字 + 右端 ✓。最多 6 档（语言 / 并发数），列表区放得下，不滚动。 */
+    oy = LIST_TOP + 62;
+    for (i = 0; i < n && i < SET_OPT_MAX; i++) {
+        Rect orr = { SET_PANEL_X + 8, oy, SET_PANEL_R - SET_PANEL_X - 16, SET_OPT_H - 4 };
+        char buf[96];
+        bool sel = (i == set_drawer_cur);
+        int th = 0;
+        if (oy + SET_OPT_H > LIST_BOTTOM) break;
+        set_opt_name(item, i, buf, sizeof buf);
+        w_text_w(1.0f, buf, NULL, &th);
+        if (sel) {
+            w_rect((Rect){ orr.x, orr.y, 3, orr.h }, theme->accent);
+            w_rect_outline(orr, theme->accent);
+            w_icon_check((float)(SET_PANEL_R - 30), (float)(orr.y + orr.h / 2),
+                         8.0f, theme->accent);
+        }
+        w_text_clip(orr.x + 16, orr.y + (orr.h - th) / 2, 1.0f,
+                    sel ? theme->accent : theme->text, buf, orr.w - 16 - 30);
+        if (set_panel_hit(orr, card, &vis)) w_add(WID_SET_OPT(i), vis);
+        oy += SET_OPT_H;
+    }
+    vita2d_disable_clipping();
+}
+
+/* 列表态：点行 / 焦点行按确认 —— 动作行直接执行，值行开选项面板 */
+static void set_row_activate(int item)
+{
+    if (item == SET_ITEM_HOSTNAME)     ask_ime_host();
+    else if (item == SET_ITEM_SAVEDIR) open_dir_pick(PAGE_SETTINGS, true, g_cfg.save_dir);
+    else if (item == SET_ITEM_COLOR)   open_color_pick();
+    else if (item == SET_ITEM_CHECK)   update_check_now();
+    else                               set_drawer_open(item);
 }
 
 void page_settings_render(void)
 {
-    static const char *upd_mode_en[] = { "Off", "Daily", "Weekly", "Monthly" };
     char theme_v[64], light_v[32], layout_v[96], lang_v[32], pane_v[32];
     char par_v[32];
     char upd_v[64];
     int upd_st = update_state();
-    int slot;
+    int slot, shrink;
+
+    set_drawer_step();                 /* 面板宽度动画（打开/收起都走这里） */
+    shrink = set_drawer_w * SET_PANEL_SHRINK / SET_PANEL_W;
 
     w_page_header(tr("Settings"));
     set_clamp_scroll();
@@ -276,7 +518,7 @@ void page_settings_render(void)
         if (top + h <= LIST_TOP) continue;      /* 整行滚到可视区上方外 */
         if (top >= LIST_BOTTOM) break;          /* 以下都滚到可视区下方外 */
         if (item < 0) {
-            /* 分组标题 / 提示行 / 关于区（只读，不注册触摸） */
+            /* 分组标题 / 关于区（只读，不注册触摸） */
             const char *txt = NULL;
             switch (slot) {
             case SET_SLOT_HDR_A: txt = tr("Device"); break;
@@ -289,9 +531,6 @@ void page_settings_render(void)
             }
             if (txt)
                 w_text(28, top + 12, 1.05f, theme->text_dim, "%s", txt);
-            if (slot == SET_SLOT_HINT)
-                w_text(28, top + 6, 0.9f, theme->text_dim, "%s",
-                       tr("Tap row halves to change"));
             if (slot == SET_SLOT_ABOUT_A) {
                 /* 文字 logo：PSVSend 主色大字 + 右侧版本号 */
                 int lw = 0, lh = 0;
@@ -308,19 +547,17 @@ void page_settings_render(void)
                        "github.com/LinuxMint-User/PSVSend");
             continue;
         }
-        Rect r = { 24, top, SCR_W - 48, SET_ROW_H - 4 };
+        /* 行宽随面板动画收窄（912 → 576）：面板展开时右侧让出空间给选项面板 */
+        Rect r = { 24, top, SCR_W - 48 - shrink, SET_ROW_H - 4 };
         /* 命中区按可视区裁剪后再注册：绘制有 clip 矩形管着，触摸命中没有——
          * 滚到页头/页脚方向半露出的行，其矩形会伸进页头空白带与页脚，点那里
-         * 会误触到该行（设置页表现为翻主题/开键盘）。口径同 add_row_hit。 */
+         * 会误触到该行（设置页表现为开面板/开键盘）。口径同 add_row_hit。
+         * 值行整行一个热区（点行 = 开选项面板），不再切左右两半。 */
         {
             Rect hit = r;
             if (hit.y < LIST_TOP) { hit.h -= LIST_TOP - hit.y; hit.y = LIST_TOP; }
             if (hit.y + hit.h > LIST_BOTTOM) hit.h = LIST_BOTTOM - hit.y;
-            if (hit.h > 0) {
-                w_add(item * 2,     (Rect){ hit.x, hit.y, hit.w / 2, hit.h });
-                w_add(item * 2 + 1, (Rect){ hit.x + hit.w / 2, hit.y,
-                                            hit.w - hit.w / 2, hit.h });
-            }
+            if (hit.h > 0) w_add(item * 2, hit);
         }
         switch (item) {
         case SET_ITEM_HOSTNAME:
@@ -384,15 +621,16 @@ void page_settings_render(void)
                 w_row(r, tr("Check for updates"), upd_v, item == g_app.set_sel);
             break;
         case SET_ITEM_AUTO:
-            w_row(r, tr("Auto check"), tr(upd_mode_en[g_cfg.upd_auto]),
+            w_row(r, tr("Auto check"), tr(set_upd_mode[g_cfg.upd_auto]),
                   item == g_app.set_sel);
             break;
         }
     }
     vita2d_disable_clipping();
 
-    /* 内容超长时的右侧细滚动条（后续设置项多了自动出现） */
-    {
+    /* 内容超长时的右侧细滚动条（后续设置项多了自动出现）。
+     * 面板展开期间隐藏：滚动已冻结（拖动进不来），画家了也没意义，还会和面板叠边。 */
+    if (set_drawer_item < 0) {
         int m = set_content_h() - LIST_VIEW_H;
         if (m > 0) {
             int bh = LIST_VIEW_H * LIST_VIEW_H / set_content_h();
@@ -403,32 +641,67 @@ void page_settings_render(void)
         }
     }
 
+    set_drawer_draw();           /* 值行选项面板（画在列表之上） */
+
     HintSeg segs[6] = { 0 };
     int ns = 0;
-    /* 上下移动选中项：哪一头按不动就把方向键那一臂画灰（列表到顶/到底）。
-     * 焦点在"确认键布局"项时，上下选择照旧，只是"改值"那一段从确认键换成左右方向键。 */
-    uint8_t off = HDIR_HORZ;
-    int sl = item_slot(g_app.set_sel);
-    if (sl < 0 || slot_step(sl, -1) == sl) off |= HDIR_UP;
-    if (sl < 0 || slot_step(sl, 1) == sl)  off |= HDIR_DOWN;
-    segs[ns].key = HKEY_DPAD;        segs[ns].dir_off = off;
-    segs[ns++].text = tr("Choose");
-    if (g_app.set_sel == SET_ITEM_KEY) {
-        segs[ns].key = HKEY_DPAD;    segs[ns].dir_off = HDIR_VERT;
-        segs[ns++].text = tr("Switch");
+    if (set_drawer_item >= 0) {
+        /* 面板态：↑↓ 移光标（顶/底那一头画灰）、确认 = 选定、✗ = 取消并关。
+         * 文案与列表态不同——确认键段必须跟随"当前动作"，不能写死。 */
+        int n = set_opt_count(set_drawer_item);
+        uint8_t off = HDIR_HORZ;
+        if (set_drawer_cur <= 0)     off |= HDIR_UP;
+        if (set_drawer_cur >= n - 1) off |= HDIR_DOWN;
+        segs[ns].key = HKEY_DPAD;    segs[ns].dir_off = off;
+        segs[ns++].text = tr("Choose");
+        segs[ns].key = HKEY_CONFIRM; segs[ns++].text = tr("Select");
+        segs[ns].key = HKEY_BACK;    segs[ns++].text = tr("Back");
     } else {
+        /* 列表态：上下移动选中项（到顶/到底把那一臂画灰）；确认键 = 开选项面板
+         * （动作行 = 直接执行，沿用原来的"Change"），OLED 下"外观"行没有可选档位
+         * → 那一段画灰，与行值"深色（固定）"一致。 */
+        uint8_t off = HDIR_HORZ;
+        int it = g_app.set_sel;
+        bool act = (it == SET_ITEM_HOSTNAME || it == SET_ITEM_SAVEDIR ||
+                    it == SET_ITEM_COLOR || it == SET_ITEM_CHECK);
+        int sl = item_slot(it);
+        if (sl < 0 || slot_step(sl, -1) == sl) off |= HDIR_UP;
+        if (sl < 0 || slot_step(sl, 1) == sl)  off |= HDIR_DOWN;
+        segs[ns].key = HKEY_DPAD;        segs[ns].dir_off = off;
+        segs[ns++].text = tr("Choose");
         segs[ns].key = HKEY_CONFIRM;
-        /* OLED 下"外观"行不可改：确认键那一段画灰，与行值"深色（固定）"一致 */
-        segs[ns].dim = (g_app.set_sel == SET_ITEM_LIGHT &&
-                        g_app.theme_id == THEME_OLED);
-        segs[ns++].text = tr("Change");
+        /* 动作行点了就执行，不算"改值"；OLED 下的外观行没有档位可开 → 画灰 */
+        segs[ns].dim = !act && set_opt_count(it) <= 0;
+        segs[ns++].text = act ? tr("Change") : tr("Options");
+        segs[ns].key = HKEY_BACK;        segs[ns++].text = tr("Back");
     }
-    segs[ns].key = HKEY_BACK;        segs[ns++].text = tr("Back");
     w_page_footer_segs(segs, ns);
 }
 
 void page_settings_input(const Input *in)
 {
+    /* 面板态：拖动滚动冻结、列表焦点不动，其余按键一律吞掉，只认面板内的动作 */
+    if (set_drawer_item >= 0) {
+        if (in->tap) {
+            int id = w_hit(in->tap_x, in->tap_y);
+            if (id >= WID_SET_OPT(0) && id < WID_SET_OPT(SET_OPT_MAX))
+                set_drawer_apply(id - WID_SET_OPT(0));   /* 点选项 = 应用（面板留着） */
+            else if (id != WID_SET_PANEL_BG)
+                set_drawer_close();   /* 右上 ✗ 或点面板外：关，不应用 */
+            return;
+        }
+        if (in->up || in->down) {
+            int n = set_opt_count(set_drawer_item);
+            int c = set_drawer_cur + (in->down ? 1 : -1);
+            if (c < 0) c = 0;
+            if (c > n - 1) c = n - 1;
+            set_drawer_cur = c;
+            return;
+        }
+        if (in->confirm) { set_drawer_apply(set_drawer_cur); return; }
+        if (in->back)    { set_drawer_close(); return; }
+        return;
+    }
     if (in->drag_start || in->dragging) {
         int m = set_content_h() - LIST_VIEW_H;
         if (m < 0) m = 0;
@@ -442,14 +715,10 @@ void page_settings_input(const Input *in)
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id >= 0) {
-            int item = id / 2;
+            int item = id / 2;           /* 行 id 仍留 2 的步长，与面板 id 段不撞 */
             if (item >= 0 && item < SET_ITEM_N) {
                 g_app.set_sel = item;
-                if (item == SET_ITEM_HOSTNAME) ask_ime_host();
-                else if (item == SET_ITEM_SAVEDIR)
-                    open_dir_pick(PAGE_SETTINGS, true, g_cfg.save_dir);
-                else if (item == SET_ITEM_COLOR) open_color_pick();
-                else settings_change(item, (id & 1) ? 1 : -1);
+                set_row_activate(item);
             }
         }
         return;
@@ -460,20 +729,9 @@ void page_settings_input(const Input *in)
         g_app.set_sel = slot_item(slot);
         set_keep_visible();
     }
-    /* 一般项用确认键改值；"确认键布局"项是唯一的自指设置（改的就是确认键本身，
-     * 切完按键身份就换了，用确认键去切有认知负担），故只用左右方向键切换，
-     * 确认键对它不响应。触摸左右半边改值的方式保持不变。 */
-    if (g_app.set_sel == SET_ITEM_KEY && (in->left || in->right))
-        settings_change(SET_ITEM_KEY, in->right ? 1 : -1);
-    if (in->confirm) {
-        int item = g_app.set_sel;
-        if (item == SET_ITEM_HOSTNAME) ask_ime_host();
-        else if (item == SET_ITEM_SAVEDIR)
-            open_dir_pick(PAGE_SETTINGS, true, g_cfg.save_dir);
-        else if (item == SET_ITEM_COLOR) open_color_pick();
-        else if (item != SET_ITEM_KEY)
-            settings_change(item, 1);
-    }
+    /* 确认键：动作行直接执行，值行开选项面板（"确认键布局"项也照此——面板里只需
+     * 按一次就换身份，不再像以前那样专门给它开左右方向键）。 */
+    if (in->confirm) set_row_activate(g_app.set_sel);
     if (in->back) g_app.page = PAGE_DEVICES;
 }
 

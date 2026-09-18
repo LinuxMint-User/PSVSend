@@ -52,6 +52,13 @@ void w_icon_cross(float cx, float cy, float r, uint32_t c)
     thick_seg(cx - r, cy + r, cx + r, cy - r, c);
 }
 
+/* "✓"图标：以 (cx,cy) 为中心的两段折线（设置页选项面板标记当前档用） */
+void w_icon_check(float cx, float cy, float r, uint32_t c)
+{
+    thick_seg(cx - r * 0.9f, cy + r * 0.05f, cx - r * 0.2f, cy + r * 0.7f, c);
+    thick_seg(cx - r * 0.2f, cy + r * 0.7f, cx + r * 0.95f, cy - r * 0.75f, c);
+}
+
 static void w_icon(HintIcon ic, float cx, float cy, uint32_t c, uint8_t dir_off)
 {
     switch (ic) {

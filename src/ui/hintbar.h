@@ -58,4 +58,7 @@ void w_page_footer(const char *hint);
 /* 独立"✕"图标（列表行尾删除按钮，不用在提示条里） */
 void w_icon_cross(float cx, float cy, float r, uint32_t c);
 
+/* 独立"✓"图标（设置页选项面板标记当前档；与 w_icon_cross 同一套线宽口径） */
+void w_icon_check(float cx, float cy, float r, uint32_t c);
+
 #endif /* PSVSEND_UI_HINTBAR_H */
