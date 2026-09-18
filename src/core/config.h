@@ -15,6 +15,14 @@
 /* 历史发现的设备 IP 上限（跨启动"最近在线优先扫描"的持久化列表） */
 #define KNOWN_MAX         24
 
+/* 发送侧并发上传数（协议 §4.2 明确允许 upload 并行调用）。
+ * 上限 6 是为给接收侧 worker 池留余量：对端 HTTP_MAX_CONN = 8，6 路上传 + 1 路
+ * prepare / 取消通知仍不越界（详见 docs/TODO.md「并发上传的隐患」隐患 2）。
+ * 1 = 退回逐文件串行。 */
+#define PARALLEL_MIN      1
+#define PARALLEL_MAX      6
+#define PARALLEL_DEFAULT  3
+
 /* 客户端发布版本（运行时显示 / 设置页"关于"）。
  * 与 CMakeLists.txt 的 project(VERSION 2.2.0) 保持一致——升级版本号时
  * 两处一起改，SFO APP_VER 由 CMake 从 VERSION 派生，无需手改。 */
@@ -31,6 +39,7 @@ typedef struct {
     int  custom_v;           /* 自定义主色 HSV：明度 0-100 */
     int  confirm_layout;     /* 0=美式 1=日式 */
     int  pane_swap;          /* 发送主页两栏布局：0=设备在左 1=文件在左（照顾左撇子） */
+    int  max_parallel;       /* 发送侧并发上传数 PARALLEL_MIN..PARALLEL_MAX（默认 3） */
     int  lang;               /* 界面语言偏好：I18N_LANG_*（0=跟随系统，见 core/i18n.h） */
     int  known_n;            /* 历史设备 IP 条数（最近发现优先，作扫描种子） */
     char known_ips[KNOWN_MAX][16]; /* 历史设备 IP，最新在前 */
@@ -68,6 +77,7 @@ void config_get_save_dir(char *out, int n);
 void config_set_save_dir(const char *dir);
 void config_set_lang(int lang);                  /* 越界 → AUTO */
 void config_set_upd_auto(int v);                 /* 越界 → 每周 */
+void config_set_max_parallel(int v);             /* 越界 → 默认 3（发送线程读该项） */
 void config_set_upd_last(long long t);
 
 #endif

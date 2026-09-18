@@ -690,7 +690,14 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
                      + (SceLong64)HTTP_RECV_TIMEOUT_S * 1000000LL;
         int want = cl64 > 0 ? (int)(he + 4 + cl64) : HTTP_MAX_REQ - 1;
         int had = 0;
-        if (want > HTTP_MAX_REQ - 1) want = HTTP_MAX_REQ - 1;
+        if (want > HTTP_MAX_REQ - 1) {
+            /* 声明的 body 超出缓冲上限：正常客户端在非 upload 路由上不会发这么大
+             * 的请求，出现即说明对端异常（或 Content-Length 被读错）。截断后
+             * handler 多半报 400，这里点明真因，省得对着"400 bad request"倒查。 */
+            dlog("http: %s req body %lld > cap %d, truncated",
+                 route, (long long)cl64, HTTP_MAX_REQ - 1);
+            want = HTTP_MAX_REQ - 1;
+        }
         while (n < want) {
             SceLong64 lim;
             int r;

@@ -56,6 +56,7 @@ static void cfg_defaults(void)
     g_cfg.custom_v = 90;
     g_cfg.confirm_layout = 0;
     g_cfg.pane_swap = 0;               /* 主页两栏：默认设备在左 */
+    g_cfg.max_parallel = PARALLEL_DEFAULT;  /* 发送侧并发上传数：默认 3 */
     g_cfg.lang = 0;                    /* 语言偏好默认跟随系统 */
     g_cfg.known_n = 0;
     g_cfg.upd_auto = 2;                /* 自动检查更新：默认每周 */
@@ -104,6 +105,7 @@ void config_init(void)
             if (json_get_int(buf, "customV", &v)) g_cfg.custom_v = (int)v;
             if (json_get_int(buf, "confirmLayout", &v)) g_cfg.confirm_layout = (int)v;
             if (json_get_int(buf, "paneSwap", &v)) g_cfg.pane_swap = (int)v;
+            if (json_get_int(buf, "maxParallel", &v)) g_cfg.max_parallel = (int)v;
             if (json_get_int(buf, "lang", &v)) g_cfg.lang = (int)v;
             if (json_get_int(buf, "updateAuto", &v)) g_cfg.upd_auto = (int)v;
             if (json_get_int(buf, "updateLast", &v)) g_cfg.upd_last = v;
@@ -135,6 +137,8 @@ void config_init(void)
                                                sizeof g_cfg.fingerprint);
     if (g_cfg.port <= 0 || g_cfg.port > 65535) g_cfg.port = DEFAULT_PORT;
     if (g_cfg.pane_swap != 0 && g_cfg.pane_swap != 1) g_cfg.pane_swap = 0;
+    if (g_cfg.max_parallel < PARALLEL_MIN || g_cfg.max_parallel > PARALLEL_MAX)
+        g_cfg.max_parallel = PARALLEL_DEFAULT;
     if (g_cfg.custom_h < 0 || g_cfg.custom_h > 359) g_cfg.custom_h = 210;
     if (g_cfg.custom_s < 0 || g_cfg.custom_s > 100) g_cfg.custom_s = 65;
     if (g_cfg.custom_v < 0 || g_cfg.custom_v > 100) g_cfg.custom_v = 90;
@@ -193,6 +197,7 @@ static void config_write_locked(void)
                    "  \"customV\": %d,\n"
                    "  \"confirmLayout\": %d,\n"
                    "  \"paneSwap\": %d,\n"
+                   "  \"maxParallel\": %d,\n"
                    "  \"lang\": %d,\n"
                    "  \"updateAuto\": %d,\n"
                    "  \"updateLast\": %lld,\n"
@@ -201,7 +206,7 @@ static void config_write_locked(void)
                    "}\n",
                    a, f, g_cfg.port, g_cfg.theme_id, g_cfg.light_mode,
                    g_cfg.custom_h, g_cfg.custom_s, g_cfg.custom_v,
-                   g_cfg.confirm_layout, g_cfg.pane_swap,
+                   g_cfg.confirm_layout, g_cfg.pane_swap, g_cfg.max_parallel,
                    g_cfg.lang, g_cfg.upd_auto, g_cfg.upd_last, d, k);
     if (len < 0 || len >= (int)sizeof out) {
         dlog("cfg: json overflow (%d)", len);
@@ -306,6 +311,15 @@ void config_set_upd_auto(int v)
     cfg_lock();
     if (v < 0 || v > 3) v = 2;
     g_cfg.upd_auto = v;
+    config_write_locked();
+    cfg_unlock();
+}
+
+void config_set_max_parallel(int v)
+{
+    cfg_lock();
+    if (v < PARALLEL_MIN || v > PARALLEL_MAX) v = PARALLEL_DEFAULT;
+    g_cfg.max_parallel = v;
     config_write_locked();
     cfg_unlock();
 }

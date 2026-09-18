@@ -1,14 +1,22 @@
 /* transfer.c —— LocalSend v2 HTTP(S) 发送客户端（对应协议 §4 文件传输 HTTP）。
  * 真机事实：Vita SceNet 的 TCP connect/recv/send 在后台线程可用（http 服务器
- * 线程已验证），仅 UDP sendto 必须留在主循环。因此整段"prepare 等待 + 逐文件
- * 上传"跑在独立线程，UI 主线程只通过 xfer_info() 取快照渲染。
+ * 线程已验证），仅 UDP sendto 必须留在主循环。因此整段"prepare 等待 + 多文件
+ * 并发上传"跑在独立线程，UI 主线程只通过 xfer_info() 取快照渲染。
  * 收发超时模型与 http.c 一致：SceNet 无数据时 recv 立刻返回 EWOULDBLOCK
  * (0x80410123)，不能当错误，必须轮询到截止时间；取消通过每轮检查标志实现。
  *
  * HTTPS 目标（对方 announce protocol=https）：走 mbedTLS（工具链自带的 Vita
  * 移植），用对方 announce 的 fingerprint（协议规定 = 证书 SHA-256 hex）做
  * pin：握手验证回调里算叶子证书 DER 的 SHA-256，与指纹不匹配即拒绝。熵源
- * 由 Vita 弱随机(时间/指针/计数)顶替，LAN 场景够用。 */
+ * 由 Vita 弱随机(时间/指针/计数)顶替，LAN 场景够用。
+ *
+ * 并发模型（协议 §4.2 明确写了 This route can be called in parallel.）：
+ * 阶段 1 的 prepare-upload 只有一条连接，等接收方决定；阶段 2 由 N 个 worker
+ * 各开一条连接、各取一个文件上传（N = config 的 maxParallel，1..6，1 即退回
+ * 逐文件串行）。worker 只负责"置文件状态 / 记错"，终态（finished / ok /
+ * cancelled）一律由监督者 xfer_thr 在 join 完全部 worker 之后统一写一次——
+ * worker 若自己去写 finished，UI 会以为传输已结束并允许开新任务，而 g_j 会被
+ * 下一次 xfer_start memset 掉，正在收尾的 worker 就在读一份被清空的 Job。 */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -52,8 +60,12 @@
 
 typedef struct {
     XferInfo   v;
-    volatile int  cancel;
-    volatile int  notified;          /* cancel 通知已尝试（每任务一次，memset 清零） */
+    volatile int  cancel;            /* 用户取消（UI 线程置位） */
+    volatile int  abort;             /* 连接级失败 → 全局中止（对端不在） */
+    volatile int  notified;          /* cancel 通知已尝试（每任务一次，锁内 test-and-set） */
+    int        parallel;             /* 本次实际并发数（1=串行，决定状态行文案） */
+    int        next;                 /* 下一个待派发的文件下标（worker 锁内取号） */
+    char       abort_msg[160];       /* 首个连接级失败的原因（终态 err 用） */
     SceUID     th;
     char       ip[16];
     int        port;
@@ -81,19 +93,17 @@ static void set_msg(const char *fmt, ...)
     unlock();
 }
 
-/* 更新单文件进度；若正处理该文件则重算总进度 */
+/* 更新单文件进度，并把差值累加进总进度。
+ * 并发下没有"当前文件"可言（多个 worker 各更新自己那个文件的 sent），必须
+ * 每次更新即按增量累加；旧写法只在 i == v.cur 时整表重算，并发时 cur 只指
+ * 向其中一个 worker 的文件，其余文件的字节数永远不计入 → 总进度条不动。 */
 static void set_file_state(int i, int state, SceOff sent)
 {
     if (i < 0 || i >= g_j.count) return;
     lock();
+    g_j.v.total_sent += sent - g_j.v.f[i].sent;
     g_j.v.f[i].state = state;
     g_j.v.f[i].sent = sent;
-    if (i == g_j.v.cur) {
-        SceOff t = 0;
-        int k;
-        for (k = 0; k < g_j.count; k++) t += g_j.v.f[k].sent;
-        g_j.v.total_sent = t;
-    }
     unlock();
 }
 
@@ -131,23 +141,38 @@ static void mark_file_failed(int i, const char *fmt, ...)
 }
 
 /* 连接级失败（连不上 / TLS 握手失败 / 中途断流 / 等不到回执）：判"对端不在"，
- * 把本文件与所有还没成功的文件一起标失败并立刻收尾——否则剩下每个文件都要
- * 各等一遍连接/回执超时（几十个文件就是几分钟界面停摆）。HTTP 4xx/5xx 不是
- * 连接级，走单文件失败（mark_file_failed），继续发剩下的。 */
-static void abort_files_from(int i, const char *fmt, ...)
+ * 本 worker 置全局中止标志并把自己这个文件标失败——其余在途 worker 在下一个
+ * 检查点看到标志即收手，还没派发的文件由监督者在 join 完全部 worker 后统一
+ * 标失败。**收敛口径（2026-09-18 定案）：首个连接级失败立即全局中止**，而不是
+ * 让各 worker 各自等满 6s（连接）/30s（回执）——并发 6 路下后者是 ceil(N/6)
+ * 轮超时，几十个文件就是分钟级界面停摆；且对端真不在时，在途文件同样必然失败。
+ * HTTP 4xx/5xx 不是连接级，走单文件失败（mark_file_failed），继续发剩下的。 */
+static void abort_xfer(int i, const char *fmt, ...)
 {
     char tmp[160];
     va_list ap;
-    int k;
     va_start(ap, fmt);
     vsnprintf(tmp, sizeof tmp, fmt, ap);
     va_end(ap);
-    for (k = i; k < g_j.count; k++) {
-        if (g_j.v.f[k].state == 2) continue;      /* 已成功的不动 */
-        set_file_state(k, 3, g_j.v.f[k].sent);
+    lock();
+    if (!g_j.abort) {                 /* 原因取第一个报出来的那个 */
+        g_j.abort = 1;
+        snprintf(g_j.abort_msg, sizeof g_j.abort_msg, "%s", tmp);
     }
-    dlog("xfer: abort from file %d/%d: %s", i + 1, g_j.count, tmp);
-    fail("%s", tmp);
+    unlock();
+    mark_file_failed(i, "%s", tmp);
+    dlog("xfer: abort at file %d/%d: %s", i + 1, g_j.count, tmp);
+}
+
+/* worker 取号：返回下一个待发文件下标；-1 = 没活干了（发完 / 已取消 / 已中止） */
+static int next_file(void)
+{
+    int i;
+    lock();
+    if (g_j.cancel || g_j.abort || g_j.next >= g_j.count) i = -1;
+    else i = g_j.next++;
+    unlock();
+    return i;
 }
 
 /* 协议 v1 §3.3：cancel 由【发送方】在取消会话时调用，通知接收方清理与显示
@@ -172,6 +197,9 @@ static void finish_cancelled(void)
 typedef struct {
     int fd;
     int tls;                  /* 本连接是否走 TLS */
+    int ignore_flags;         /* 本连接不理会 cancel/abort 标志（只有 cancel 通知
+                               * 那条连接会置位：它的成败不该被它要通知的那件事
+                               * 本身的标志打断，见 cancel_notify_peer） */
     int  ssl_up;              /* mbedtls 上下文已初始化（收尾要释放） */
     mbedtls_ssl_context  ssl;
     mbedtls_ssl_config   conf;
@@ -268,13 +296,14 @@ static int vita_entropy_poll(void *arg, unsigned char *out, size_t len, size_t *
     return 0;
 }
 
-/* 发送 len 字节；返回 0=成功 -1=错误/超时 -2=已取消 */
+/* 发送 len 字节；返回 0=成功 -1=错误/超时 -2=已取消 -4=全局中止（对端不在） */
 static int conn_send_all(Conn *c, const char *data, int len)
 {
     int off = 0;
     SceLong64 dl = sceKernelGetSystemTimeWide() + CHUNK_DEADLINE_US;
     while (off < len) {
-        if (g_j.cancel) return -2;
+        if (!c->ignore_flags && g_j.cancel) return -2;
+        if (!c->ignore_flags && g_j.abort) return -4;   /* 别的 worker 已判"对端不在"：别再耗发送窗口 */
         if (sceKernelGetSystemTimeWide() >= dl) return -1;   /* 发送窗口堵死 */
         if (c->tls) {
             int r = mbedtls_ssl_write(&c->ssl, (const unsigned char *)data + off,
@@ -300,11 +329,13 @@ static int conn_send_all(Conn *c, const char *data, int len)
     return 0;
 }
 
-/* 收一次包（轮询到 dl 截止）：返回 >0 字节数；0=对方关闭；-1=错误/超时；-2=取消 */
+/* 收一次包（轮询到 dl 截止）：返回 >0 字节数；0=对方关闭；-1=错误/超时；
+ * -2=取消；-4=全局中止（对端不在，别的 worker 已判定） */
 static int conn_recv_poll(Conn *c, char *buf, int cap, SceLong64 dl)
 {
     for (;;) {
-        if (g_j.cancel) return -2;
+        if (!c->ignore_flags && g_j.cancel) return -2;
+        if (!c->ignore_flags && g_j.abort) return -4;
         if (sceKernelGetSystemTimeWide() >= dl) return -1;
         if (c->tls) {
             int r = mbedtls_ssl_read(&c->ssl, (unsigned char *)buf, (size_t)cap);
@@ -331,7 +362,8 @@ static int conn_recv_poll(Conn *c, char *buf, int cap, SceLong64 dl)
 }
 
 /* 读一个 HTTP 响应。返回 body 长度（body 在 buf 里头部之后，调用方的 JSON 解析
- * 器会自己跳过头部）；-1 = 读失败/超时/缓冲装不下；-2 = 用户取消。 */
+ * 器会自己跳过头部）；-1 = 读失败/超时/缓冲装不下；-2 = 用户取消；
+ * -4 = 全局中止（对端不在）。 */
 static int read_resp(Conn *c, int *code, char *buf, int cap, SceLong64 wait_us)
 {
     int n = 0, he = -1, cl = -1, body_off = 0, chunked = 0;
@@ -339,13 +371,14 @@ static int read_resp(Conn *c, int *code, char *buf, int cap, SceLong64 wait_us)
     *code = 0;
     for (;;) {
         int i, r;
-        if (g_j.cancel) return -2;
+        if (!c->ignore_flags && g_j.cancel) return -2;
+        if (!c->ignore_flags && g_j.abort) return -4;
         if (n >= cap - 1) {
             dlog("resp: reply does not fit in %d-byte buffer", cap);
             return -1;
         }
         r = conn_recv_poll(c, buf + n, cap - 1 - n, dl);
-        if (r == -2) return -2;
+        if (r == -2 || r == -4) return r;
         if (r <= 0) {
             dlog("resp: incomplete reply (%d byte(s) in, r=%d)", n, r);
             return -1;              /* 读错误 / 超时 / 对端提前关闭 */
@@ -418,7 +451,7 @@ static void conn_close(Conn *c)
     c->fd = -1;
 }
 
-/* TLS 握手（EWOULDBLOCK 轮询；期间可取消）；返回 0 成功 / -1 / -2 取消 */
+/* TLS 握手（EWOULDBLOCK 轮询；期间可取消）；返回 0 成功 / -1 / -2 取消 / -4 中止 */
 static int tls_handshake(Conn *c)
 {
     SceLong64 dl = sceKernelGetSystemTimeWide() + TLS_HANDSHAKE_US;
@@ -483,7 +516,8 @@ static int tls_handshake(Conn *c)
     r = mbedtls_ssl_set_hostname(&c->ssl, g_j.ip);
     if (r != 0) { dlog("xfer: set_hostname err -0x%04X", (unsigned)(-r)); return -1; }
     for (;;) {
-        if (g_j.cancel) return -2;
+        if (!c->ignore_flags && g_j.cancel) return -2;
+        if (!c->ignore_flags && g_j.abort) return -4;   /* 中止：别再耗 20s 握手上限 */
         if (sceKernelGetSystemTimeWide() >= dl) { dlog("xfer: tls handshake timeout"); return -1; }
         r = mbedtls_ssl_handshake(&c->ssl);
         if (r == 0) return 0;
@@ -500,7 +534,8 @@ static int tls_handshake(Conn *c)
 }
 
 /* 建立连接：TCP connect +（如需）TLS 握手 + 发 HTTP 头。
- * 返回 0 成功；-1 失败；-2 取消（连接已关闭）。 */
+ * 返回 0 成功；-1 失败；-2 取消；-3 TLS 握手/证书校验失败；-4 全局中止
+ * （对端不在，别的 worker 已判定——取消与中止都会自关连接再返回）。 */
 static int conn_open(Conn *c, const char *method_path, SceOff body_len)
 {
     SceNetSockaddrIn sa;
@@ -554,11 +589,16 @@ static int conn_open(Conn *c, const char *method_path, SceOff body_len)
             unsigned int sl = sizeof so;
             SceNetSockaddrIn p;
             unsigned int plen = sizeof p;
-            if (g_j.cancel) {
+            if (!c->ignore_flags && g_j.cancel) {
                 dlog("xfer: connect cancelled -> %s:%d", g_j.ip, g_j.port);
                 sceNetSocketClose(c->fd);
                 c->fd = -1;
                 return -2;
+            }
+            if (!c->ignore_flags && g_j.abort) {   /* 别的 worker 已判对端不在：别再等这 6s */
+                sceNetSocketClose(c->fd);
+                c->fd = -1;
+                return -4;
             }
             if (sceNetGetsockopt(c->fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_ERROR,
                                  &so, &sl) == 0 && so != 0) {
@@ -593,6 +633,10 @@ static int conn_open(Conn *c, const char *method_path, SceOff body_len)
             conn_close(c);
             return -2;
         }
+        if (r == -4) {
+            conn_close(c);
+            return -4;
+        }
         if (r != 0) {
             conn_close(c);
             return -3;                  /* TCP 已通但 TLS 握手/证书校验失败 */
@@ -613,8 +657,13 @@ static int conn_open(Conn *c, const char *method_path, SceOff body_len)
     return 0;
 }
 
-/* 尽力向接收方 POST cancel（声明见上）。通知期间临时清取消标志——取消已触发，
- * 但这条新连接的 send/recv 轮询不能再被 -2 打断；结束后恢复。 */
+/* 尽力向接收方 POST cancel（声明见上）。这条连接置 ignore_flags：它的收发轮询
+ * 不能再被 cancel/abort 标志打断（它要通知的正是"已取消"这件事）。
+ * **不许在这里去清 cancel/abort 全局标志**：并发下其它 worker 每轮都靠这两个标志
+ * 收手，清掉等于放开它们继续上传（连接/回执各有一份超时，最坏能续跑十几秒，
+ * 用户按了取消却看着进度条继续走）。
+ * 并发下多个 worker 会同时走到取消路径，故用锁做一次性的 test-and-set：同一
+ * 会话的 cancel 只发一次，重复发会让对端把同一会话收尾两遍。 */
 static void cancel_notify_peer(void)
 {
     char path[96];
@@ -622,20 +671,21 @@ static void cancel_notify_peer(void)
     char rbuf[256];
     int code = 0;
     if (!g_j.session[0]) return;     /* 会话还没建立：无可通知 */
-    if (g_j.notified) return;        /* 每任务只尽力通知一次 */
+    lock();
+    if (g_j.notified) { unlock(); return; }   /* 每任务只尽力通知一次 */
     g_j.notified = 1;
+    unlock();
     snprintf(path, sizeof path, "/api/localsend/v2/cancel?sessionId=%s", g_j.session);
     dlog("xfer: notify receiver cancel (session %s)", g_j.session);
-    g_j.cancel = 0;
     memset(&c, 0, sizeof c);
     c.fd = -1;
     c.tls = g_j.tls;
+    c.ignore_flags = 1;
     if (conn_open(&c, path, 0) == 0) {
         read_resp(&c, &code, rbuf, (int)sizeof rbuf, 5000000LL);
         dlog("xfer: cancel notify -> HTTP %d", code);
         conn_close(&c);
     }
-    g_j.cancel = 1;
 }
 
 /* ---------- JSON 拼装/解析 ---------- */
@@ -724,12 +774,141 @@ static char *build_prepare_json(void)
     return b;
 }
 
+/* ---------- 上传 worker（阶段 2 的并发执行体） ---------- */
+
+/* 单个文件的完整上传：建连接 → 发字节 → 等回执（每文件一条独立连接）。
+ * 返回 0 = 这个文件已处理完（成功，或已按"单文件失败"记下），可再取下一个；
+ *      1 = 本 worker 收手（用户取消 / 全局中止）。
+ * 本函数绝不写 finished / active / cancelled —— 终态只由监督者 xfer_thr 在
+ * join 完全部 worker 之后写一次（理由见文件头注）。 */
+static int upload_one(int i)
+{
+    char chunk[TX_CHUNK];
+    char q[320];
+    char abuf[512];                 /* 上传回执缓冲（头 + 空 body） */
+    Conn c;
+    int fd, rd, sr, blen;
+    int code = 0;
+    SceOff sent_file = 0;
+
+    if (i < 0 || i >= g_j.count) return 0;
+    if (g_j.tokens[i][0] == 0) {
+        /* 协议 4.1 明确允许对端只回执收下的子集：没 token = 这个文件被拒 */
+        mark_file_failed(i, "receiver did not accept %s", g_j.files[i].name);
+        return 0;
+    }
+    lock();
+    g_j.v.cur = i;                  /* 并发下 = 最近开工的那个（页面只拿它判状态行） */
+    g_j.v.f[i].state = 1;
+    unlock();
+    if (g_j.parallel <= 1)          /* 串行才报"在发哪个文件"；并发时报了只会乱跳 */
+        set_msg("Sending %s (%d/%d)", g_j.files[i].name, i + 1, g_j.count);
+
+    fd = sceIoOpen(g_j.files[i].path, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        mark_file_failed(i, "cannot open %s", g_j.files[i].path);
+        return 0;
+    }
+    snprintf(q, sizeof q,
+             "/api/localsend/v2/upload?sessionId=%s&fileId=f%d&token=%s",
+             g_j.session, i, g_j.tokens[i]);
+    memset(&c, 0, sizeof c);
+    c.fd = -1;
+    c.tls = g_j.tls;
+    sr = conn_open(&c, q, g_j.files[i].size);
+    if (sr == -2) {                 /* conn_open 取消已自关：对方在等首文件流，先通知 */
+        cancel_notify_peer();
+        sceIoClose(fd);
+        return 1;
+    }
+    if (sr == -4) {                 /* 全局中止：本文件由监督者统一标失败 */
+        sceIoClose(fd);
+        return 1;
+    }
+    if (sr < 0) {
+        if (sr == -3)
+            abort_xfer(i, "TLS handshake with %s:%d failed", g_j.ip, g_j.port);
+        else
+            abort_xfer(i, "connect failed for %s", g_j.files[i].name);
+        sceIoClose(fd);
+        return 1;
+    }
+    while (sent_file < g_j.files[i].size) {
+        SceOff want = g_j.files[i].size - sent_file;
+        if (want > (SceOff)sizeof chunk) want = sizeof chunk;
+        rd = sceIoRead(fd, chunk, (unsigned)want);
+        if (rd < 0) {
+            conn_close(&c);
+            sceIoClose(fd);
+            mark_file_failed(i, "read error on %s", g_j.files[i].name);
+            return 0;
+        }
+        if (rd == 0) {
+            /* 文件比声明的 size 短（读取期间被替换/截断）：再转下去
+             * conn_send_all(len=0) 立即返回、sent_file 不增 → 100% CPU 空转，
+             * 对端一直等声明的字节数，只能靠用户取消。 */
+            conn_close(&c);
+            sceIoClose(fd);
+            mark_file_failed(i, "%s shrank during send", g_j.files[i].name);
+            return 0;
+        }
+        sr = conn_send_all(&c, chunk, rd);
+        if (sr < 0) {
+            if (sr == -2) cancel_notify_peer(); /* 发送中被取消：断流前通知 */
+            conn_close(&c);
+            sceIoClose(fd);
+            /* -2 取消 / -4 别人已判"对端不在"：本 worker 收手，终态交监督者 */
+            if (sr == -2 || sr == -4) return 1;
+            /* 上传中途断流：对端没了（连接级）→ 全局中止 */
+            abort_xfer(i, "send error on %s", g_j.files[i].name);
+            return 1;
+        }
+        sent_file += rd;
+        set_file_state(i, 1, sent_file);
+    }
+    /* 等对方回执（2xx 即成功） */
+    blen = read_resp(&c, &code, abuf, sizeof abuf, OP_TIMEOUT_US);
+    conn_close(&c);
+    sceIoClose(fd);
+    if (blen == -2) {
+        cancel_notify_peer();       /* body 已发完等回执时取消：收尾前通知 */
+        return 1;
+    }
+    if (blen == -4) return 1;       /* 全局中止 */
+    if (blen < 0) {
+        /* 等不到回执（超时/连接被关）同样是连接级失败 */
+        abort_xfer(i, "no reply for %s", g_j.files[i].name);
+        return 1;
+    }
+    if (code < 200 || code >= 300) {
+        /* HTTP 4xx/5xx：只算这一个文件失败，继续发别的 */
+        mark_file_failed(i, "%s upload failed (HTTP %d)", g_j.files[i].name, code);
+        return 0;
+    }
+    dlog("xfer: file %d/%d done (%lld bytes)", i + 1, g_j.count,
+         (long long)g_j.files[i].size);
+    set_file_state(i, 2, g_j.files[i].size);
+    return 0;
+}
+
+/* 上传 worker：反复取号 → 传完一个文件，直到没活干或该收手。
+ * 正常 return（不 ExitDeleteThread），监督者据此 join 后再删线程对象。 */
+static int upload_worker(SceSize args, void *argp)
+{
+    (void)args; (void)argp;
+    for (;;) {
+        int i = next_file();        /* 发完 / 取消 / 中止 → -1 */
+        if (i < 0) break;
+        if (upload_one(i) != 0) break;
+    }
+    return 0;
+}
+
 /* ---------- 传输线程 ---------- */
 static int xfer_thr(SceSize args, void *argp)
 {
     char *body = NULL;
     char *prep = NULL;              /* prepare 应答缓冲（堆上，容大文件列表） */
-    char chunk[TX_CHUNK];
     int code = 0, rc, i;
     (void)args; (void)argp;
     dlog("xfer: thread entered, target %s:%d (%s)%s, %d file(s)",
@@ -801,133 +980,73 @@ static int xfer_thr(SceSize args, void *argp)
     free(body); body = NULL;
     free(prep); prep = NULL;
 
-    /* 阶段 2：逐文件上传。逐文件独立成败：
+    /* 阶段 2：多文件并发上传（并发数 = config 的 maxParallel，钳到文件数；
+     * 1 即退回逐文件串行）。每文件一条独立连接、独立成败：
      * - 对端只接受子集（回执没给该文件 token）→ 只标这个文件失败，继续发别的；
      * - 单文件失败（打不开/读失败/文件变短、HTTP 4xx/5xx）→ 同上；
      * - 连接级失败（连不上 / 握手失败 / 中途断流 / 等不到回执）→ 判"对端不在"，
-     *   剩余文件一起标失败并立刻收尾。
-     * 终态不在这里定：循环结束后按"有没有失败文件"统一判定。 */
-    for (i = 0; i < g_j.count; i++) {
-        int fd = -1, rd, sr, blen;
-        SceOff sent_file = 0;
-        int fres = 0;                /* 0=成功 1=本文件失败 2=取消 3=连接级失败 */
-        if (g_j.cancel) { cancel_notify_peer(); finish_cancelled(); goto out; }
-        if (g_j.tokens[i][0] == 0) {
-            /* 协议 4.1 明确允许对端只回执收下的子集：没 token = 这个文件被拒 */
-            mark_file_failed(i, "receiver did not accept %s", g_j.files[i].name);
-            continue;
+     *   置 abort 全局中止（在途 worker 顺着轮询退出），并把还没完成的文件一起
+     *   标失败收尾。
+     * 终态一律在 join 完全部 worker 之后由本线程写一次（worker 不碰 terminated 类
+     * 字段，见文件头注）。 */
+    {
+        SceUID wt[PARALLEL_MAX];
+        int nw = g_cfg.max_parallel, k, started = 0;
+        if (nw < PARALLEL_MIN) nw = PARALLEL_MIN;
+        if (nw > PARALLEL_MAX) nw = PARALLEL_MAX;
+        if (nw > g_j.count) nw = g_j.count;
+        g_j.parallel = nw;              /* upload_one 据此决定状态行文案（1=串行） */
+        if (nw > 1)
+            set_msg("Sending %d file(s) in parallel...", g_j.count);
+        for (k = 0; k < nw; k++) {
+            SceUID t = sceKernelCreateThread("psvsend_xferw", upload_worker,
+                                             0x40, 0x20000, 0, 0, NULL);
+            if (t < 0) {
+                dlog("xfer: worker create fail 0x%08X (%d/%d)",
+                     (unsigned)t, k + 1, nw);
+                break;
+            }
+            if (sceKernelStartThread(t, 0, NULL) < 0) {
+                dlog("xfer: worker start fail (%d/%d)", k + 1, nw);
+                sceKernelDeleteThread(t);
+                break;
+            }
+            wt[started++] = t;
         }
-        lock();
-        g_j.v.cur = i;
-        g_j.v.f[i].state = 1;
-        unlock();
-        set_msg("Sending %s (%d/%d)", g_j.files[i].name, i + 1, g_j.count);
-
-        fd = sceIoOpen(g_j.files[i].path, SCE_O_RDONLY, 0);
-        if (fd < 0) {
-            mark_file_failed(i, "cannot open %s", g_j.files[i].path);
-            continue;
+        if (started == 0) { fail("cannot start transfer worker"); goto out; }
+        dlog("xfer: %d worker(s) started for %d file(s)", started, g_j.count);
+        /* join 全部 worker 再往下走：此后没有别的线程还在动 g_j，终态写入与下一次
+         * xfer_start 的 memset 才不会撞车。worker 的每个等待都有上限（连接 6s /
+         * 握手 20s / 单块发送 10s / 回执 30s）且每轮都查取消与中止标志，正常秒级
+         * 就到齐；这里按 250ms 轮询而不是无限等待，真出意外也不会把 xfer 线程
+         * 永远挂住（谁都没结束时至少还能从日志看出卡在哪一路）。 */
+        for (k = 0; k < started; k++) {
+            int waited = 0;
+            for (;;) {
+                SceUInt to = 250 * 1000;
+                if (sceKernelWaitThreadEnd(wt[k], NULL, &to) == 0) break;
+                if (++waited % 20 == 0)      /* 每 5s 报一次，别刷屏 */
+                    dlog("xfer: worker %d join slow (%ds)", k + 1, waited / 4);
+            }
+            sceKernelDeleteThread(wt[k]);
         }
-        {
-            char q[320];
-            char abuf[512];         /* 上传回执缓冲（头 + 空 body） */
-            Conn c;
-            snprintf(q, sizeof q,
-                     "/api/localsend/v2/upload?sessionId=%s&fileId=f%d&token=%s",
-                     g_j.session, i, g_j.tokens[i]);
-            memset(&c, 0, sizeof c);
-            c.fd = -1;
-            c.tls = g_j.tls;
-            sr = conn_open(&c, q, g_j.files[i].size);
-            if (sr == -2) {           /* conn_open 取消已自关 */
-                cancel_notify_peer(); /* 对方在等首文件流：先通知，别让它干等 */
-                fres = 2;
-                goto file_end;
-            }
-            if (sr < 0) {
-                if (sr == -3)
-                    abort_files_from(i, "TLS handshake with %s:%d failed", g_j.ip, g_j.port);
-                else
-                    abort_files_from(i, "connect failed for %s", g_j.files[i].name);
-                fres = 3;
-                goto file_end;
-            }
-            while (sent_file < g_j.files[i].size) {
-                SceOff want = g_j.files[i].size - sent_file;
-                if (want > (SceOff)sizeof chunk) want = sizeof chunk;
-                if (g_j.cancel) {
-                    cancel_notify_peer(); /* 先通知再断流：对方收到 cancel 主动收尾，
-                                           * 不会把随后的连接断流判成字节错误 */
-                    conn_close(&c);
-                    finish_cancelled();
-                    fres = 2;
-                    goto file_end;
-                }
-                rd = sceIoRead(fd, chunk, (unsigned)want);
-                if (rd < 0) {
-                    conn_close(&c);
-                    mark_file_failed(i, "read error on %s", g_j.files[i].name);
-                    fres = 1;
-                    goto file_end;
-                }
-                if (rd == 0) {
-                    /* 文件比声明的 size 短（读取期间被替换/截断）：再转下去
-                     * conn_send_all(len=0) 立即返回、sent_file 不增 → 100% CPU
-                     * 空转，对端一直等声明的字节数，只能靠用户取消。 */
-                    conn_close(&c);
-                    mark_file_failed(i, "%s shrank during send", g_j.files[i].name);
-                    fres = 1;
-                    goto file_end;
-                }
-                sr = conn_send_all(&c, chunk, rd);
-                if (sr < 0) {
-                    if (sr == -2) cancel_notify_peer(); /* 发送中被取消：断流前通知 */
-                    conn_close(&c);
-                    if (sr == -2) {
-                        finish_cancelled();
-                        fres = 2;
-                    } else {
-                        /* 上传中途断流：对端没了（连接级），剩余文件别逐个再试 */
-                        abort_files_from(i, "send error on %s", g_j.files[i].name);
-                        fres = 3;
-                    }
-                    goto file_end;
-                }
-                sent_file += rd;
-                set_file_state(i, 1, sent_file);
-            }
-            /* 等对方回执（2xx 即成功） */
-            blen = read_resp(&c, &code, abuf, sizeof abuf, OP_TIMEOUT_US);
-            conn_close(&c);
-            if (blen == -2) {
-                cancel_notify_peer(); /* body 已发完等回执时取消：收尾前通知 */
-                finish_cancelled();
-                fres = 2;
-                goto file_end;
-            }
-            if (blen < 0) {
-                /* 等不到回执（超时/连接被关）同样是连接级失败 */
-                abort_files_from(i, "no reply for %s", g_j.files[i].name);
-                fres = 3;
-                goto file_end;
-            }
-            if (code < 200 || code >= 300) {
-                /* HTTP 4xx/5xx：只算这一个文件失败，继续发剩下的 */
-                mark_file_failed(i, "%s upload failed (HTTP %d)",
-                                 g_j.files[i].name, code);
-                fres = 1;
-                goto file_end;
-            }
-        }
-    file_end:
-        if (fd >= 0) sceIoClose(fd);
-        if (fres == 2 || fres == 3) goto out;
-        if (fres != 0) continue;
-        dlog("xfer: file %d/%d done (%lld bytes)", i + 1, g_j.count,
-             (long long)g_j.files[i].size);
-        set_file_state(i, 2, g_j.files[i].size);
     }
-    if (g_j.cancel) { cancel_notify_peer(); finish_cancelled(); goto out; }
+    dlog("xfer: all workers joined");
+    if (g_j.cancel) { finish_cancelled(); goto out; }   /* 内含 cancel 通知兜底 */
+
+    /* 连接级失败（对端不在）：把还没派发、以及在途被中止打断的文件一起标失败，
+     * 再按整批失败收尾。上面已 join 完全部 worker，这里没有别的写者，直接读即可。 */
+    if (g_j.abort) {
+        int nfail = 0;
+        for (i = 0; i < g_j.count; i++) {
+            if (g_j.v.f[i].state == 0 || g_j.v.f[i].state == 1)
+                set_file_state(i, 3, g_j.v.f[i].sent);
+            if (g_j.v.f[i].state == 3) nfail++;
+        }
+        fail("%s", g_j.abort_msg[0] ? g_j.abort_msg : "peer unreachable");
+        dlog("xfer: aborted, %d/%d file(s) failed", nfail, g_j.count);
+        goto out;
+    }
 
     /* 全部文件处理完：按"有没有失败文件"定终态（部分失败的展示交给页面：
      * 页面按行状态自己区分"完成但有 N 个失败"与"全部失败"）。 */

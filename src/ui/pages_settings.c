@@ -24,6 +24,7 @@ enum {
     SET_ITEM_LANG,         /* 显示：界面语言 */
     SET_ITEM_KEY,          /* 操作：确认键布局 */
     SET_ITEM_PANE,         /* 操作：主页两栏布局（设备在左 / 文件在左） */
+    SET_ITEM_PARALLEL,     /* 操作：并发上传数（发送侧同时上传的文件数 1-6） */
     SET_ITEM_HOSTNAME,     /* 设备：主机名（改名走系统键盘） */
     SET_ITEM_SAVEDIR,      /* 存储：默认保存目录（动作行：进目录选择器并落盘） */
     SET_ITEM_CHECK,        /* 更新：检查更新（动作行：按任意键/点任意半即查） */
@@ -43,6 +44,7 @@ enum {
     SET_SLOT_HDR_C,        /* 分组：操作 */
     SET_SLOT_KEY,
     SET_SLOT_PANE,
+    SET_SLOT_PARALLEL,
     SET_SLOT_HINT,
     SET_SLOT_HDR_ST,       /* 分组：存储 */
     SET_SLOT_SAVEDIR,
@@ -84,6 +86,7 @@ static int slot_item(int slot)
     case SET_SLOT_LANG:  return SET_ITEM_LANG;
     case SET_SLOT_KEY:   return SET_ITEM_KEY;
     case SET_SLOT_PANE:  return SET_ITEM_PANE;
+    case SET_SLOT_PARALLEL: return SET_ITEM_PARALLEL;
     case SET_SLOT_SAVEDIR: return SET_ITEM_SAVEDIR;
     case SET_SLOT_CHECK: return SET_ITEM_CHECK;
     case SET_SLOT_AUTO:  return SET_ITEM_AUTO;
@@ -102,6 +105,7 @@ static int item_slot(int item)
     case SET_ITEM_LANG:     return SET_SLOT_LANG;
     case SET_ITEM_KEY:      return SET_SLOT_KEY;
     case SET_ITEM_PANE:     return SET_SLOT_PANE;
+    case SET_ITEM_PARALLEL: return SET_SLOT_PARALLEL;
     case SET_ITEM_CHECK:    return SET_SLOT_CHECK;
     case SET_ITEM_AUTO:     return SET_SLOT_AUTO;
     }
@@ -205,6 +209,13 @@ static void settings_change(int item, int dir)
         g_app.pane_swap = g_app.pane_swap ? 0 : 1;   /* 立即生效：主页下次渲染即换边 */
         g_cfg.pane_swap = g_app.pane_swap;
         config_save();
+    } else if (item == SET_ITEM_PARALLEL) {
+        /* 并发上传数：1..6 首尾循环。1 = 逐文件串行；只影响"下一次"发送——正在
+         * 跑的那次传输已在启动时定好了 worker 数（xfer_thr 读的是一份值）。 */
+        int v = g_cfg.max_parallel + dir;
+        if (v < PARALLEL_MIN) v = PARALLEL_MAX;
+        if (v > PARALLEL_MAX) v = PARALLEL_MIN;
+        config_set_max_parallel(v);    /* 锁内写入并落盘：发送线程读该项 */
     } else if (item == SET_ITEM_CHECK) {
         update_check_now();      /* 动作行：左右/确认/点任意半都触发检查（dir 无意义） */
     } else if (item == SET_ITEM_AUTO) {
@@ -220,6 +231,7 @@ void page_settings_render(void)
 {
     static const char *upd_mode_en[] = { "Off", "Daily", "Weekly", "Monthly" };
     char theme_v[64], light_v[32], layout_v[96], lang_v[32], pane_v[32];
+    char par_v[32];
     char upd_v[64];
     int upd_st = update_state();
     int slot;
@@ -239,6 +251,7 @@ void page_settings_render(void)
     snprintf(lang_v, sizeof lang_v, "%s", i18n_lang_name(i18n_lang_pref()));
     snprintf(pane_v, sizeof pane_v, "%s",
              g_app.pane_swap ? tr("Files left") : tr("Devices left"));
+    snprintf(par_v, sizeof par_v, "%d", g_cfg.max_parallel);
     upd_v[0] = 0;
     switch (upd_st) {
     case UPD_WORKING:
@@ -356,6 +369,10 @@ void page_settings_render(void)
             break;
         case SET_ITEM_PANE:
             w_row(r, tr("Layout"), pane_v, item == g_app.set_sel);
+            break;
+        case SET_ITEM_PARALLEL:
+            /* 并发上传数：只看数字即可（1 = 一次传一个文件） */
+            w_row(r, tr("Parallel uploads"), par_v, item == g_app.set_sel);
             break;
         case SET_ITEM_CHECK:
             /* 动作行：右侧显示检查状态；发现新版时用 accent 强调 */
