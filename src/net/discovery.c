@@ -133,6 +133,8 @@ void discovery_peer_registered(const char *body, const char *src_ip)
         dev.port = DISC_PORT;                  /* 对方默认协议端口 */
     if (!json_get_str(body, "protocol", dev.protocol, sizeof dev.protocol))
         snprintf(dev.protocol, sizeof dev.protocol, "%s", "http");
+    /* 同 scan.c parse_member：download 以前从不赋值、恒 false，顺手按协议取值 */
+    json_get_bool(body, "download", &dev.download);
     dlog("disc: peer '%s' %s:%d via register", dev.alias, dev.ip, dev.port);
     table_upsert(&dev);
 }
@@ -343,8 +345,14 @@ static int disc_open_tx(void)
     }
     sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_BROADCAST,
                      &so_bcast, sizeof so_bcast);
-    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
-                     &so_nbio, sizeof so_nbio);
+    /* 非阻塞是"announce 不钉死主线程"的前提（见上）：置位失败即宁可不要这个
+     * socket（返回 -1，调用方下一拍会重建），也绝不冒阻塞 UI 的风险。 */
+    if (sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
+                         &so_nbio, sizeof so_nbio) != 0) {
+        dlog("disc: tx socket set NBIO fail");
+        sceNetSocketClose(sock);
+        return -1;
+    }
     /* 组播出口网卡 + TTL：不选网卡时部分协议栈默认不发/乱发组播 */
     {
         unsigned int ip4 = 0;

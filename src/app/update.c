@@ -77,12 +77,12 @@ static uint64_t g_tick_last_us;        /* update_tick 每秒节流 */
 static uint64_t now_us(void) { return (uint64_t)sceKernelGetSystemTimeWide(); }
 
 /* config upd_auto：0=off 1=每天 2=每周 3=每月 → 周期秒 */
-static long auto_interval(void)
+static long long auto_interval(void)
 {
     switch (g_cfg.upd_auto) {
-    case 1: return 24L * 3600;
-    case 2: return 7L * 24 * 3600;
-    case 3: return 30L * 24 * 3600;
+    case 1: return 24LL * 3600;
+    case 2: return 7LL * 24 * 3600;
+    case 3: return 30LL * 24 * 3600;
     }
     return 0;
 }
@@ -310,24 +310,25 @@ static int date_month(const char *m)
             return i;
     return -1;
 }
-/* 公历 y/m/d → 距 1970-01-01 的天数（Hinnant days_from_civil 变体，纯算术） */
-static long civil_days(int y, unsigned m, unsigned d)
+/* 公历 y/m/d → 距 1970-01-01 的天数（Hinnant days_from_civil 变体，纯算术）。
+ * 全程 64 位：Vita 上 long 只有 32 位，天数 * 86400 在 2038-01-19 后有符号溢出。 */
+static long long civil_days(int y, unsigned m, unsigned d)
 {
-    long era;
+    long long era;
     unsigned yoe, doy, doe;
     y -= (int)(m <= 2);
     era = (y >= 0 ? y : y - 399) / 400;
     yoe = (unsigned)(y - (int)(era * 400));
     doy = (153u * (m + (m > 2 ? 0u : 12u) - 3u) + 2u) / 5u + d - 1u;
     doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
-    return era * 146097L + (long)doe - 719468L;
+    return era * 146097LL + (long long)doe - 719468LL;
 }
-static long date_to_unix(const char *s)
+static long long date_to_unix(const char *s)
 {
     int dd = 0, yy = 0, hh = 0, mm = 0, ss = 0, mo, used = 0;
     char m3[4] = "";
     const char *tail;
-    long days;
+    long long days;
     if (!s) return 0;
     /* "Sun, 06 Nov 1994 08:49:37 GMT"：跳过星期，取 日 月 年 时分秒 GMT */
     if (sscanf(s, "%*[^,] , %d %3s %d %d:%d:%d GMT%n",
@@ -343,7 +344,8 @@ static long date_to_unix(const char *s)
         mm > 59 || ss > 60)
         return 0;
     days = civil_days(yy, (unsigned)(mo + 1), (unsigned)dd);
-    return days * 86400L + (long)hh * 3600L + (long)mm * 60L + (long)ss;
+    return days * 86400LL + (long long)hh * 3600LL + (long long)mm * 60LL
+           + (long long)ss;
 }
 
 /* 解析已收齐的 HTTP 头部 win[0..hn)：状态码 + Content-Length + chunked 标记 */
@@ -407,7 +409,7 @@ static void http_parse_hdr(const char *h, int hn, int *st, int *clen, int *chunk
  * date_out（可空）：2xx 后把响应头 Date 转 unix 秒写进去（授时用）。
  * 内部为一次性独立连接：每源自建 fd + mbedtls 全套，出口统一清理。 */
 static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn,
-                     int hdr_only, long *date_out)
+                     int hdr_only, long long *date_out)
 {
     char win[UPD_WIN];
     char req[384];
@@ -549,7 +551,7 @@ static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn,
                             goto fail;
                         }
                         if (date_out && date[0] && *date_out == 0) {
-                            long t = date_to_unix(date);
+                            long long t = date_to_unix(date);
                             if (t > 0) *date_out = t;
                         }
                         if (hdr_only) goto ok;   /* 授时：头到手即断，不读 body */
@@ -659,7 +661,7 @@ static int upd_run(SceSize a1, void *a2)
     int mode = UPD_MODE_MANUAL;
     char tag[64] = "";
     char src_host[48] = "none";
-    long t_net = 0;                  /* 本 worker 拿到的网络 unix 秒 */
+    long long t_net = 0;             /* 本 worker 拿到的网络 unix 秒 */
     UpdState fin = UPD_FAIL;
     int i;
 
@@ -677,19 +679,22 @@ static int upd_run(SceSize a1, void *a2)
             sceKernelExitDeleteThread(0);
             return 0;
         }
-        dlog("update: auto time src=%s = %ld", UPD_SRC[i - 1].host, t_net);
-        /* 2) 周期判定：距上次网络检查未到周期 → 静默结束（不完整检查） */
-        if (g_cfg.upd_last &&
-            t_net - (long)g_cfg.upd_last < auto_interval()) {
-            dlog("update: auto within interval last=%ld next>%ld",
-                 (long)g_cfg.upd_last,
-                 (long)g_cfg.upd_last + auto_interval());
+        dlog("update: auto time src=%s = %lld", UPD_SRC[i - 1].host, t_net);
+        /* 2) 周期判定：距上次网络检查未到周期 → 静默结束（不完整检查）。
+         * 差值必须 > 0 才算"在周期内"：负差值意味着 upd_last 落在未来
+         * （上次授时异常/系统被改过），旧写法 `t - last < interval` 对这种
+         * 情况恒成立 → 自动检查永久静默跳过且不自纠；负差值一律按"到期"
+         * 做完整检查，随后的落盘用真实网络时间把 upd_last 修正回来。 */
+        if (g_cfg.upd_last && t_net - g_cfg.upd_last > 0 &&
+            t_net - g_cfg.upd_last < auto_interval()) {
+            dlog("update: auto within interval last=%lld next>%lld",
+                 g_cfg.upd_last, g_cfg.upd_last + auto_interval());
             g_st = g_st_save;
             g_busy = 0;
             sceKernelExitDeleteThread(0);
             return 0;
         }
-        dlog("update: auto due last=%ld -> full check", (long)g_cfg.upd_last);
+        dlog("update: auto due last=%lld -> full check", g_cfg.upd_last);
     }
 
     /* 3) 完整检查：按源表顺序试，首个可用源定论；全失败 → FAIL */
@@ -715,7 +720,7 @@ static int upd_run(SceSize a1, void *a2)
      *    "此刻查过"，防半开/解析类问题按周期高频重试；手动且全失败
      *    （无任何 Date）则不记，用户可立即再点重试。 */
     if (t_net > 0)
-        config_set_upd_last((int)t_net);   /* 锁内写入并落盘 */
+        config_set_upd_last(t_net);    /* 锁内写入并落盘（int64，2038 后不截断） */
     g_st = fin;
     g_busy = 0;
     dlog("update: done state=%d src=%s%s", fin, src_host,

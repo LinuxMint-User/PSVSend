@@ -106,7 +106,7 @@ void config_init(void)
             if (json_get_int(buf, "paneSwap", &v)) g_cfg.pane_swap = (int)v;
             if (json_get_int(buf, "lang", &v)) g_cfg.lang = (int)v;
             if (json_get_int(buf, "updateAuto", &v)) g_cfg.upd_auto = (int)v;
-            if (json_get_int(buf, "updateLast", &v)) g_cfg.upd_last = (int)v;
+            if (json_get_int(buf, "updateLast", &v)) g_cfg.upd_last = v;
             json_get_str(buf, "saveDir", g_cfg.save_dir, sizeof g_cfg.save_dir);
             {   /* knownIps: "ip,ip,..."（逗号分隔，最新在前） */
                 char k[512];
@@ -195,7 +195,7 @@ static void config_write_locked(void)
                    "  \"paneSwap\": %d,\n"
                    "  \"lang\": %d,\n"
                    "  \"updateAuto\": %d,\n"
-                   "  \"updateLast\": %d,\n"
+                   "  \"updateLast\": %lld,\n"
                    "  \"saveDir\": \"%s\",\n"
                    "  \"knownIps\": \"%s\"\n"
                    "}\n",
@@ -310,7 +310,7 @@ void config_set_upd_auto(int v)
     cfg_unlock();
 }
 
-void config_set_upd_last(int t)
+void config_set_upd_last(long long t)
 {
     cfg_lock();
     g_cfg.upd_last = t < 0 ? 0 : t;

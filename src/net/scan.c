@@ -62,6 +62,7 @@ static SceUID    g_lock = -1;   /* 保护游标/计数/已知表 */
 static volatile int g_up = 0;      /* 线程已建 */
 static volatile int g_active = 0;  /* 正在扫 */
 static volatile int g_need = 0;    /* 空闲后顺延一轮 */
+static volatile int g_clear = 0;   /* 挂起的"手动扫描要清表"（见 scan_trigger） */
 static volatile int g_done = 0;    /* 已探主机数 */
 static volatile int g_found = 0;   /* 本轮发现的设备数 */
 static int         g_total = 0;
@@ -158,7 +159,15 @@ static int net_connect_to(const char *ip, int port, SceLong64 budget_us)
     fd = sceNetSocket("psvsend_scan", SCE_NET_AF_INET,
                       SCE_NET_SOCK_STREAM, SCE_NET_IPPROTO_TCP);
     if (fd < 0) return -1;
-    sceNetSetsockopt(fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &one, sizeof one);
+    /* 非阻塞是下面"connect 在途轮询"的前提：置位失败则 sceNetConnect 会以内核
+     * TCP 超时（几十秒）阻塞，整个扫描 worker 就废在这一个 IP 上。故置位失败
+     * 直接放弃这个 IP（本函数返回 -1 = 探不到，与连不上同一条路）。 */
+    if (sceNetSetsockopt(fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &one,
+                         sizeof one) != 0) {
+        dlog("scan: %s set NBIO fail, skip host", ip);
+        sceNetSocketClose(fd);
+        return -1;
+    }
     memset(&sa, 0, sizeof sa);
     sa.sin_len = sizeof sa;
     sa.sin_family = SCE_NET_AF_INET;
@@ -424,6 +433,9 @@ static int parse_member(const char *body, int tls, const char *ip, Device *out,
         out->port = (int)v;
     json_get_str(body, "deviceModel", out->model, sizeof out->model);
     json_get_str(body, "deviceType", out->dtype, sizeof out->dtype);
+    /* 协议里的 download（对端是否开着下载 API）：以前从不赋值、恒 false，
+     * 将来若有"按它过滤不可接收设备"的用法就会把所有对端都判死，顺手取值。 */
+    json_get_bool(body, "download", &out->download);
     return 1;
 }
 
@@ -595,7 +607,13 @@ static void scan_round(void)
         for (i = 0; i < kn; i++) {
             h = kh[i];
             if (h == (int)d || h < 1 || h > 254) continue;
-            ctx->hosts[ctx->n++] = h;
+            /* 这里也必须去重：config 的 knownIps 按**原字符串**去重，
+             * "192.168.1.7" 与 "192.168.1.07" 是两条记录、解析出的主机号却是
+             * 同一个 → 重复追加会让 ctx->n 超过 hosts[254] 的容量（栈越界）。
+             * 去重后 host 号互不相同，最多 254 个，容量恰好够。 */
+            for (k = 0; k < ctx->n; k++)
+                if (ctx->hosts[k] == h) break;
+            if (k == ctx->n) ctx->hosts[ctx->n++] = h;
         }
         for (h = 1; h <= 254; h++) {
             if (h == (int)d) continue;
@@ -689,6 +707,10 @@ static int scan_thr(SceSize args, void *argp)
             if (net_connected() && strcmp(net_local_ip(), "0.0.0.0") != 0) {
                 g_need = 0;
                 g_active = 1;
+                if (g_clear) {      /* 手动扫描的清表（本轮开始前做，见 scan_trigger） */
+                    g_clear = 0;
+                    discovery_clear();
+                }
                 scan_round();
                 g_active = 0;
                 off_logged = 0;
@@ -721,9 +743,17 @@ void scan_trigger(void)
         dlog("scan: thread up");
     }
     /* 手动扫描 = 重新认识当前网络：先把旧条目清掉（含已离线的"残留"），
-     * 扫到的/期间 register 回来的会立刻重新入表。给用户即时的"清空"反馈。 */
-    dlog("scan: manual trigger, clear device table");
-    discovery_clear();
+     * 扫到的/期间 register 回来的会立刻重新入表。给用户即时的"清空"反馈。
+     * 唯一例外：此刻正有一轮在扫（g_active）——在跑的 worker 马上又会把结果
+     * 填回来，清了等于没清；于是把"清表"挂起，等本轮结束、新一轮开始前再清
+     * （见 scan_thr），保证列表是"清空 → 重扫"而不是"清空 → 被旧轮填回"。 */
+    if (g_active) {
+        g_clear = 1;
+        dlog("scan: manual trigger while scanning, clear deferred to next round");
+    } else {
+        dlog("scan: manual trigger, clear device table");
+        discovery_clear();
+    }
     g_need = 1;                     /* 空闲则本轮开始；在扫则扫完顺延一轮 */
 }
 

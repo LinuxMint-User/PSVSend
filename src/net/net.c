@@ -27,10 +27,26 @@ static int g_state = 0;                   /* 0 未完成 / 1 就绪 / <0 上次�
 static int g_step = 0;                    /* 已完成步骤位：1=sysmodule 2=net 4=netctl */
 static int g_ctl_err = 0;                 /* 最近一次 netctl 状态查询返回码（net_poll 维护） */
 static int g_ctl_st  = -1;                /* 最近读到的网络状态（net_poll 维护） */
-static char g_ip[16] = "0.0.0.0";         /* 本机 IP 缓存（net_poll 刷新；读方无锁，
-                                            最坏读到半更新串，只影响一次组播出口选择） */
+static char g_ip[16] = "0.0.0.0";         /* 本机 IP 缓存（net_poll 刷新） */
+static SceUID g_ip_mtx = -1;              /* 保护 g_ip 的整串读写（见 ip_lock 注释） */
 static SceUID g_ctl_mtx = -1;             /* 保护 ctl 查询与 term/init 重建互斥 */
 static int g_ctl_held = 0;                /* 本线程是否持有该锁（只有 watch 线程用这对函数） */
+
+/* g_ip 是一整串（如 "192.168.1.107"），写方是 watch 线程、读方散布在 UI /
+ * 扫描 / 发现线程，且调用点会拿它去算 /24 前缀（scan_round）或选组播出口。
+ * 旧实现读方无锁：恰好读在 snprintf 中途就会拿到改到一半的串（"192.168.1.10"
+ * 比真值少一位），扫描会照着错的 /24 整轮白扫。故读写都走这把锁整串进出
+ * （持锁时间 = 一次 snprintf/memcpy，可忽略）。
+ * 刻意不复用 g_ctl_mtx：那对 ctl_lock/ctl_unlock 靠全局 g_ctl_held 记
+ * "本线程是否持锁"，非 watch 线程借用会把该标志搞乱、使 watch 的 unlock 失效。 */
+static void ip_lock(void)
+{
+    if (g_ip_mtx >= 0) sceKernelLockMutex(g_ip_mtx, 1, NULL);
+}
+static void ip_unlock(void)
+{
+    if (g_ip_mtx >= 0) sceKernelUnlockMutex(g_ip_mtx, 1);
+}
 
 /* 有界取锁（诊断 + 防死）：理论上前述场景锁永远空闲、立即拿到。
  * d12 实测出现"expired 后 watch 线程凭空消失"——若真是锁被某个未知
@@ -78,6 +94,8 @@ int net_start(void)
          * 官方 sample（debugScreen.c）对普通互斥锁一律用 initCount=0。 */
         g_ctl_mtx = sceKernelCreateMutex("psvsend_ctl", 0, 0, NULL);
     }
+    if (g_ip_mtx < 0)                     /* g_ip 整串读写锁（同 initCount=0 口径） */
+        g_ip_mtx = sceKernelCreateMutex("psvsend_ip", 0, 0, NULL);
 
     /* 分步推进、只重试失败的那一步。Wi-Fi 关闭/刚开机时 netctl 常起不来
      * （sceNetCtlInit 失败）：若此处只打日志仍把 g_state 置 1，netctl 客户端
@@ -172,7 +190,9 @@ void net_poll(void)
     if (r == 0 && st == SCE_NETCTL_STATE_CONNECTED &&
         sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_IP_ADDRESS, &info) == 0 &&
         info.ip_address[0]) {
+        ip_lock();
         snprintf(g_ip, sizeof g_ip, "%s", info.ip_address);
+        ip_unlock();
     }
     /* 未连上 / 信息查询暂时失败：不清 g_ip。Wi-Fi 刚恢复时 GetInfo 可能晚于
      * GetState 就绪，若此时把 IP 清成 0.0.0.0，扫描门槛（ip != 0.0.0.0）会一直
@@ -181,10 +201,16 @@ void net_poll(void)
     ctl_unlock();
 }
 
-/* 本机 IP 缓存（只读，不做系统调用）；未轮询到为 "0.0.0.0" */
+/* 本机 IP 缓存（只读，不做系统调用）；未轮询到为 "0.0.0.0"。
+ * 锁内整串拷到静态缓冲再返回（见 ip_lock 注释）。该静态缓冲为全线程共享，
+ * 但两个读者拷到的内容必然相同（同一份 IP），调用点拿到即用，无碍。 */
 const char *net_local_ip(void)
 {
-    return g_ip;
+    static char out[16];
+    ip_lock();
+    memcpy(out, g_ip, sizeof out);
+    ip_unlock();
+    return out;
 }
 
 /* 链路状态缓存（只读，不做系统调用）：UI/announce/scan 每帧可调无风险 */
@@ -216,8 +242,15 @@ int net_poke(void)
     if ((g_step & 2) == 0) return -2;     /* SceNet 栈没起来：poke 无意义 */
     fd = sceNetSocket("psvsend_wake", SCE_NET_AF_INET, SCE_NET_SOCK_DGRAM, 0);
     if (fd < 0) return fd;
-    sceNetSetsockopt(fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
-                     &so_nbio, sizeof so_nbio);
+    /* 非阻塞是"不钉死主线程"的前提：置位失败即本函数的前提不成立（MODE 阻塞
+     * 时 sendto 在重连过渡态会等路由约 2s，把主循环连同按键一起钉住，见上）。
+     * 宁可放弃这拍唤醒（下一拍照常重试），也不冒阻塞主线程的风险。 */
+    if (sceNetSetsockopt(fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
+                         &so_nbio, sizeof so_nbio) != 0) {
+        dlog("net: poke set NBIO fail -> skip this round");
+        sceNetSocketClose(fd);
+        return -1;
+    }
     memset(&a, 0, sizeof a);
     a.sin_len = sizeof a;
     a.sin_family = SCE_NET_AF_INET;

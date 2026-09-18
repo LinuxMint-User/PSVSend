@@ -37,8 +37,10 @@ typedef struct {
     char save_dir[512];  /* 保存目录（设置页可选，持久化；默认 downloads）。
                           * 接收前的"本次目录"是内存态临时覆盖，不进 config。 */
     int  upd_auto;   /* 自动检查更新：0=关 1=每天 2=每周(默认) 3=每月 */
-    int  upd_last;   /* 上次检查更新时刻的"网络"unix 时间戳（授时来自远端
-                      * 响应头 Date；自动周期判定用，0=从未成功查过） */
+    long long upd_last; /* 上次检查更新时刻的"网络"unix 时间戳（授时来自远端
+                      * 响应头 Date；自动周期判定用，0=从未成功查过）。
+                      * 64 位：unix 秒在 2038-01-19 就越过 int32 上限，
+                      * 用 int 存会截断成负值 → 被当成"从未查过"而每次都查。 */
 } Config;
 
 extern Config g_cfg;
@@ -58,7 +60,7 @@ int config_known_hosts(unsigned a, unsigned b, unsigned c, int *out, int max);
  * 一半的字符串（广播里发出半截设备名、接收落到半截目录名）；一律走这里。
  * setter 内部同时落盘，返回即已持久化。
  * 仅供 UI 线程读写的字段（theme/light/custom/confirmLayout/paneSwap）与
- * int 项（updAuto/updLast）可直接访问 g_cfg。 */
+ * int 项（updAuto）可直接访问 g_cfg。 */
 void config_get_alias(char *out, int n);
 void config_set_alias(const char *alias);        /* 空串 → DEFAULT_ALIAS */
 void config_get_fingerprint(char *out, int n);
@@ -66,6 +68,6 @@ void config_get_save_dir(char *out, int n);
 void config_set_save_dir(const char *dir);
 void config_set_lang(int lang);                  /* 越界 → AUTO */
 void config_set_upd_auto(int v);                 /* 越界 → 每周 */
-void config_set_upd_last(int t);
+void config_set_upd_last(long long t);
 
 #endif

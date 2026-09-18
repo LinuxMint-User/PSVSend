@@ -604,7 +604,6 @@ static void h_cancel(HttpReq *r)
 static void handle_conn(Conn *cn, const char *rip, int my_gen)
 {
     char buf[HTTP_MAX_REQ];
-    struct timeval tv;
     int n = 0, he = -1, i;
     SceLong64 cl64 = -1;            /* Content-Length 原值（Vita long 仅 32 位，大文件要 64 位） */
     char method[8] = "";
@@ -614,10 +613,12 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
     const char *left;
     int llen;
 
-    tv.tv_sec = HTTP_RECV_TIMEOUT_S;
-    tv.tv_usec = 0;
-    sceNetSetsockopt(cn->fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO,
-                     &tv, sizeof tv);
+    /* 本连接 fd 由 spawn_conn 置为非阻塞（与全仓 scan/update/net 同一口径）：
+     * recv 无数据立刻返回 EWOULDBLOCK，由 conn_read 20ms 轮询到各自 deadline。
+     * 旧实现在这里设 SO_RCVTIMEO=3s 而 fd 是阻塞的——内核超时返回的错误码
+     * 未必是 EWOULDBLOCK，conn_read 会把它当"真错误"结束会话，于是"收体空闲
+     * 上限 30s"名存实亡（约 3s 就可能被切断）；取消/换代的感知也被拖到 3s。
+     * 删掉它，非阻塞 + 自管 deadline 是唯一的时间语义。 */
     {
         /* 收请求头直到出现空行（头结束）：总截止 3s，认到即停。 */
         SceLong64 dl = sceKernelGetSystemTimeWide()
@@ -810,8 +811,18 @@ static int conn_worker(SceSize args, void *argp)
 /* 登记并启动一个连接 worker；返回 1=已开，0=满员/失败（调用者应关 fd） */
 static int spawn_conn(int c, const char *ip)
 {
-    int i;
+    int i, one = 1;
     SceUID t;
+
+    /* 本连接的 fd 一律置非阻塞：conn_read/conn_write 的时间语义全靠
+     * "EWOULDBLOCK + 20ms 轮询 + 调用方 deadline"（与 scan/update/net 一致），
+     * 阻塞 fd 会让 recv 在内核里睡到超时才返回（见 handle_conn 头注）。
+     * 置位失败就不接手这条连接：让调用方关掉它（返回 0 = 未开）。 */
+    if (sceNetSetsockopt(c, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &one,
+                         sizeof one) != 0) {
+        dlog("http: conn from %s set NBIO fail", ip);
+        return 0;
+    }
 
     conn_lock();
     for (i = 0; i < HTTP_MAX_CONN; i++)
@@ -954,6 +965,13 @@ int http_start(void)
         dlog("http: listen fail");
         return -2;
     }
+    /* 监听 socket 置非阻塞：accept 空转立即返回 EWOULDBLOCK（http_thr 里那条
+     * 分支以前是死代码，因为 socket 一直阻塞着），于是停机/换代的响应不再
+     * 卡在一次 accept 上，http_stop 的 join 预算更容易等到它。置位失败只是
+     * 退回"阻塞 accept"的老行为（功能不变，仅换代会慢一拍），不值得拆服务。 */
+    if (sceNetSetsockopt(s, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &one,
+                         sizeof one) != 0)
+        dlog("http: listener set NBIO fail, keep blocking accept");
     g_lsock = s;
     g_port = chosen > 0 ? chosen : 0;
     g_run = 1;
