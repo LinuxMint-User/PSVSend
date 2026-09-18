@@ -28,6 +28,7 @@ static uint64_t rep_last[4];    /* 上次触发时刻 */
 
 static bool   t_down;            /* 本帧是否有手指按住 */
 static bool   t_drag;            /* 当前按住的手是否已判定为滑动 */
+static bool   t_ignore;          /* 冻结前就在按的那只手：抬起前一律不产生动作 */
 static int    t_x0, t_y0;        /* 按下起点（屏幕坐标） */
 static int    t_lastx, t_lasty;  /* 最近一次触摸点 */
 static bool   t_have_last;       /* 是否已有坐标可参考（抬起时用于距离判断） */
@@ -79,6 +80,18 @@ static void touch_poll(Input *in, SceTouchData *touch)
 {
     bool down = touch->reportNum > 0;
     int cx = 0, cy = 0;
+
+    if (t_ignore) {
+        /* 冻结（系统键盘打开）前就一直按着的手：抬起前不产生任何动作。
+         * 否则解冻首帧会把它算成"刚按下"并在抬起时合成一次 tap。 */
+        if (!down) {
+            t_ignore = false;
+            t_down = false;
+            t_drag = false;
+            t_have_last = false;
+        }
+        return;
+    }
 
     if (down)
         touch_to_screen(touch->report[0].x, touch->report[0].y, &cx, &cy);
@@ -161,6 +174,38 @@ void ui_input_poll(Input *in)
         touch_poll(in, &touch);
     else
         t_down = false;   /* 读取失败视为抬手，避免状态卡住 */
+}
+
+/* 输入冻结（系统键盘打开期间整段不调用 ui_input_poll）结束后调用一次：
+ * 冻结期间 prev_buttons / 触摸状态都没有更新，若直接恢复轮询，解冻首帧会把
+ * "此刻正按着的键"当成一次新的按下沿（凭空合成确认/返回），把"此刻还按在
+ * 屏上的手指"当成刚按下（关键盘时手指还在屏上 → 抬起即合成一次 tap 落在
+ * 某行上）。这里把两边状态一次性对齐到"此刻的真实状态"：
+ *   - 按键：prev_buttons 取当前值 → 已按住的键不产生按下沿；长按重复计时
+ *     重置到当下，避免解冻瞬间立刻补发一次重复。
+ *   - 触摸：仍按着的手标记为忽略（抬起前不产生任何动作），没按着则清干净。 */
+void ui_input_resync(void)
+{
+    SceCtrlData pad;
+    SceTouchData touch;
+    uint64_t now = sceKernelGetSystemTimeWide();
+    int i;
+
+    if (sceCtrlPeekBufferPositive(0, &pad, 1) >= 0)
+        prev_buttons = pad.buttons;
+    for (i = 0; i < 4; i++)
+        rep_press[i] = rep_last[i] = now;
+
+    t_drag = false;
+    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) >= 0 &&
+        touch.reportNum > 0) {
+        t_down = true;       /* 手指还在屏上：整只手的这次手势作废（等抬起） */
+        t_ignore = true;
+    } else {
+        t_down = false;
+        t_have_last = false;
+        t_ignore = false;
+    }
 }
 
 /* 启动触摸采样（PSV 默认关闭，必须显式开启才能收到事件） */

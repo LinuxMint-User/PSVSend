@@ -119,14 +119,18 @@ static void utf16_to_utf8(const SceWChar16 *s, int len, char *o, int cap)
         wi++;
         if (cp < 0x80) {
             o[bi++] = (char)cp;
-        } else if (cp < 0x800 && bi + 1 < cap) {
+        } else if (cp < 0x800 && bi + 2 < cap) {
+            /* 各分支的余量判断都要保证"写完这 len 字节后还剩得下结尾 \0"：
+             * 用的是 bi + len < cap（而不是 bi + len - 1 < cap），否则函数末尾
+             * 的 o[bi] = 0 会写越界 1 字节（调用方落点是 pages_recv.c 的
+             * static char ime_out[128]）。 */
             o[bi++] = (char)(0xC0 | (cp >> 6));
             o[bi++] = (char)(0x80 | (cp & 0x3F));
-        } else if (cp < 0x10000 && bi + 2 < cap) {
+        } else if (cp < 0x10000 && bi + 3 < cap) {
             o[bi++] = (char)(0xE0 | (cp >> 12));
             o[bi++] = (char)(0x80 | ((cp >> 6) & 0x3F));
             o[bi++] = (char)(0x80 | (cp & 0x3F));
-        } else if (bi + 3 < cap) {
+        } else if (bi + 4 < cap) {
             o[bi++] = (char)(0xF0 | (cp >> 18));
             o[bi++] = (char)(0x80 | ((cp >> 12) & 0x3F));
             o[bi++] = (char)(0x80 | ((cp >> 6) & 0x3F));

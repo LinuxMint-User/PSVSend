@@ -116,8 +116,27 @@ static vita2d_font *load_slot(int slot)
     return buf ? vita2d_load_font_mem(buf, (unsigned)g_font_ram_len[slot]) : NULL;
 }
 
+/* 渲染 pass 中（vita2d_start_drawing..end_drawing 之间）置 1：此间禁止新建
+ * 字体槽（见 font_get 的守卫），因为建槽会分配 512² 显存纹理，落在渲染 pass
+ * 中途可触发 GPU crash 整机重启（见 font_preload_all 注释）。 */
+static int g_in_frame;
+static int g_font_warned;      /* 缺档/表满告警已打印次数（防 dlog 刷屏） */
+
+/* 已建槽中与 size 最接近的字体（无槽则 NULL）。用于"帧内不许建槽/表满"时的
+ * 降级：字号略有出入，但不会崩、也不丢字。 */
+static vita2d_font *font_nearest(int size, int cjk)
+{
+    int i, best = -1, bd = 0;
+    for (i = 0; i < g_fs_n; i++) {
+        int d = g_fs[i].size > size ? g_fs[i].size - size : size - g_fs[i].size;
+        if (best < 0 || d < bd) { best = i; bd = d; }
+    }
+    if (best < 0) return NULL;
+    return cjk ? g_fs[best].cjk : g_fs[best].lat;
+}
+
 /* 返回 size 像素字号的字体：cjk=0 拉丁、1 CJK（地区随当前界面语言）；加载
- * 失败返回 NULL。表满（UI 档位应远少于 MAX_FONT_SIZES）时回退 0 号槽。
+ * 失败返回 NULL。
  * 注意：新槽一次建齐 lat+cjk 两份，故建槽可能在"要拉丁"的那次调用里发生——
  * CJK 槽必须按当前界面语言算，不能沿用该次调用的 cjk 参数（否则两种字体
  * 会被建成同一份）。 */
@@ -127,6 +146,17 @@ vita2d_font *font_get(int size, int cjk)
     for (i = 0; i < g_fs_n; i++)
         if (g_fs[i].size == size)
             return cjk ? g_fs[i].cjk : g_fs[i].lat;
+    /* 帧内禁建槽：UI 字号档本应在启动时按 UI_FONT_SCALES 建齐（font_preload_all），
+     * 走到这里说明该字号漏在表外（页面新加了字号档没补表）。此时宁可降级到最接近
+     * 的已建档，也不能在建槽时触发 GPU crash。 */
+    if (g_in_frame) {
+        if (g_font_warned < 8) {
+            g_font_warned++;
+            dlog("font: size %d requested in-frame but not preloaded -> degrade",
+                 size);
+        }
+        return font_nearest(size, cjk);
+    }
     if (g_fs_n < MAX_FONT_SIZES) {
         int slot = cjk_slot_current();
         g_fs[g_fs_n].size     = size;
@@ -139,15 +169,23 @@ vita2d_font *font_get(int size, int cjk)
         g_fs_n++;
         return cjk ? g_fs[g_fs_n - 1].cjk : g_fs[g_fs_n - 1].lat;
     }
-    return cjk ? g_fs[0].cjk : g_fs[0].lat;
+    if (g_font_warned < 8) {
+        g_font_warned++;
+        dlog("font: slot table full (%d), size %d -> degrade", MAX_FONT_SIZES, size);
+    }
+    return font_nearest(size, cjk);
 }
 
-/* UI 字号档位表 = 现有页面全部 w_text scale 经 font_px 取整的集合；
- * font_preload_all 启动建齐。日后新增字号档请同步补进此表。 */
-static const int g_font_sizes[] = {
-    16, 18, 20, 21, 22, 23, 24, 25, 26, 30, 34,
-};
-#define FONT_SIZES_N ((int)(sizeof g_font_sizes / sizeof g_font_sizes[0]))
+/* UI 字号档 = 各页面 w_text / w_text_w / w_text_mid / w_text_clip 的 scale 取值
+ * 集合，这里是**唯一真源**（scale→px 的换算只走 w_font_px，字号档由它生成，
+ * 不再手工维护一张 px 表）。页面新增字号档时补进本列表即可；漏补不会崩——
+ * font_get 的帧内守卫会拦下建槽并降级，同时 dlog 报出漏掉的字号。 */
+#define UI_FONT_SCALES(X)                                                    \
+    X(0.8f) X(0.9f) X(1.0f) X(1.05f) X(1.1f) X(1.15f) X(1.2f) X(1.25f)      \
+    X(1.3f) X(1.5f) X(1.7f)
+#define SCALE_ENTRY(s) s,
+static const float g_font_scales[] = { UI_FONT_SCALES(SCALE_ENTRY) };
+#define FONT_SCALES_N ((int)(sizeof g_font_scales / sizeof g_font_scales[0]))
 
 /* 启动时帧外预加载全部字号档（见 ui_run 的调用点）。
  * 动机：字体对象是懒加载的，若某字号第一次被页面用到才创建，创建动作
@@ -155,42 +193,63 @@ static const int g_font_sizes[] = {
  * 映射）会落在渲染 pass 中途（start_drawing 与 end_drawing 之间）。GPU
  * 正异步执行上一批命令时 CPU 侧改显存管理状态，可触发 render GPU crash
  * （无 CPU 异常线程、纯 GPU 驱动报错，表现为撕裂后崩溃）。UI 字号档位
- * 有限，启动一次建齐后 font_get 运行时只命中缓存，此路径被整体消除。
+ * 有限，启动一次建齐后 font_get 运行时只命中缓存，此路径被整体消除；
+ * font_get 另有帧内禁建槽守卫兜住"表漏了某档"的情况。
  * 字形 glyph 仍按需光栅化写进已建好的 atlas（纯 CPU memcpy，不创建 GPU
  * 资源，无此风险），故无需也不应全量光栅化字形。 */
 static void font_preload_all(void)
 {
-    int i, ok = 0;
+    int i, ok = 0, sz;
     g_font_lang = i18n_lang();
-    for (i = 0; i < FONT_SIZES_N; i++) {
-        if (font_get(g_font_sizes[i], 0)) ok++;   /* latin */
-        if (font_get(g_font_sizes[i], 1)) ok++;   /* CJK  */
+    for (i = 0; i < FONT_SCALES_N; i++) {
+        sz = w_font_px(g_font_scales[i]);
+        if (font_get(sz, 0)) ok++;   /* latin */
+        if (font_get(sz, 1)) ok++;   /* CJK  */
     }
     dlog("font preload done: %d/%d fonts, sizes %d..%d, lang=%d cjk_slot=%d "
-         "lat=%p cjk=%p", ok, 2 * FONT_SIZES_N, g_font_sizes[0],
-         g_font_sizes[FONT_SIZES_N - 1], g_font_lang, cjk_slot_current(),
-         (void *)g_fs[0].lat, (void *)g_fs[0].cjk);
+         "lat=%p cjk=%p", ok, 2 * FONT_SCALES_N,
+         w_font_px(g_font_scales[0]), w_font_px(g_font_scales[FONT_SCALES_N - 1]),
+         g_font_lang, cjk_slot_current(), (void *)g_fs[0].lat, (void *)g_fs[0].cjk);
 }
 
-/* 界面语言换了地区（简↔繁；日后含日文）时，把各字号的 CJK 字体对象换成对应
- * 地区那份：释放旧的、按新槽重建。必须帧外调用——vita2d_load_font_mem 会建
- * 512x512 显存纹理，落在渲染 pass 中途有 GPU crash 风险（见 font_preload_all
- * 注释）；ui_run 在每帧 start_drawing 之前检查一次。首次换到某地区会读盘
- * ~1.6s（16MB），属一次性开销。 */
+/* 界面语言换了地区（简↔繁↔日）时，把各字号的 CJK 字体对象换成对应地区那份：
+ * 先建新的、成功后再释放旧的。必须帧外调用——vita2d_load_font_mem 会建 512x512
+ * 显存纹理，落在渲染 pass 中途有 GPU crash 风险（见 font_preload_all 注释）；
+ * ui_run 在每帧 start_drawing 之前检查一次。首次换到某地区会读盘 ~1.6s
+ * （16MB），属一次性开销。
+ * 失败处理：先删后建的老写法一旦读盘/建对象失败，该字号的 CJK 就永久为 NULL
+ * （整屏汉字消失）且 cjk_slot 已记新区、后续帧不再重试。现在建失败就保留旧
+ * 字体继续显示（字形地区不对，但汉字还在），且不推进 g_font_lang → 下一帧
+ * 自动重试；连续失败 FONT_RELOAD_MAX 次才放弃（避免每帧都去读 16MB 卡住）。 */
+#define FONT_RELOAD_MAX 3
 static void font_reload_cjk(void)
 {
-    int i, slot;
-    g_font_lang = i18n_lang();
+    static int fails;
+    int i, slot, ok = 1;
     slot = cjk_slot_current();
     for (i = 0; i < g_fs_n; i++) {
+        vita2d_font *nf;
         if (g_fs[i].cjk_slot == slot)
             continue;
+        nf = load_slot(slot);
+        if (!nf) {                /* 建失败：保留旧对象（内容将就但可见） */
+            ok = 0;
+            continue;
+        }
         if (g_fs[i].cjk)
             vita2d_free_font(g_fs[i].cjk);
-        g_fs[i].cjk = load_slot(slot);
+        g_fs[i].cjk = nf;
         g_fs[i].cjk_slot = slot;
     }
-    dlog("font cjk reload: lang=%d slot=%d", g_font_lang, slot);
+    if (ok) {
+        fails = 0;
+        g_font_lang = i18n_lang();
+    } else if (++fails >= FONT_RELOAD_MAX) {
+        fails = 0;
+        g_font_lang = i18n_lang();   /* 放弃：不再每帧重试，等下次换语言再说 */
+    }
+    dlog("font cjk reload: lang=%d slot=%d ok=%d fails=%d", g_font_lang, slot, ok,
+         fails);
 }
 
 /* ---------- widget 命中表 ---------- */
@@ -258,6 +317,7 @@ static void input_page(const Input *in)
 void ui_run(void)
 {
     static uint64_t last_be = 0;
+    static bool ime_was_busy;      /* 上一帧键盘是否打开（用于解冻时复位输入边沿） */
     uint64_t run0 = (uint64_t)sceKernelGetSystemTimeWide() / 1000;
     ui_input_init();           /* 开启触摸采样 */
     pages_init();
@@ -290,6 +350,7 @@ void ui_run(void)
             font_reload_cjk();
 
         vita2d_start_drawing();
+        g_in_frame = 1;              /* 此间 font_get 禁止新建字体槽（GPU crash 风险） */
         vita2d_set_clear_color(theme->bg);
         vita2d_clear_screen();
 
@@ -298,14 +359,18 @@ void ui_run(void)
 
         if (!page_ime_busy()) {          /* 系统键盘打开期间按键/触摸归键盘，页面输入暂停 */
             Input in;
+            if (ime_was_busy)
+                ui_input_resync();       /* 冻结期结束：先对齐边沿，别把"还在按着的键"当新按下 */
             ui_input_poll(&in);
             if (in.tap || in.up || in.down || in.left || in.right ||
                 in.confirm || in.back || in.menu || in.alt || in.square ||
                 in.drag_start || in.dragging)
                 input_page(&in);
         }
+        ime_was_busy = page_ime_busy();
 
         vita2d_end_drawing();
+        g_in_frame = 0;
         /* 系统对话框（IME 键盘/消息框等）由应用每帧把 dialog 合成进显示缓冲，
          * 由 vita2d_common_dialog_update() 完成（内部自检有无 dialog 在运行，
          * 无则空转）。缺此调用时 dialog 引擎卡在 RUNNING、画面永不出现——

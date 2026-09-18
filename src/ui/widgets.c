@@ -26,7 +26,9 @@
 #define FONT_PX   20.0f
 #define FONT_ASC  0.88f
 
-static int font_px(float scale)
+/* scale → 像素字号。对外声明（ui.h）供 ui_main.c 由 scale 列表推字号档，
+ * 保证"scale 与 px 的对应关系"全项目只有这一处定义。 */
+int w_font_px(float scale)
 {
     return (int)(scale * FONT_PX + 0.5f);
 }
@@ -96,7 +98,7 @@ void w_text(float x, float y, float scale, uint32_t color, const char *fmt, ...)
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     if (!*buf) return;
-    int size = font_px(scale);
+    int size = w_font_px(scale);
     int base_y = (int)(y + FONT_ASC * size + 0.5f);
     int pen = (int)(x + 0.5f);
     const char *p = buf;
@@ -118,7 +120,7 @@ void w_text_w(float scale, const char *text, int *w, int *h)
     if (w) *w = 0;
     if (h) *h = 0;
     if (!text || !*text) return;
-    int size = font_px(scale);
+    int size = w_font_px(scale);
     char seg[512];
     int pen = 0;
     const char *p = text;
@@ -139,16 +141,6 @@ void w_text_w(float scale, const char *text, int *w, int *h)
     if (h) *h = size;   /* 行高 ≈ 字号 px */
 }
 
-static const char *utf8_skip(const char *p)
-{
-    unsigned char c = (unsigned char)*p;
-    if (c < 0x80) return p + 1;
-    if ((c & 0xE0) == 0xC0) return p + 2;
-    if ((c & 0xF0) == 0xE0) return p + 3;
-    if ((c & 0xF8) == 0xF0) return p + 4;
-    return p + 1;
-}
-
 void w_text_clip(float x, float y, float scale, uint32_t color,
                  const char *text, int max_w)
 {
@@ -158,7 +150,11 @@ void w_text_clip(float x, float y, float scale, uint32_t color,
     const char *p = text;
     int n = 0;
     while (*p) {
-        const char *next = utf8_skip(p);
+        uint32_t cp;
+        /* 逐字符步进统一走 utf8_next_cp：它校验后继字节与 \0，非法/截断序列
+         * 只前进 1 字节；早先这里另有一套"按首字节宽度盲进 2~4 字节"的实现，
+         * 定长 name 数组被填满、结尾是半个汉字时它会越过 '\0' 继续读。 */
+        const char *next = utf8_next_cp(p, &cp);
         if (n + (int)(next - p) >= (int)sizeof buf) break;   /* 文本过长：截断 */
         memcpy(tmp, buf, n);
         memcpy(tmp + n, p, next - p);
@@ -197,7 +193,8 @@ int w_text_mid(float x, float y, float scale, uint32_t color,
         return max_w;
     }
     while (*p && ncp < (int)(sizeof off / sizeof off[0])) {
-        const char *nx = utf8_skip(p);
+        uint32_t cp;
+        const char *nx = utf8_next_cp(p, &cp);
         int n = (int)(nx - p), w = 0;
         if (n > (int)sizeof cbuf - 1) n = (int)sizeof cbuf - 1;
         memcpy(cbuf, p, n);

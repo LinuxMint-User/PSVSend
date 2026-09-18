@@ -149,6 +149,9 @@ extern int g_back_key;
 /* ---------- 输入（input.c） ---------- */
 void ui_input_init(void);
 void ui_input_poll(Input *in);
+/* 输入被冻结（系统键盘打开期间整段不轮询）后调用一次：把边沿状态对齐到
+ * "此刻的真实按键/触摸"，避免解冻首帧凭空合成一次确认/返回或 tap。 */
+void ui_input_resync(void);
 
 /* ---------- 初始化（pages.c） ---------- */
 void pages_init(void);
@@ -184,6 +187,9 @@ bool page_ime_busy(void);   /* 改名事务进行中：主循环应跳过页面�
 void page_ime_pump(void);   /* 主循环每帧帧间调用：打开挂起键盘 / 收尾写回 */
 
 /* ---------- 控件绘制（widgets.c） ---------- */
+/* scale → 像素字号的唯一换算点（widgets.c 内定义 FONT_PX）；ui_main.c 用它
+ * 由"UI 用到的 scale 列表"推出启动预加载的字号档，两边不会再各存一份。 */
+int  w_font_px(float scale);
 void w_text(float x, float y, float scale, uint32_t color, const char *fmt, ...);
 void w_text_w(float scale, const char *text, int *w, int *h);
 /* 中间省略绘制（放不下 max_w 时画"头…尾"，尾部保留以露出扩展名），

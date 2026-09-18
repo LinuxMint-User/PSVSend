@@ -468,6 +468,16 @@ static void w_checkbox(Rect b, bool on)
     }
 }
 
+/* 把一份行内区域注册成触摸区，先按列表可视区（RSS_TOP..RSS_BOTTOM）裁剪：
+ * 绘制有 clip 矩形管着，触摸命中没有——半滚出的行其命中框会伸进页头空白带
+ * 或页脚，点那里会误触到行（弹出改名键盘、误切勾选）。口径同 add_row_hit。 */
+static void rss_add_hit(int id, Rect r)
+{
+    if (r.y < RSS_TOP) { r.h -= RSS_TOP - r.y; r.y = RSS_TOP; }
+    if (r.y + r.h > RSS_BOTTOM) r.h = RSS_BOTTOM - r.y;
+    if (r.h > 0) w_add(id, r);
+}
+
 void page_recv_setup_render(void)
 {
     w_page_header(tr("Receive setup"));
@@ -485,7 +495,7 @@ void page_recv_setup_render(void)
         bool sel = (i == g_app.inc_sel);
         w_rect(r, theme->card);
         if (sel) w_rect((Rect){ 24, top, 4, RSS_ROW_H }, theme->accent);
-        w_add(i, r);
+        rss_add_hit(i, r);
 
         if (i == 0) {
             /* 保存目录行：本次目录（默认=config saveDir）。确认键/点击进入
@@ -521,8 +531,8 @@ void page_recv_setup_render(void)
                theme->text_dim, "%s", sz);
         Rect ren = { 700, top + 9, 108, 38 };
         Rect chk = { 824, top + 9, 38, 38 };
-        w_add(RS_REN_ID + i, ren);
-        w_add(RS_CHK_ID + i, chk);
+        rss_add_hit(RS_REN_ID + i, ren);
+        rss_add_hit(RS_CHK_ID + i, chk);
         w_rect_outline(ren, theme->border);
         int w2 = 0, h2 = 0;
         w_text_w(1.0f, tr("Rename"), &w2, &h2);

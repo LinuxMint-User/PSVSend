@@ -296,8 +296,19 @@ void page_settings_render(void)
             continue;
         }
         Rect r = { 24, top, SCR_W - 48, SET_ROW_H - 4 };
-        w_add(item * 2,     (Rect){ r.x, r.y, r.w / 2, r.h });
-        w_add(item * 2 + 1, (Rect){ r.x + r.w / 2, r.y, r.w - r.w / 2, r.h });
+        /* 命中区按可视区裁剪后再注册：绘制有 clip 矩形管着，触摸命中没有——
+         * 滚到页头/页脚方向半露出的行，其矩形会伸进页头空白带与页脚，点那里
+         * 会误触到该行（设置页表现为翻主题/开键盘）。口径同 add_row_hit。 */
+        {
+            Rect hit = r;
+            if (hit.y < LIST_TOP) { hit.h -= LIST_TOP - hit.y; hit.y = LIST_TOP; }
+            if (hit.y + hit.h > LIST_BOTTOM) hit.h = LIST_BOTTOM - hit.y;
+            if (hit.h > 0) {
+                w_add(item * 2,     (Rect){ hit.x, hit.y, hit.w / 2, hit.h });
+                w_add(item * 2 + 1, (Rect){ hit.x + hit.w / 2, hit.y,
+                                            hit.w - hit.w / 2, hit.h });
+            }
+        }
         switch (item) {
         case SET_ITEM_HOSTNAME:
             w_row(r, tr("Hostname"),
