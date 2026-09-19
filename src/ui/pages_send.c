@@ -125,61 +125,39 @@ static void dev_sync(void)
     else if (g_app.dev_sel >= n) g_app.dev_sel = n - 1;
 }
 
-/* 页头下细条：优先"请先选择文件"提示，其次手动扫描的实时进度/结果
- * （与列表是否为空无关；三角键按下后下一帧起可见，round 结束后约 4s
- * 报告"扫到 N 台"）。两种提示共用这一行，避免挤占两栏的竖直空间。 */
+/* 页头下细条：显示"焦点栏当前光标项"的完整标识（行内被截断的信息在这里补全）。
+ *   文件栏 —— 选中文件的完整路径（行内文件名过长会中间省略，这里能核对到底
+ *             是哪个文件，尤其移除前确认用）；
+ *   设备栏 —— 目标地址 proto://ip:port（行内只有别名与型号，地址列表里没有）。
+ * 扫描进度/结果不在这里：它归设备栏标题行右侧（就在它描述的那一栏里）。
+ * "请先选择文件"是短时警告，独占整行、优先于上述两条。 */
+#define STRIP_Y 56
+
 static void dev_strip(void)
 {
     uint64_t now = (uint64_t)sceKernelGetSystemTimeWide();
+    int i;
+
     if (dev_hint_us && now < dev_hint_us) {
-        w_text(28, 56, 0.9f, theme->warn, "%s", tr("Select files first"));
+        w_text(28, STRIP_Y, 0.9f, theme->warn, "%s", tr("Select files first"));
         return;
     }
     dev_hint_us = 0;
-    if (api_scan_active()) {
-        int d = api_scan_done(), t = api_scan_total(), f = g_app.dev_count;
-        char st[96];
-        if (t <= 0) t = 254;
-        if (d < 0 || d > t) d = 0;
-        dev_scan_was = 1;
-        dev_scan_end_us = 0;          /* 新一轮开始，旧的结果提示作废 */
-        /* 分母是 /24 上限、不是"必须探完才能用"的门槛：设备入表即可选、可发，
-         * 扫描只是后台补全列表。已有设备时明说可继续，免得用户对着 12/254 干等
-         * （设备通常 ~0.7s 就出现）；一台未有时不出现该句，那时它只是空话。 */
-        if (f > 0)
-            snprintf(st, sizeof st,
-                     tr("Scanning... %d of %d possible hosts, %d found, you could proceed"),
-                     d, t, f);
-        else
-            snprintf(st, sizeof st, tr("Scanning... %d of %d possible hosts"), d, t);
-        w_text(28, 56, 0.9f, theme->text_dim, "%s", st);
-    } else if (dev_scan_was) {        /* round 结束边沿：记时刻与结果 */
-        dev_scan_was = 0;
-        dev_scan_end_us = now;
-        /* 以"表里现有设备数"为准（而非仅主动探测的 api_scan_found()）：
-         * 扫描期间入表的既可能有探测命中，也可能有设备自己发的 register，
-         * round 结束时列表里实际有几台就报几台，横幅才不与列表矛盾 */
-        dev_scan_last_found = g_app.dev_count;
-    }
-    if (dev_scan_end_us && now - dev_scan_end_us < 4000000ull) {
-        char st[96];
-        if (dev_scan_last_found > 0)
-            snprintf(st, sizeof st, tr("Scan complete, %d device%s found"),
-                     dev_scan_last_found,
-                     dev_scan_last_found == 1 ? "" : "s");
-        else
-            snprintf(st, sizeof st, tr("Scan complete, no devices"));
-        w_text(28, 56, 0.9f, theme->text_dim, "%s", st);
-        return;
-    }
-    dev_scan_end_us = 0;              /* 提示过期，清标记 */
 
-    /* 文件栏聚焦且已选非空：细条改显示选中行的完整路径。行内文件名过长会被
-     * 截断，这里能核对到底是哪个文件（尤其删除前确认用）。 */
-    if (g_app.pane_focus == 1 && g_app.picked_count > 0) {
-        int i = g_app.picked_sel;
+    if (g_app.pane_focus == 1) {
+        if (g_app.picked_count <= 0) return;
+        i = g_app.picked_sel;
         if (i < 0 || i >= g_app.picked_count) i = 0;
-        w_text_lead(28, 56, 0.9f, theme->text_dim, g_app.picked[i].path, SCR_W - 56);
+        w_text_lead(28, STRIP_Y, 0.9f, theme->text_dim,
+                    g_app.picked[i].path, SCR_W - 56);
+    } else {
+        char addr[48];
+        if (g_app.dev_count <= 0) return;
+        i = g_app.dev_sel;
+        if (i < 0 || i >= g_app.dev_count) i = 0;
+        snprintf(addr, sizeof addr, "%s://%s:%d",
+                 g_app.dev_proto[i], g_app.dev_ip[i], g_app.dev_port[i]);
+        w_text_clip(28, STRIP_Y, 0.9f, theme->text_dim, addr, SCR_W - 56);
     }
 }
 
@@ -190,6 +168,56 @@ static void dev_pane_render(const PaneRect *p, bool focused)
     char title[48];
     snprintf(title, sizeof title, tr("Devices (%d)"), count);
     pane_title(p, title, focused);
+
+    /* 扫描进度/结果画在标题行右侧 —— 就在它描述的那一栏里，不再占页头下的
+     * 细条（细条空出来专给"当前光标项的完整标识"）。状态推进每帧一次、与是否
+     * 绘制无关；空态（无设备）由下面的栏内文案负责，这里不画。 */
+    {
+        char st[64];
+        bool has = false;
+        uint64_t now = (uint64_t)sceKernelGetSystemTimeWide();
+        if (api_scan_active()) {
+            int d = api_scan_done(), t = api_scan_total();
+            if (t <= 0) t = 254;
+            if (d < 0 || d > t) d = 0;
+            dev_scan_was = 1;
+            dev_scan_end_us = 0;      /* 新一轮开始，旧的结果提示作废 */
+            snprintf(st, sizeof st, tr("Scanning... %d/%d"), d, t);
+            has = true;
+        } else if (dev_scan_was) {    /* round 结束边沿：记时刻与结果 */
+            dev_scan_was = 0;
+            dev_scan_end_us = now;
+            /* 以"表里现有设备数"为准（而非仅主动探测的 api_scan_found()）：
+             * 扫描期间入表的既可能有探测命中，也可能有设备自己发的 register，
+             * round 结束时列表里实际有几台就报几台，横幅才不与列表矛盾 */
+            dev_scan_last_found = count;
+        }
+        if (!has) {
+            if (dev_scan_end_us && now - dev_scan_end_us < 4000000ull) {
+                if (dev_scan_last_found > 0)
+                    snprintf(st, sizeof st, tr("Scan complete, %d device%s found"),
+                             dev_scan_last_found, dev_scan_last_found == 1 ? "" : "s");
+                else
+                    snprintf(st, sizeof st, tr("Scan complete, no devices"));
+                has = true;
+            } else {
+                dev_scan_end_us = 0;  /* 提示过期，清标记 */
+            }
+        }
+        if (count > 0 && has) {
+            int tw = 0, sw = 0, avail;
+            w_text_w(1.0f, title, &tw, NULL);
+            w_text_w(0.9f, st, &sw, NULL);
+            avail = p->w - 8 - tw - 16;   /* 标题右侧剩余（含 16px 间距） */
+            if (sw <= avail)
+                w_text_right(p->x + p->w - 4, PANE_TITLE_Y + 3, 0.9f,
+                             theme->text_dim, "%s", st);
+            else if (avail >= 120)        /* 宽度不够就裁尾（保标题），别整条消失 */
+                w_text_clip(p->x + p->w - 4 - avail, PANE_TITLE_Y + 3, 0.9f,
+                            theme->text_dim, st, avail);
+        }
+    }
+
     if (count > 0) {
         area_clamp(&dev_scroll, count, PANE_VIEW_H);
         vita2d_enable_clipping();
