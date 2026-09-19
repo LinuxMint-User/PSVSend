@@ -35,7 +35,7 @@ void page_progress_render(void)
     int i;
     SceOff done[MAX_PICKED];
     bool rfail[MAX_PICKED] = { false };  /* 每行是否失败（发送路径：逐文件独立成败） */
-    SceOff total = 0;
+    SceOff sent_bytes = 0;               /* 真实已传字节（速度用，不从百分比反推） */
     int fin = 0, nfail = 0, active = -1;
     bool fail_state = false, partial = false;
     XferInfo xv;
@@ -46,6 +46,7 @@ void page_progress_render(void)
         /* 发送路径（真实）：从 xfer 模块拷快照映射到行显示数组 */
         api_send_info(&xv);
         xf_count = xv.count > MAX_PICKED ? MAX_PICKED : xv.count;
+        sent_bytes = xv.total_sent;
         for (i = 0; i < xf_count; i++) {
             snprintf(xf_name[i], sizeof xf_name[0], "%s",
                      xv.f[i].name[0] ? xv.f[i].name : "?");
@@ -75,7 +76,6 @@ void page_progress_render(void)
         } else if (xv.active && xv.cur >= 0) {
             msg = xv.msg[0] ? xv.msg : tr("Sending...");
         }
-        for (i = 0; i < xf_count; i++) total += xf_size[i];
     } else {
         /* 接收路径（真实）：每帧从 receive 模块拷会话快照；会话还没建好
          * （Accept 刚点、http 线程未醒的几帧）用 start_recv 捕获的清单兜底。 */
@@ -92,7 +92,7 @@ void page_progress_render(void)
                 if (xf_size[i] == 0 || done[i] >= xf_size[i]) fin++;
             }
             active = rs.cur;                       /* 正在收的文件（-1=无） */
-            total = rs.total;
+            sent_bytes = rs.got_total;
             if (rs.state == RECV_ST_READY || rs.state == RECV_ST_RECEIVING)
                 g_app.prog_ms =
                     (int)((sceKernelGetSystemTimeWide() - rs.start_us) / 1000);
@@ -123,7 +123,6 @@ void page_progress_render(void)
              * 如请求恰好在决定前过期）→ 不能卡在进度页，给个失败态可退出。 */
             for (i = 0; i < xf_count; i++) {
                 done[i] = 0;
-                total += xf_size[i];
                 if (xf_size[i] == 0) fin++;
             }
             msg = tr("Waiting for sender to start...");
@@ -211,7 +210,12 @@ void page_progress_render(void)
         w_text_w(1.15f, st, &tw, &th);
         w_text(920 - tw, 376, 1.15f, sc, "%s", st);
     }
-    w_bar((Rect){ 40, 400, 880, 16 }, theme->card, theme->accent, g_app.prog_pct);
+    /* 主进度条：填充保持"声明字节里实际过了多少"（不改），颜色按终态取
+     * （运行中 / 成功 = accent，部分失败 = warn，取消·整体失败 = danger） */
+    uint32_t bar_col = theme->accent;
+    if (partial) bar_col = theme->warn;
+    else if (g_app.prog_cancel || fail_state) bar_col = theme->danger;
+    w_bar((Rect){ 40, 400, 880, 16 }, theme->card, bar_col, g_app.prog_pct);
 
     /* 状态行：失败原因 / 等待对方接受 / 正在发送 */
     if (msg) {
@@ -221,7 +225,7 @@ void page_progress_render(void)
     /* 高级面板：文件计数 / 耗时 / 速度（十进制 MB，1 MB = 1,000,000 B） */
     if (g_app.prog_info) {
         double sec = g_app.prog_ms / 1000.0;
-        double mb = (double)(total * (SceOff)g_app.prog_pct / 100) / 1000000.0;
+        double mb = (double)sent_bytes / 1000000.0;
         double speed = sec > 0.05 ? mb / sec : 0.0;
         char st[160];
         snprintf(st, sizeof st,
