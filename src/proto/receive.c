@@ -177,11 +177,13 @@ static int utf8_floor(const char *s, int n)
  * Windows 保留名（CON/PRN…）改任何东西——那在 ux0 上完全合法，擅自改只会让
  * 发送端和接收端对不上名。
  * 超长时按用户约定的"保完整后缀、从前往后截断主名"缩短；绝不切出半个多字节
- * 字符（非法 UTF-8 会让 sceIoOpen 直接返 EINVAL、整批接收失败）。 */
-void recv_sanitize_name(const char *in, char *out, int n)
+ * 字符（非法 UTF-8 会让 sceIoOpen 直接返 EINVAL、整批接收失败）。
+ * 返回 true = 因超出长度预算被截短（确认页提示"文件名过长"就用它，不能用
+ * "缩短前后字节数不等"来推——路径前缀/首尾空白点也会让名字变短）。 */
+bool recv_sanitize_name(const char *in, char *out, int n)
 {
     int lim, o = 0, i, keep, elen = 0;
-    bool any = false;
+    bool any = false, cut = false;
     const char *slash, *dot = NULL;
     int len;
     if (!in) in = "";
@@ -190,11 +192,12 @@ void recv_sanitize_name(const char *in, char *out, int n)
     while (*in == ' ') in++;                     /* 去前导空白 */
     lim = n - 1;
     if (lim > RECV_NAME_MAX) lim = RECV_NAME_MAX;
-    if (lim < 1) { out[0] = 0; return; }
+    if (lim < 1) { out[0] = 0; return false; }
     len = (int)strlen(in);
     if (len <= lim) {
         keep = len;                              /* 放得下：原样保留 */
     } else {
+        cut = true;                              /* 装不下：这次才是"名字过长" */
         dot = strrchr(in, '.');
         if (dot && dot != in && (int)strlen(dot) <= RECV_EXT_MAX &&
             (int)strlen(dot) < lim)
@@ -224,6 +227,7 @@ void recv_sanitize_name(const char *in, char *out, int n)
     out[o] = 0;
     if (!any || !out[0] || strcmp(out, ".") == 0 || strcmp(out, "..") == 0)
         snprintf(out, n, "unnamed");
+    return cut;
 }
 
 /* 拆出 "base" 与扩展名 ".ext"（无扩展则 ext=""） */
@@ -549,13 +553,14 @@ static int recv_http_prepare(const char *body, const char *ip, char *resp, int r
     if (json_iter_first(filesv, &it)) {
         do {
             char raw[512], nm[192], sh[65];
+            bool cut;
             raw[0] = nm[0] = sh[0] = 0;
             p = json_get_val(it.val, "fileName");
             if (p) json_val_str(p, raw, sizeof raw);
             /* 名字在此就规整：净化 + 超长保后缀截断（与落盘同一函数）。若拖到后面
              * 靠 192 缓冲 snprintf 拷贝，尾巴会被截成半个 UTF-8 字符，落盘时
              * sceIoOpen 直接 EINVAL（真机 d133 的失败根因）。 */
-            recv_sanitize_name(raw, nm, sizeof nm);
+            cut = recv_sanitize_name(raw, nm, sizeof nm);
             p = json_get_val(it.val, "size");
             sz = 0;
             if (p) json_val_int(p, &sz);
@@ -571,8 +576,10 @@ static int recv_http_prepare(const char *body, const char *ip, char *resp, int r
             }
             snprintf(g_pend.f[n].fileid, sizeof g_pend.f[n].fileid, "%s", it.key);
             snprintf(g_pend.f[n].name, sizeof g_pend.f[n].name, "%s", nm);
-            /* 名字被缩短了？（确认页据此提示"文件名过长，将自动缩短"） */
-            g_pend.f[n].trunc = strlen(raw) > strlen(nm);
+            /* 名字过长被截短了？（确认页据此提示"文件名过长，将自动缩短"）。
+             * 用 sanitize 的返回值，不能拿 strlen(raw) > strlen(nm) 推——名字里
+             * 带路径前缀、首尾空白/点时也会变短，那样会把正常名字全报成"过长"。 */
+            g_pend.f[n].trunc = cut;
             g_pend.f[n].size = (SceOff)sz;
             snprintf(g_pend.f[n].sha256, sizeof g_pend.f[n].sha256, "%s", sh);
             g_pend.f[n].rname[0] = 0;    /* 默认沿用对方文件名；UI 可改（recv_set_name） */

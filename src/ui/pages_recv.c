@@ -135,19 +135,28 @@ void page_recv_confirm_render(void)
         warn++;
     }
 
-    /* 文件预览（前几条） */
+    /* 文件预览（前几条）：整块必须待在卡片里（卡片底 = card.y + card.h），
+     * 提示行越多起点越低，所以按剩余高度收缩条数——否则"…还有 N 个"会被顶
+     * 出卡片下沿。每行占 26px、文字高 20px，末行文字底留 10px 内边距。 */
+    int list_y = 240 + warn * 20;
+    int limit_y = card.y + card.h - 10;
     int show = n < 5 ? n : 5;
-    int py = 240 + warn * 20;
+    while (show > 0) {
+        int last = list_y + (show - 1) * 26 + 20;     /* 最后一行文字底 */
+        if (n > show) last += 26;                     /* 还要留"…还有 N 个"那行 */
+        if (last <= limit_y) break;
+        show--;
+    }
     for (i = 0; i < show; i++) {
         int sw = 0, nw;
         w_human_size(g_app.inc_files[i].size, sz);
         w_text_w(1.0f, sz, &sw, NULL);
-        nw = w_text_mid(72, py + i * 26, 1.0f, theme->text,
+        nw = w_text_mid(72, list_y + i * 26, 1.0f, theme->text,
                         g_app.inc_files[i].name, card.w - 160 - sw);
-        w_text(72 + nw + 12, py + i * 26, 1.0f, theme->text_dim, "(%s)", sz);
+        w_text(72 + nw + 12, list_y + i * 26, 1.0f, theme->text_dim, "(%s)", sz);
     }
     if (n > show)
-        w_text(60, py + show * 26, 1.0f, theme->text_dim,
+        w_text(60, list_y + show * 26, 1.0f, theme->text_dim,
                tr("  ... %d more"), n - show);
 
     /* 底部三个按钮：Reject / Setup / Accept */
@@ -304,11 +313,8 @@ static void start_recv(void)
 }
 
 /* ================= 接收设置页（本次保存目录 + 逐文件勾选/改名占位） ================= */
-#define RSS_TOP     68
-#define RSS_BOTTOM  (SCR_H - 46 - 14)  /* 页脚上方留空 */
-#define RSS_VIEW    (RSS_BOTTOM - RSS_TOP)
-#define RSS_ROW_H   56
-#define RSS_STRIDE  60
+/* 本页是整幅列表，几何直接走 ui.h 的公共常量（列表顶 / 可视区底 / 行高 / 行步进），
+ * 不再另立一套 RSS_*——此前列表顶 68 / 步进 60 / 底部留白 14 与公共口径都不一致。 */
 #define RS_REN_ID   0x4000             /* 触摸 id：改名按钮 = 基址 + 行号 */
 #define RS_CHK_ID   0x8000             /* 触摸 id：勾选框  = 基址 + 行号 */
 
@@ -443,7 +449,7 @@ void page_ime_pump(void)
 static void rs_clamp(void)
 {
     int rows = 1 + g_app.inc_count;
-    int max_s = rows * RSS_STRIDE - RSS_VIEW;
+    int max_s = rows * ROW_STRIDE - LIST_VIEW_H;
     if (max_s < 0) max_s = 0;
     if (rs_scroll < 0) rs_scroll = 0;
     if (rs_scroll > max_s) rs_scroll = max_s;
@@ -452,10 +458,10 @@ static void rs_clamp(void)
 static void rs_keep_visible(void)
 {
     int rows = 1 + g_app.inc_count;
-    int st = g_app.inc_sel * RSS_STRIDE;
-    int bot = st + RSS_ROW_H;
+    int st = g_app.inc_sel * ROW_STRIDE;
+    int bot = st + ROW_H;
     if (st < rs_scroll) rs_scroll = st;
-    if (bot > rs_scroll + RSS_VIEW) rs_scroll = bot - RSS_VIEW;
+    if (bot > rs_scroll + LIST_VIEW_H) rs_scroll = bot - LIST_VIEW_H;
     rs_clamp();
 }
 
@@ -479,13 +485,13 @@ static void w_checkbox(Rect b, bool on)
     }
 }
 
-/* 把一份行内区域注册成触摸区，先按列表可视区（RSS_TOP..RSS_BOTTOM）裁剪：
+/* 把一份行内区域注册成触摸区，先按列表可视区（LIST_TOP..LIST_BOTTOM）裁剪：
  * 绘制有 clip 矩形管着，触摸命中没有——半滚出的行其命中框会伸进页头空白带
  * 或页脚，点那里会误触到行（弹出改名键盘、误切勾选）。口径同 add_row_hit。 */
 static void rss_add_hit(int id, Rect r)
 {
-    if (r.y < RSS_TOP) { r.h -= RSS_TOP - r.y; r.y = RSS_TOP; }
-    if (r.y + r.h > RSS_BOTTOM) r.h = RSS_BOTTOM - r.y;
+    if (r.y < LIST_TOP) { r.h -= LIST_TOP - r.y; r.y = LIST_TOP; }
+    if (r.y + r.h > LIST_BOTTOM) r.h = LIST_BOTTOM - r.y;
     if (r.h > 0) w_add(id, r);
 }
 
@@ -498,17 +504,17 @@ void page_recv_setup_render(void)
     int i;
 
     vita2d_enable_clipping();
-    vita2d_set_clip_rectangle(0, RSS_TOP, SCR_W, RSS_BOTTOM);
-    for (i = rs_scroll / RSS_STRIDE; i < rows; i++) {
-        int top = RSS_TOP + i * RSS_STRIDE - rs_scroll;
-        if (top >= RSS_BOTTOM) break;
-        Rect r = { 24, top, SCR_W - 48, RSS_ROW_H };
+    vita2d_set_clip_rectangle(0, LIST_TOP, SCR_W, LIST_BOTTOM);
+    for (i = rs_scroll / ROW_STRIDE; i < rows; i++) {
+        int top = LIST_TOP + i * ROW_STRIDE - rs_scroll;
+        if (top >= LIST_BOTTOM) break;
+        Rect r = { 24, top, SCR_W - 48, ROW_H };
         bool sel = (i == g_app.inc_sel);
         RowGeom g;
         Rect chk, ren;
         int size_right;
         w_rect(r, theme->card);
-        if (sel) w_rect((Rect){ 24, top, 4, RSS_ROW_H }, theme->accent);
+        if (sel) w_rect((Rect){ 24, top, 4, ROW_H }, theme->accent);
         rss_add_hit(i, r);
         /* 行尾控件链自右向左排：勾选框 → 改名按钮 → 尺寸右值，右缘对齐行内容
          * 右边界；主文本可用宽到此为止（不再是一串写死的 x 坐标）。 */
@@ -564,12 +570,12 @@ void page_recv_setup_render(void)
 
     /* 内容超长时的细滚动条 */
     {
-        int max_s = rows * RSS_STRIDE - RSS_VIEW;
+        int max_s = rows * ROW_STRIDE - LIST_VIEW_H;
         if (max_s > 0) {
-            int bh = RSS_VIEW * RSS_VIEW / (rows * RSS_STRIDE);
+            int bh = LIST_VIEW_H * LIST_VIEW_H / (rows * ROW_STRIDE);
             if (bh < 24) bh = 24;
-            int by = RSS_TOP + (RSS_VIEW - bh) * rs_scroll / max_s;
-            w_rect((Rect){ 936, RSS_TOP, 4, RSS_VIEW }, theme->card);
+            int by = LIST_TOP + (LIST_VIEW_H - bh) * rs_scroll / max_s;
+            w_rect((Rect){ 936, LIST_TOP, 4, LIST_VIEW_H }, theme->card);
             w_rect((Rect){ 936, by, 4, bh }, theme->text_dim);
         }
     }
@@ -598,16 +604,16 @@ void page_recv_setup_input(const Input *in)
 {
     int rows = 1 + g_app.inc_count;
     if (in->drag_start || in->dragging) {
-        int max_s = rows * RSS_STRIDE - RSS_VIEW;
+        int max_s = rows * ROW_STRIDE - LIST_VIEW_H;
         if (max_s < 0) max_s = 0;
         if (in->drag_start) rs_press_scroll = rs_scroll;
         int ns = rs_press_scroll - in->drag_dy;
         if (ns < 0) ns = 0;
         if (ns > max_s) ns = max_s;
         rs_scroll = ns;
-        int vis_top = rs_scroll / RSS_STRIDE;
-        int vis_bot = (rs_scroll + RSS_VIEW) / RSS_STRIDE;
-        int row = (in->drag_y - RSS_TOP + rs_scroll) / RSS_STRIDE;
+        int vis_top = rs_scroll / ROW_STRIDE;
+        int vis_bot = (rs_scroll + LIST_VIEW_H) / ROW_STRIDE;
+        int row = (in->drag_y - LIST_TOP + rs_scroll) / ROW_STRIDE;
         if (row < vis_top) row = vis_top;
         if (row > vis_bot) row = vis_bot;
         if (row < 0) row = 0;

@@ -75,8 +75,10 @@ void recv_set_name(int idx, const char *name);
 
 /* 名字 → 可落盘的单级文件名：按 ux0: 合法性净化 + 超长时"保后缀、截主名"，
  * 见 receive.c。落盘与 UI 改名共用，保证"界面上显示的即落盘名"；
- * UI 侧只经 api_recv_sanitize_name 调用。 */
-void recv_sanitize_name(const char *in, char *out, int n);
+ * UI 侧只经 api_recv_sanitize_name 调用。
+ * 返回 true = 名字超出 191 字节预算、被截短了（接收确认页"文件名过长"提示的依据；
+ * 路径前缀、首尾空白/点之类的缩短不算——那不是"过长"）。 */
+bool recv_sanitize_name(const char *in, char *out, int n);
 
 /* UI 在接受前设定"本次保存目录"（内存态，仅本会话；NULL/空 → 回退
  * config saveDir 默认）。不持久化，下次会话由 UI 重新给出默认值。 */
