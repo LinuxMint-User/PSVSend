@@ -568,13 +568,14 @@ void page_settings_render(void)
             break;
         case SET_ITEM_SAVEDIR: {
             /* 值可能是长路径：label 一行、路径 clip 下一行（选中=整行反色） */
+            RowGeom g;
             uint32_t card = item == g_app.set_sel ? theme->accent : theme->card;
             uint32_t tc = item == g_app.set_sel ? theme->accent_text : theme->text;
             uint32_t dc = item == g_app.set_sel ? theme->accent_text : theme->text_dim;
             w_rect(r, card);
-            w_text(r.x + 24, r.y + 3, 1.25f, tc, "%s", tr("Save folder"));
-            w_text_clip(r.x + 24, r.y + 31, 1.0f, dc, g_cfg.save_dir,
-                        r.w - 48);
+            row_geom(r, ROW_2LINE, 0, &g);
+            w_text(g.x_text, g.y_main, g.main_sc, tc, "%s", tr("Save folder"));
+            w_text_clip(g.x_text, g.y_sub, g.sub_sc, dc, g_cfg.save_dir, g.w_text);
             break;
         }
         case SET_ITEM_THEME:
@@ -586,14 +587,14 @@ void page_settings_render(void)
         case SET_ITEM_COLOR: {
             /* 主色行：右端不是文字而是色块——直接预览自定义主色（纯色，不随
              * 当前主题明暗变），描边保证浅色主题下也能看清边界。 */
+            RowGeom g;
             uint32_t card = item == g_app.set_sel ? theme->accent : theme->card;
             uint32_t tc = item == g_app.set_sel ? theme->accent_text : theme->text;
             w_rect(r, card);
-            int mh = 0;
-            w_text_w(1.25f, tr("Primary color"), NULL, &mh);
-            w_text(r.x + 24, r.y + (r.h - mh) / 2, 1.25f, tc, "%s",
-                   tr("Primary color"));
-            Rect chip = { r.x + r.w - 24 - 96, r.y + (r.h - 32) / 2, 96, 32 };
+            row_geom(r, ROW_VALUE, 96 + ROW_GAP, &g);   /* 右端让出色块宽 */
+            w_text_clip(g.x_text, g.y_main, g.main_sc, tc, tr("Primary color"),
+                        g.w_text);
+            Rect chip = { g.x_right - 96, r.y + (r.h - 32) / 2, 96, 32 };
             w_rect(chip, theme_hsv(g_cfg.custom_h, g_cfg.custom_s, g_cfg.custom_v));
             w_rect_outline(chip, item == g_app.set_sel ? theme->accent_text
                                                        : theme->border);

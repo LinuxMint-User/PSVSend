@@ -18,6 +18,8 @@
 #define XF_BOTTOM     370      /* 文件列表可视区底（总进度条上方） */
 #define XF_VIEW_H     (XF_BOTTOM - XF_TOP)
 #define XF_ROW_H      58
+#define XF_NAME_W     650      /* 行内文件名可用宽（右侧留百分比列） */
+#define XF_BAR_W      660      /* 行内细进度条宽 */
 
 static int xf_press_scroll = 0;
 
@@ -153,6 +155,8 @@ void page_progress_render(void)
     vita2d_set_clip_rectangle(0, XF_TOP, SCR_W, XF_BOTTOM);
     for (i = xf_scroll / XF_ROW_H; i < xf_count; i++) {
         int top = XF_TOP + i * XF_ROW_H - xf_scroll;
+        Rect r = { 24, top, SCR_W - 48, ROW_H };
+        RowGeom g;
         if (top >= XF_BOTTOM) break;
         bool is_active = (i == active) && g_app.prog_running;
         bool is_fail = rfail[i];              /* 该文件独立失败 → 标红 */
@@ -163,11 +167,10 @@ void page_progress_render(void)
         const char *pctxt = is_fail ? tr("Failed") : pctlb;
         uint32_t nc = is_fail ? theme->danger
                               : (is_active ? theme->text : theme->text_dim);
-        int tw = 0, th = 0;
-        w_text_w(1.1f, pctxt, &tw, &th);
-        w_text(920 - tw, top + 2, 1.1f, nc, "%s", pctxt);
-        w_text_mid(40, top + 2, 1.1f, nc, xf_name[i], 650);
-        w_bar((Rect){ 40, top + 30, 660, 10 }, theme->card,
+        row_geom(r, ROW_DENSE, 0, &g);
+        w_text_right(g.x_right, g.y_main, g.main_sc, nc, "%s", pctxt);
+        w_text_mid(g.x_text, g.y_main, g.main_sc, nc, xf_name[i], XF_NAME_W);
+        w_bar((Rect){ g.x_text, g.y_sub, XF_BAR_W, 10 }, theme->card,
               is_fail ? theme->danger : theme->accent, fp);
     }
     vita2d_disable_clipping();
