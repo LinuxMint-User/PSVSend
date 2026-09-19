@@ -199,7 +199,7 @@ static void dev_pane_render(const PaneRect *p, bool focused)
             int top = PANE_TOP - dev_scroll + i * ROW_STRIDE;
             uint32_t bg, mc, sc;
             Rect r;
-            int mh = 0, sh = 0;
+            RowGeom g;
             const char *sub = g_app.dev_sub[i];
             if (top >= PANE_BOTTOM) break;
             r = (Rect){ p->x, top, p->w, ROW_H };
@@ -208,15 +208,15 @@ static void dev_pane_render(const PaneRect *p, bool focused)
             w_rect(r, bg);
             /* 名称 / 型号两行排：挤在一行时名称（1.25 缩放）会把栏宽吃满，
              * 右侧型号必被截断——分两行各自吃满栏宽，谁都不会被对方挤掉。 */
-            w_text_w(1.25f, g_app.dev_alias[i], NULL, &mh);
+            row_geom(r, ROW_2LINE, 0, &g);
             if (sub[0]) {
-                w_text_w(1.0f, sub, NULL, &sh);
-                w_text_clip(r.x + 20, r.y + 5, 1.25f, mc,
-                            g_app.dev_alias[i], r.w - 40);
-                w_text_clip(r.x + 20, r.y + 5 + mh - 2, 1.0f, sc, sub, r.w - 40);
+                w_text_clip(g.x_text, g.y_main, g.main_sc, mc,
+                            g_app.dev_alias[i], g.w_text);
+                w_text_clip(g.x_text, g.y_sub, g.sub_sc, sc, sub, g.w_text);
             } else {
-                w_text_clip(r.x + 20, r.y + (r.h - mh) / 2, 1.25f, mc,
-                            g_app.dev_alias[i], r.w - 40);
+                /* 无型号：名称单行居中 */
+                w_text_clip(g.x_text, r.y + (r.h - w_font_px(g.main_sc)) / 2,
+                            g.main_sc, mc, g_app.dev_alias[i], g.w_text);
             }
         }
         vita2d_disable_clipping();
@@ -269,10 +269,10 @@ static void pick_pane_render(const PaneRect *p, bool focused)
         int top = PANE_TOP - pick_scroll + i * ROW_STRIDE;
         char sz[16];
         Rect r, xh;
-        int sw = 0, sh = 0, mh = 0;
-        int xbtn = p->x + p->w - 40;      /* 行尾 ✕ 区（40px 宽） */
+        RowGeom g;
+        int sw = 0;
+        int xbtn = p->x + p->w - 40;      /* 行尾 ✕ 区（40px 宽），贴栏右边缘 */
         int cx = xbtn + 20, cy = top + ROW_H / 2;
-        int name_max;
         uint32_t bg, mc, sc;
         bool sel = (i == g_app.picked_sel);
         if (top >= PANE_BOTTOM) break;
@@ -284,14 +284,15 @@ static void pick_pane_render(const PaneRect *p, bool focused)
         if (xh.y + xh.h > PANE_BOTTOM) xh.h = PANE_BOTTOM - xh.y;
         if (xh.h > 0) w_add(WID_PICKX_BASE + i, xh);
         w_rect(r, bg);
+        row_geom(r, ROW_VALUE, 0, &g);
         w_human_size(g_app.picked[i].size, sz);
-        w_text_w(1.0f, sz, &sw, &sh);
-        w_text(xbtn - sw - 12, r.y + (r.h - sh) / 2, 1.0f, sc, "%s", sz);
-        name_max = xbtn - sw - 12 - (r.x + 20) - 8;
-        if (name_max < 40) name_max = 40;
-        w_text_w(1.25f, g_app.picked[i].name, NULL, &mh);
-        w_text_clip(r.x + 20, r.y + (r.h - mh) / 2, 1.25f, mc,
-                    g_app.picked[i].name, name_max);
+        w_text_w(g.sub_sc, sz, &sw, NULL);
+        /* 名称可用宽 = 内容左锚点 → 尺寸左界（尺寸宽按实测扣，不再写死预留） */
+        g.w_text = (xbtn - 12 - sw - ROW_GAP) - g.x_text;
+        if (g.w_text < 40) g.w_text = 40;
+        w_text_right(xbtn - 12, g.y_sub, g.sub_sc, sc, "%s", sz);
+        w_text_clip(g.x_text, g.y_main, g.main_sc, mc,
+                    g_app.picked[i].name, g.w_text);
         /* ✕ 只是常驻的触摸删除钮，不承载焦点 */
         w_icon_cross((float)cx, (float)cy, 8.0f,
                      sel ? (focused ? theme->accent_text : theme->text)

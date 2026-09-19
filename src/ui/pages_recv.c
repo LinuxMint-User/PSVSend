@@ -504,9 +504,19 @@ void page_recv_setup_render(void)
         if (top >= RSS_BOTTOM) break;
         Rect r = { 24, top, SCR_W - 48, RSS_ROW_H };
         bool sel = (i == g_app.inc_sel);
+        RowGeom g;
+        Rect chk, ren;
+        int size_right;
         w_rect(r, theme->card);
         if (sel) w_rect((Rect){ 24, top, 4, RSS_ROW_H }, theme->accent);
         rss_add_hit(i, r);
+        /* 行尾控件链自右向左排：勾选框 → 改名按钮 → 尺寸右值，右缘对齐行内容
+         * 右边界；主文本可用宽到此为止（不再是一串写死的 x 坐标）。 */
+        row_geom(r, ROW_VALUE, 0, &g);
+        chk = (Rect){ g.x_right - 38, top + 9, 38, 38 };
+        ren = (Rect){ chk.x - ROW_GAP - 108, top + 9, 108, 38 };
+        size_right = ren.x - ROW_GAP;
+        g.w_text = size_right - ROW_GAP - g.x_text;
 
         if (i == 0) {
             /* 保存目录行：本次目录（默认=config saveDir）。确认键/点击进入
@@ -514,9 +524,12 @@ void page_recv_setup_render(void)
              * 本行整行可点（下方 w_add 注册），故行尾不再画"更改"二字：
              * 它此前用 accent_text，而选中行底色其实是 card（只有左侧一条
              * accent 竖条），浅色主题下白字白底完全不可见。 */
-            w_text(60, top + 8, 1.0f, theme->text_dim, "%s", tr("Save to"));
-            w_text_mid(60, top + 30, 1.1f, sel ? theme->text : theme->text_dim,
-                       g_app.recv_dir, 780);
+            row_geom(r, ROW_2LINE, 0, &g);
+            w_text(g.x_text, g.y_main, g.main_sc, theme->text_dim, "%s",
+                   tr("Save to"));
+            w_text_mid(g.x_text, g.y_sub, g.sub_sc,
+                       sel ? theme->text : theme->text_dim, g_app.recv_dir,
+                       g.w_text);
             continue;
         }
 
@@ -524,24 +537,20 @@ void page_recv_setup_render(void)
         bool on = g_app.inc_files[idx].inc;
         uint32_t nc = sel ? theme->text : theme->text_dim;
         w_human_size(g_app.inc_files[idx].size, sz);
+        w_text_right(size_right, r.y + (r.h - w_font_px(SC_SUB)) / 2, SC_SUB,
+                     theme->text_dim, "%s", sz);
         if (g_app.inc_files[idx].rname[0]) {
             /* 已改名：上行小字原名，下行保存名 */
-            w_text_mid(60, top + 4, 0.8f, theme->text_dim,
-                       g_app.inc_files[idx].name, 460);
-            w_text_mid(60, top + 22, 1.0f, nc,
-                       g_app.inc_files[idx].rname, 460);
+            RowGeom g2;
+            row_geom(r, ROW_2LINE, 0, &g2);      /* 两行排的 y */
+            w_text_mid(g.x_text, g2.y_main, 0.8f, theme->text_dim,
+                       g_app.inc_files[idx].name, g.w_text);
+            w_text_mid(g.x_text, g2.y_sub, SC_SUB, nc,
+                       g_app.inc_files[idx].rname, g.w_text);
         } else {
-            int th = 0;
-            w_text_w(1.0f, g_app.inc_files[idx].name, NULL, &th);
-            w_text_mid(60, top + (RSS_ROW_H - th) / 2 - 2, 1.0f, nc,
-                       g_app.inc_files[idx].name, 460);
+            w_text_mid(g.x_text, g.y_main, g.main_sc, nc,
+                       g_app.inc_files[idx].name, g.w_text);
         }
-        int sw = 0, sh = 0;
-        w_text_w(1.0f, sz, &sw, &sh);
-        w_text(696 - sw, top + (RSS_ROW_H - sh) / 2 - 2, 1.0f,
-               theme->text_dim, "%s", sz);
-        Rect ren = { 700, top + 9, 108, 38 };
-        Rect chk = { 824, top + 9, 38, 38 };
         rss_add_hit(RS_REN_ID + i, ren);
         rss_add_hit(RS_CHK_ID + i, chk);
         w_rect_outline(ren, theme->border);
