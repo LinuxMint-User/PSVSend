@@ -112,13 +112,15 @@ static void touch_poll(Input *in, SceTouchData *touch)
                 if (dx >= TOUCH_DRAG_THRESHOLD || dy >= TOUCH_DRAG_THRESHOLD) {
                     t_drag = true;
                     in->drag_start = true;
-                    in->drag_x0 = t_x0; in->drag_y0 = t_y0;
                     in->drag_x = cx;   in->drag_y = cy;
                     in->drag_dx = cx - t_x0; in->drag_dy = cy - t_y0;
                 }
             }
             if (t_drag) {
                 in->dragging = true;
+                /* 起点在拖动全程都要带上：输入结构每 poll 都清零，
+                 * 只在 drag_start 帧赋值会让后续帧读到 0（分栏判定失效）。 */
+                in->drag_x0 = t_x0; in->drag_y0 = t_y0;
                 in->drag_x = cx;   in->drag_y = cy;
                 in->drag_dx = cx - t_x0; in->drag_dy = cy - t_y0;
             }
