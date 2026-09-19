@@ -60,7 +60,7 @@ enum {
     SET_SLOT_N
 };
 #define SET_HDR_H   44        /* 分组标题行高（含上方留白） */
-#define SET_ROW_H   60        /* 设置项行步进（视觉行 56） */
+/* 设置项行步进/行高走 ui.h 公共常量（ROW_STRIDE / ROW_H），本页不再另立一套 */
 #define SET_LOGO_H  60        /* 关于组 logo 行（大字，底部再留白） */
 #define SET_ADAPT_H 40        /* 关于组适配说明行 */
 
@@ -153,7 +153,7 @@ static int set_row_h(int slot)
     if (slot == SET_SLOT_ABOUT_A) return SET_LOGO_H;
     if (slot == SET_SLOT_ABOUT_B) return SET_ADAPT_H;
     if (slot == SET_SLOT_ABOUT_C) return SET_ADAPT_H;
-    return slot_item(slot) >= 0 ? SET_ROW_H : SET_HDR_H;
+    return slot_item(slot) >= 0 ? ROW_STRIDE : SET_HDR_H;
 }
 
 static int set_row_top(int slot)
@@ -197,8 +197,8 @@ static void set_keep_visible(void)
     if (slot < 0) return;
     top = set_row_top(slot);
     if (top < set_scroll) set_scroll = top;
-    if (top + SET_ROW_H > set_scroll + LIST_VIEW_H)
-        set_scroll = top + SET_ROW_H - LIST_VIEW_H;
+    if (top + ROW_STRIDE > set_scroll + LIST_VIEW_H)
+        set_scroll = top + ROW_STRIDE - LIST_VIEW_H;
     set_clamp_scroll();
 }
 
@@ -549,7 +549,7 @@ void page_settings_render(void)
             continue;
         }
         /* 行宽随面板动画收窄（912 → 576）：面板展开时右侧让出空间给选项面板 */
-        Rect r = { 24, top, SCR_W - 48 - shrink, SET_ROW_H - 4 };
+        Rect r = { 24, top, SCR_W - 48 - shrink, ROW_H };
         /* 命中区按可视区裁剪后再注册：绘制有 clip 矩形管着，触摸命中没有——
          * 滚到页头/页脚方向半露出的行，其矩形会伸进页头空白带与页脚，点那里
          * 会误触到该行（设置页表现为开面板/开键盘）。口径同 add_row_hit。

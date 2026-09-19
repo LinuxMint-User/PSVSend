@@ -13,11 +13,11 @@
 #include "core/i18n.h"
 #include "app/api.h"
 
-/* 传输页：文件列表区域与总进度布局（发送/接收共用） */
-#define XF_TOP        68
+/* 传输页：文件列表区域与总进度布局（发送/接收共用）。
+ * 列表顶 / 行高 / 行步进走 ui.h 的公共常量（与其它整幅列表一致）；
+ * 可视区底由下方总进度条的位置决定，是本页特有几何，留在这里。 */
 #define XF_BOTTOM     370      /* 文件列表可视区底（总进度条上方） */
-#define XF_VIEW_H     (XF_BOTTOM - XF_TOP)
-#define XF_ROW_H      58
+#define XF_VIEW_H     (XF_BOTTOM - LIST_TOP)
 #define XF_NAME_W     650      /* 行内文件名可用宽（右侧留百分比列） */
 #define XF_BAR_W      660      /* 行内细进度条宽 */
 
@@ -142,7 +142,7 @@ void page_progress_render(void)
 
     /* 列表可视区滚动夹紧 */
     {
-        int max_s = xf_count * XF_ROW_H - XF_VIEW_H;
+        int max_s = xf_count * ROW_STRIDE - XF_VIEW_H;
         if (max_s < 0) max_s = 0;
         if (xf_scroll < 0) xf_scroll = 0;
         if (xf_scroll > max_s) xf_scroll = max_s;
@@ -152,9 +152,9 @@ void page_progress_render(void)
 
     /* 每文件一行：名称 + 百分比 + 细进度条（内容随 xf_scroll 像素滚动） */
     vita2d_enable_clipping();
-    vita2d_set_clip_rectangle(0, XF_TOP, SCR_W, XF_BOTTOM);
-    for (i = xf_scroll / XF_ROW_H; i < xf_count; i++) {
-        int top = XF_TOP + i * XF_ROW_H - xf_scroll;
+    vita2d_set_clip_rectangle(0, LIST_TOP, SCR_W, XF_BOTTOM);
+    for (i = xf_scroll / ROW_STRIDE; i < xf_count; i++) {
+        int top = LIST_TOP + i * ROW_STRIDE - xf_scroll;
         Rect r = { 24, top, SCR_W - 48, ROW_H };
         RowGeom g;
         if (top >= XF_BOTTOM) break;
@@ -177,12 +177,12 @@ void page_progress_render(void)
 
     /* 内容超长时右侧细滚动条 */
     {
-        int max_s = xf_count * XF_ROW_H - XF_VIEW_H;
+        int max_s = xf_count * ROW_STRIDE - XF_VIEW_H;
         if (max_s > 0) {
-            int bh = XF_VIEW_H * XF_VIEW_H / (xf_count * XF_ROW_H);
+            int bh = XF_VIEW_H * XF_VIEW_H / (xf_count * ROW_STRIDE);
             if (bh < 24) bh = 24;
-            int by = XF_TOP + (XF_VIEW_H - bh) * xf_scroll / max_s;
-            w_rect((Rect){ 936, XF_TOP, 4, XF_VIEW_H }, theme->card);
+            int by = LIST_TOP + (XF_VIEW_H - bh) * xf_scroll / max_s;
+            w_rect((Rect){ 936, LIST_TOP, 4, XF_VIEW_H }, theme->card);
             w_rect((Rect){ 936, by, 4, bh }, theme->text_dim);
         }
     }
@@ -273,7 +273,7 @@ void page_progress_input(const Input *in)
 {
     /* 文件列表滚动（拖动跟手 / 方向键逐行） */
     if (in->drag_start || in->dragging) {
-        int max_s = xf_count * XF_ROW_H - XF_VIEW_H;
+        int max_s = xf_count * ROW_STRIDE - XF_VIEW_H;
         if (max_s < 0) max_s = 0;
         if (in->drag_start) xf_press_scroll = xf_scroll;
         int ns = xf_press_scroll - in->drag_dy;
@@ -283,9 +283,9 @@ void page_progress_input(const Input *in)
         return;
     }
     if (in->up || in->down) {
-        int max_s = xf_count * XF_ROW_H - XF_VIEW_H;
+        int max_s = xf_count * ROW_STRIDE - XF_VIEW_H;
         if (max_s < 0) max_s = 0;
-        xf_scroll += in->up ? -XF_ROW_H : XF_ROW_H;
+        xf_scroll += in->up ? -ROW_STRIDE : ROW_STRIDE;
         if (xf_scroll < 0) xf_scroll = 0;
         if (xf_scroll > max_s) xf_scroll = max_s;
         return;
