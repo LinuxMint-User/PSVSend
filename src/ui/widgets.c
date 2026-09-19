@@ -234,6 +234,10 @@ int w_text_mid(float x, float y, float scale, uint32_t color,
         ncp++;
         p = nx;
     }
+    if (*p) {                        /* 码点多到超出统计表：尾部也保不住 → 退回尾部裁剪 */
+        w_text_clip(x, y, scale, color, text, max_w);
+        return max_w;
+    }
     w_text_w(scale, "…", &ew, NULL);
     avail = max_w - ew;
     if (avail <= 0) return 0;
@@ -249,6 +253,46 @@ int w_text_mid(float x, float y, float scale, uint32_t color,
     out[o] = 0;
     w_text(x, y, scale, color, "%s", out);
     return lw + ew + rw;
+}
+
+/* 头部省略：放不下 max_w 时画"…尾"（保住尾部——路径的末级目录、扩展名都在尾部），
+ * 返回实际绘制宽度；放得下则整串照画。与 w_text_mid / w_text_clip 的分工见 ui.h。 */
+int w_text_lead(float x, float y, float scale, uint32_t color,
+                const char *text, int max_w)
+{
+    char cbuf[8], out[576];
+    int tw = 0, ew = 0, avail, pref = 0;
+    const char *p = text, *keep = NULL;
+    if (!text || !*text) return 0;
+    w_text_w(scale, text, &tw, NULL);
+    if (tw <= max_w) {
+        w_text(x, y, scale, color, "%s", text);
+        return tw;
+    }
+    w_text_w(scale, "…", &ew, NULL);
+    avail = max_w - ew;
+    if (avail <= 0) return 0;
+    /* 单趟前扫：在每个字符边界处看"从这儿到结尾"还装不装得下，第一个装得下的
+     * 位置即最长的可留尾巴（逐字测量与 w_text_clip 同口径，无需码点表） */
+    while (*p) {
+        uint32_t cp;
+        const char *nx = utf8_next_cp(p, &cp);
+        int n = (int)(nx - p), cw = 0;
+        if (tw - pref <= avail) { keep = p; break; }
+        if (n > (int)sizeof cbuf - 1) n = (int)sizeof cbuf - 1;
+        memcpy(cbuf, p, n);
+        cbuf[n] = 0;
+        w_text_w(scale, cbuf, &cw, NULL);
+        pref += cw;
+        p = nx;
+    }
+    if (!keep) {                    /* 连尾巴首字符都放不下 → 退回尾部裁剪 */
+        w_text_clip(x, y, scale, color, text, max_w);
+        return max_w;
+    }
+    snprintf(out, sizeof out, "…%s", keep);
+    w_text(x, y, scale, color, "%s", out);
+    return ew + (tw - pref);
 }
 
 /* ---------- 图形 ---------- */
@@ -320,11 +364,10 @@ void w_page_header(const char *title)
     w_rect((Rect){ 0, HDR_H - 2, SCR_W, 2 }, theme->border);
 }
 
-/* 右端预留宽：沿袭旧 w_row 写死的 r.w-200 口径（= 右值宽 + 间距）。
- * 后续按右值实测宽 + ROW_GAP 收掉这个魔数。 */
-#define ROW_VAL_RESERVE 152
-
-/* w_row 实现（sub_c=0 用默认色；指定则覆盖——"检查更新"行发现新版时用 accent 强调） */
+/* w_row 实现（sub_c=0 用默认色；指定则覆盖——"检查更新"行发现新版时用 accent 强调）。
+ * 右端值不再按写死的预留值让位：先量它自己的宽，主文本按"右值实测宽 + ROW_GAP"
+ * 扣出可用宽；右值本身就长过整行时退化成"主文本让位为 0、右值左对齐裁尾"，
+ * 绝不出现右值压在主文本上的叠字。 */
 static void w_row_impl(Rect r, const char *main_text, const char *sub_text,
                        uint32_t sub_c, bool selected)
 {
@@ -332,13 +375,23 @@ static void w_row_impl(Rect r, const char *main_text, const char *sub_text,
     uint32_t card = selected ? theme->accent : theme->card;
     uint32_t main_c = selected ? theme->accent_text : theme->text;
     w_rect(r, card);
-    row_geom(r, ROW_VALUE, ROW_VAL_RESERVE, &g);
-    w_text_clip(g.x_text, g.y_main, g.main_sc, main_c, main_text, g.w_text);
+    row_geom(r, ROW_VALUE, 0, &g);
     if (sub_text && *sub_text) {
         uint32_t sc = sub_c ? sub_c
                             : (selected ? theme->accent_text : theme->text_dim);
-        w_text_right(g.x_right, g.y_sub, g.sub_sc, sc, "%s", sub_text);
+        int sw = 0;
+        w_text_w(g.sub_sc, sub_text, &sw, NULL);
+        if (sw + ROW_GAP < g.w_text) {
+            g.w_text -= sw + ROW_GAP;
+            w_text_right(g.x_right, g.y_sub, g.sub_sc, sc, "%s", sub_text);
+        } else {
+            w_text_clip(g.x_text, g.y_sub, g.sub_sc, sc, sub_text,
+                        g.x_right - g.x_text);
+            g.w_text = 0;
+        }
     }
+    /* 行主文本是名字类（文件名 / 目录名 / 设置项名）→ 中间省略，保住尾部 */
+    w_text_mid(g.x_text, g.y_main, g.main_sc, main_c, main_text, g.w_text);
 }
 
 void w_row(Rect r, const char *main_text, const char *sub_text, bool selected)

@@ -64,16 +64,19 @@ void page_recv_confirm_render(void)
     w_page_header(tr("Incoming files"));
     char line[256];
     Rect card = { 24, 80, SCR_W - 48, 320 };
+    /* 卡片内文本的可用宽（左边距 24、右边距 48）：别名与提示句的长度都不受本端
+     * 控制，一律裁尾，不许裸画压到相邻内容上（文件名另走路内 w_text_mid）。 */
+    int lmax = card.w - 72;
 
     /* 请求还在等 UI 决定吗？不在了（超时被后端作废）→ 只给关闭，不再给决定按钮 */
     g_recv_expired = api_recv_pending_pull(NULL) == 0;
     if (g_recv_expired) {
         w_rect(card, theme->card);
-        w_text(48, 120, 1.5f, theme->text, "%s", g_app.recv_alias);
-        w_text(48, 172, 1.25f, theme->text_dim, "%s",
-               tr("This request has expired."));
-        w_text(48, 216, 1.0f, theme->text_dim, "%s",
-               tr("No response was sent to the sender."));
+        w_text_clip(48, 120, 1.5f, theme->text, g_app.recv_alias, lmax);
+        w_text_clip(48, 172, 1.25f, theme->text_dim,
+                    tr("This request has expired."), lmax);
+        w_text_clip(48, 216, 1.0f, theme->text_dim,
+                    tr("No response was sent to the sender."), lmax);
         Rect close = { SCR_W / 2 - 100, 444, 200, 48 };
         w_add(2, close);
         w_button(close, tr("Close"), true);
@@ -102,7 +105,7 @@ void page_recv_confirm_render(void)
 
     snprintf(line, sizeof line, tr("%s wants to send you %d file(s)."),
              g_app.recv_alias, n);
-    w_text(48, 152, 1.15f, theme->text, "%s", line);
+    w_text_clip(48, 152, 1.15f, theme->text, line, lmax);
 
     SceOff t = 0;
     for (i = 0; i < n; i++) t += g_app.inc_files[i].size;
@@ -113,7 +116,7 @@ void page_recv_confirm_render(void)
     else
         snprintf(line, sizeof line, tr("Total %s  (%d of %d selected)"),
                  sz, seln, n);
-    w_text(48, 190, 1.0f, theme->text_dim, "%s", line);
+    w_text_clip(48, 190, 1.0f, theme->text_dim, line, lmax);
 
     /* 名字过长、接收后会被自动缩短的文件数（后端在 prepare 时就算好了 trunc；
      * 用户自己改过名的行按新名算，不再提示）。缩短口径=保后缀、截主名。 */
@@ -125,13 +128,13 @@ void page_recv_confirm_render(void)
         snprintf(line, sizeof line,
                  tr("%d more file(s) exceed the receive limit and will be skipped."),
                  g_app.recv_overflow);
-        w_text(48, 212, 0.9f, theme->warn, "%s", line);
+        w_text_clip(48, 212, 0.9f, theme->warn, line, lmax);
         warn++;
     }
     if (toolong > 0) {
         snprintf(line, sizeof line,
                  tr("%d file name(s) too long, will be shortened"), toolong);
-        w_text(48, 212 + warn * 20, 0.9f, theme->warn, "%s", line);
+        w_text_clip(48, 212 + warn * 20, 0.9f, theme->warn, line, lmax);
         warn++;
     }
 
@@ -533,9 +536,10 @@ void page_recv_setup_render(void)
             row_geom(r, ROW_2LINE, 0, &g);
             w_text(g.x_text, g.y_main, g.main_sc, theme->text_dim, "%s",
                    tr("Save to"));
-            w_text_mid(g.x_text, g.y_sub, g.sub_sc,
-                       sel ? theme->text : theme->text_dim, g_app.recv_dir,
-                       g.w_text);
+            /* 保存目录是路径 → 头部省略（末级目录才是要看的），名字类才用 w_text_mid */
+            w_text_lead(g.x_text, g.y_sub, g.sub_sc,
+                        sel ? theme->text : theme->text_dim, g_app.recv_dir,
+                        g.w_text);
             continue;
         }
 

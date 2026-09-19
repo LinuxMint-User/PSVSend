@@ -575,7 +575,7 @@ void page_settings_render(void)
             w_rect(r, card);
             row_geom(r, ROW_2LINE, 0, &g);
             w_text(g.x_text, g.y_main, g.main_sc, tc, "%s", tr("Save folder"));
-            w_text_clip(g.x_text, g.y_sub, g.sub_sc, dc, g_cfg.save_dir, g.w_text);
+            w_text_lead(g.x_text, g.y_sub, g.sub_sc, dc, g_cfg.save_dir, g.w_text);
             break;
         }
         case SET_ITEM_THEME:
@@ -812,7 +812,7 @@ void page_dir_pick_render(void)
 {
     int i;
     w_page_header(tr("Choose folder"));
-    w_text_clip(28, 56, 1.0f, theme->text_dim, g_app.cur_dir, SCR_W - 56);
+    w_text_lead(28, 56, 1.0f, theme->text_dim, g_app.cur_dir, SCR_W - 56);
     if (dpick_dcount > 0) {
         clamp_scroll(&dpick_scroll, dpick_dcount);
         vita2d_enable_clipping();
@@ -836,7 +836,7 @@ void page_dir_pick_render(void)
     Rect bt = { SCR_W - 280, SCR_H - 42, 256, 36 };
     w_add(WID_DIRPICK_SAVE, bt);
     w_button(bt, tr("Save here"), true);
-    w_text_clip(24, SCR_H - 38, 1.0f, theme->text_dim,
+    w_text_lead(24, SCR_H - 38, 1.0f, theme->text_dim,
                 g_app.cur_dir, SCR_W - 296);
     HintSeg segs[6] = { 0 };
     int ns = 0;

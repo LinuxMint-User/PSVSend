@@ -179,7 +179,7 @@ static void dev_strip(void)
     if (g_app.pane_focus == 1 && g_app.picked_count > 0) {
         int i = g_app.picked_sel;
         if (i < 0 || i >= g_app.picked_count) i = 0;
-        w_text_clip(28, 56, 0.9f, theme->text_dim, g_app.picked[i].path, SCR_W - 56);
+        w_text_lead(28, 56, 0.9f, theme->text_dim, g_app.picked[i].path, SCR_W - 56);
     }
 }
 
@@ -222,25 +222,26 @@ static void dev_pane_render(const PaneRect *p, bool focused)
         vita2d_disable_clipping();
     } else if (!api_network_ready()) {
         const char *why = api_discovery_fail();
-        w_text(p->x + 4, PANE_TOP + 10, 1.15f, theme->text, "%s",
-               tr("Network not ready."));
-        if (why[0]) {
-            w_text(p->x + 4, PANE_TOP + 48, 1.0f, theme->text_dim, "%s", why);
-        } else {
-            w_text(p->x + 4, PANE_TOP + 48, 1.0f, theme->text_dim, "%s",
-                   tr("Waiting for Wi-Fi to come back up..."));
-        }
+        /* 空态 / 状态句都是本地化文案（长度随语言变）→ 按栏宽裁尾，不裸画 */
+        int wmax = p->w - 8;
+        w_text_clip(p->x + 4, PANE_TOP + 10, 1.15f, theme->text,
+                    tr("Network not ready."), wmax);
+        if (why[0])
+            w_text_clip(p->x + 4, PANE_TOP + 48, 1.0f, theme->text_dim, why, wmax);
+        else
+            w_text_clip(p->x + 4, PANE_TOP + 48, 1.0f, theme->text_dim,
+                        tr("Waiting for Wi-Fi to come back up..."), wmax);
     } else if (!api_link_up()) {
-        w_text(p->x + 4, PANE_TOP + 10, 1.15f, theme->text, "%s",
-               tr("Wi-Fi link is down."));
+        w_text_clip(p->x + 4, PANE_TOP + 10, 1.15f, theme->text,
+                    tr("Wi-Fi link is down."), p->w - 8);
     } else if (api_scan_active()) {
-        w_text(p->x + 4, PANE_TOP + 10, 1.15f, theme->text, "%s",
-               tr("Scanning network..."));
+        w_text_clip(p->x + 4, PANE_TOP + 10, 1.15f, theme->text,
+                    tr("Scanning network..."), p->w - 8);
     } else {
-        w_text(p->x + 4, PANE_TOP + 10, 1.15f, theme->text, "%s",
-               tr("No devices found."));
-        w_text(p->x + 4, PANE_TOP + 48, 1.0f, theme->text_dim, "%s",
-               tr("Press Triangle to scan this network."));
+        w_text_clip(p->x + 4, PANE_TOP + 10, 1.15f, theme->text,
+                    tr("No devices found."), p->w - 8);
+        w_text_clip(p->x + 4, PANE_TOP + 48, 1.0f, theme->text_dim,
+                    tr("Press Triangle to scan this network."), p->w - 8);
     }
 }
 
@@ -291,8 +292,9 @@ static void pick_pane_render(const PaneRect *p, bool focused)
         g.w_text = (xbtn - 12 - sw - ROW_GAP) - g.x_text;
         if (g.w_text < 40) g.w_text = 40;
         w_text_right(xbtn - 12, g.y_sub, g.sub_sc, sc, "%s", sz);
-        w_text_clip(g.x_text, g.y_main, g.main_sc, mc,
-                    g_app.picked[i].name, g.w_text);
+        /* 文件名 → 中间省略（保住扩展名）；上方 w_text_right 的尺寸值仍按实测扣宽 */
+        w_text_mid(g.x_text, g.y_main, g.main_sc, mc,
+                   g_app.picked[i].name, g.w_text);
         /* ✕ 只是常驻的触摸删除钮，不承载焦点 */
         w_icon_cross((float)cx, (float)cy, 8.0f,
                      sel ? (focused ? theme->accent_text : theme->text)
@@ -636,7 +638,7 @@ void page_files_render(void)
 {
     int count = g_app.file_count;
     w_page_header(tr("Select files"));
-    w_text_clip(28, 56, 1.0f, theme->text_dim, g_app.cur_dir, SCR_W - 260);
+    w_text_lead(28, 56, 1.0f, theme->text_dim, g_app.cur_dir, SCR_W - 260);
     {   /* 右端显示已选总数：跨目录挑文件时也能看到累计 */
         char cnt[48];
         int cw = 0, ch = 0;
@@ -823,10 +825,10 @@ void page_send_wait_render(void)
         w_text_clip(48, 190, 1.2f, failed ? theme->danger : theme->text,
                     m, card.w - 48);
     } else {
-        w_text(48, 190, 1.3f, theme->accent, "%s",
-               tr("Waiting for receiver to accept..."));
-        w_text(48, 230, 1.0f, theme->text_dim, "%s",
-               tr("Please accept on the other device."));
+        w_text_clip(48, 190, 1.3f, theme->accent,
+                    tr("Waiting for receiver to accept..."), card.w - 48);
+        w_text_clip(48, 230, 1.0f, theme->text_dim,
+                    tr("Please accept on the other device."), card.w - 48);
     }
     Rect btn = { SCR_W / 2 - 100, 444, 200, 48 };
     w_add(0, btn);

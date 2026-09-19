@@ -216,10 +216,16 @@ void page_ime_pump(void);   /* 主循环每帧帧间调用：打开挂起键盘 
 int  w_font_px(float scale);
 void w_text(float x, float y, float scale, uint32_t color, const char *fmt, ...);
 void w_text_w(float scale, const char *text, int *w, int *h);
-/* 中间省略绘制（放不下 max_w 时画"头…尾"，尾部保留以露出扩展名），
- * 返回实际绘制宽度 */
+/* 长文本的三种截断口径（定死，页面按内容类别选，别各写各的）：
+ *   路径 / 目录字符串（保存目录、当前路径、已选文件的完整路径）→ w_text_lead：
+ *     头部省略，保住尾部——末级目录/文件名才是要看的那一段；
+ *   名字类（文件名 / 目录名）→ w_text_mid：中间省略，保住尾部（扩展名）；
+ *   其余不受本端控制的文本（对端别名、提示句、平台类型）→ w_text_clip：尾部截断。
+ * 三者都必须给 max_w，不许用裸 w_text 画长文本——放不下就会压到相邻内容上。 */
 int  w_text_mid(float x, float y, float scale, uint32_t color,
                 const char *text, int max_w);
+int  w_text_lead(float x, float y, float scale, uint32_t color,
+                 const char *text, int max_w);
 void w_text_clip(float x, float y, float scale, uint32_t color,
                  const char *text, int max_w);
 /* 右对齐绘制：文本右边缘落在 x_right（内部先测量再定位） */
