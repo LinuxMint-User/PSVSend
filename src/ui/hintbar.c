@@ -13,7 +13,6 @@
 #include "ui/hintbar.h"
 #include "ui/theme.h"
 
-#define FOOTER_H     46
 #define HINT_SEG_MAX 8   /* 排序缓冲区上限：一页最多几段提示 */
 
 /* 提示条里用到的按键图形。页面不直接引用，只经 HintKey 推出（见 icon_of）。 */

@@ -186,6 +186,21 @@ void w_text_clip(float x, float y, float scale, uint32_t color,
         w_text(x, y, scale, color, "%s", buf);
 }
 
+/* 右对齐绘制：x_right = 文本右边缘（先测宽再定位，替掉各处手写的 x+w-w2 定位）。 */
+void w_text_right(int x_right, float y, float scale, uint32_t color,
+                  const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (!*buf) return;
+    int w = 0;
+    w_text_w(scale, buf, &w, NULL);
+    w_text(x_right - w, y, scale, color, "%s", buf);
+}
+
 /* 中间省略：整串放不下 max_w 时画成"头…尾"（尾部保留，超长文件名的扩展名
  * 才看得见），返回实际绘制宽度；放得下则整串照画。头尾各占可用宽的一半。 */
 int w_text_mid(float x, float y, float scale, uint32_t color,
@@ -259,31 +274,70 @@ void w_bar(Rect r, uint32_t bg, uint32_t fg, int pct)
     }
 }
 
+/* ---------- 行几何 ---------- */
+
+/* 行几何：把"行型"翻译成锚点与字号（数值口径见 ui.h 的布局常量）。
+ * ROW_VALUE 单行居中；ROW_2LINE 两行整体居中；ROW_DENSE 沿用进度页现状
+ * （主文本贴行顶 +2、附属进度条 +30）。 */
+void row_geom(Rect r, RowKind kind, int reserve_right, RowGeom *g)
+{
+    int mh, sh;
+    g->x_text  = r.x + ROW_PAD_X;
+    g->x_right = r.x + r.w - ROW_PAD_R;
+    g->w_text  = g->x_right - g->x_text - reserve_right;
+    if (g->w_text < 0) g->w_text = 0;
+    g->row_h   = r.h;
+    switch (kind) {
+    case ROW_2LINE:
+        g->main_sc = SC_MAIN;
+        g->sub_sc  = SC_SUB;
+        mh = w_font_px(g->main_sc);
+        sh = w_font_px(g->sub_sc);
+        g->y_main = r.y + (r.h - mh - sh) / 2;
+        g->y_sub  = g->y_main + mh;
+        break;
+    case ROW_DENSE:
+        g->main_sc = SC_DENSE;
+        g->sub_sc  = SC_SUB;
+        g->y_main = r.y + 2;
+        g->y_sub  = r.y + 30;
+        break;
+    case ROW_VALUE:
+    default:
+        g->main_sc = SC_MAIN;
+        g->sub_sc  = SC_SUB;
+        g->y_main = r.y + (r.h - w_font_px(g->main_sc)) / 2;
+        g->y_sub  = r.y + (r.h - w_font_px(g->sub_sc)) / 2;
+        break;
+    }
+}
+
 /* ---------- 布局组件 ---------- */
-#define HEADER_H 52
 
 void w_page_header(const char *title)
 {
-    w_text(28, 10, 1.7f, theme->text, "%s", title);
-    w_rect((Rect){ 0, HEADER_H - 2, SCR_W, 2 }, theme->border);
+    w_text(28, 10, SC_TITLE, theme->text, "%s", title);
+    w_rect((Rect){ 0, HDR_H - 2, SCR_W, 2 }, theme->border);
 }
+
+/* 右端预留宽：沿袭旧 w_row 写死的 r.w-200 口径（= 右值宽 + 间距）。
+ * 后续按右值实测宽 + ROW_GAP 收掉这个魔数。 */
+#define ROW_VAL_RESERVE 152
 
 /* w_row 实现（sub_c=0 用默认色；指定则覆盖——"检查更新"行发现新版时用 accent 强调） */
 static void w_row_impl(Rect r, const char *main_text, const char *sub_text,
                        uint32_t sub_c, bool selected)
 {
+    RowGeom g;
     uint32_t card = selected ? theme->accent : theme->card;
     uint32_t main_c = selected ? theme->accent_text : theme->text;
     w_rect(r, card);
-    int mh = 0;
-    w_text_w(1.25f, main_text, NULL, &mh);
-    w_text_clip(r.x + 24, r.y + (r.h - mh) / 2, 1.25f, main_c, main_text, r.w - 200);
+    row_geom(r, ROW_VALUE, ROW_VAL_RESERVE, &g);
+    w_text_clip(g.x_text, g.y_main, g.main_sc, main_c, main_text, g.w_text);
     if (sub_text && *sub_text) {
         uint32_t sc = sub_c ? sub_c
                             : (selected ? theme->accent_text : theme->text_dim);
-        int sw = 0, sh = 0;
-        w_text_w(1.0f, sub_text, &sw, &sh);
-        w_text(r.x + r.w - sw - 24, r.y + (r.h - sh) / 2, 1.0f, sc, "%s", sub_text);
+        w_text_right(g.x_right, g.y_sub, g.sub_sc, sc, "%s", sub_text);
     }
 }
 

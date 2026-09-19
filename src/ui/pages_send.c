@@ -413,10 +413,10 @@ void page_devices_input(const Input *in)
         bool over_dev = in->drag_x0 >= dev.x && in->drag_x0 < dev.x + dev.w;
         if (over_dev && count > 0)
             area_drag(in, count, &dev_scroll, &dev_press_scroll,
-                      &g_app.dev_sel, PANE_VIEW_H);
+                      &g_app.dev_sel, PANE_TOP, PANE_VIEW_H);
         else if (!over_dev && g_app.picked_count > 0)
             area_drag(in, g_app.picked_count, &pick_scroll, &pick_press_scroll,
-                      &g_app.picked_sel, PANE_VIEW_H);
+                      &g_app.picked_sel, PANE_TOP, PANE_VIEW_H);
         return;   /* 拖动期间不处理其它触摸动作 */
     }
     if (in->tap) {

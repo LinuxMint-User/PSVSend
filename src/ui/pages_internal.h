@@ -14,12 +14,9 @@
 #include <vita2d.h>
 #include "ui/ui.h"
 
-/* ---------- 布局常量 ---------- */
-#define LIST_TOP     76                 /* 列表可视区顶 */
-#define LIST_BOTTOM  (SCR_H - 46 - 6)   /* 列表可视区底（页脚上方留白） */
-#define LIST_VIEW_H  (LIST_BOTTOM - LIST_TOP)
-#define ROW_H        56
-#define ROW_STRIDE   62
+/* ---------- 布局常量 ----------
+ * 列表顶/底、行高与步进、行内边距、字号档已收进 ui.h（唯一来源）；这里只留
+ * 本组页面专用的控件 id 与后缀。 */
 #define WID_FILES_DONE 0x8001    /* 文件选择页"完成"触摸按钮 */
 #define WID_DIRPICK_SAVE 0x9001  /* 目录选择页"存到当前目录"触摸按钮 */
 #define DIR_SUFFIX   "/"         /* 目录名后缀 */
@@ -114,9 +111,10 @@ static inline void area_keep_visible(int *st, int count, int sel, int view_h)
     area_clamp(st, count, view_h);
 }
 
-/* 触摸拖动（可视区由参数给出）：内容跟随手指；选中 = 手指压住的行 */
+/* 触摸拖动（可视区由参数给出）：内容跟随手指；选中 = 手指压住的行。
+ * view_top 必须是调用方自己的可视区顶——旧版写死 PANE_TOP，非主页调用会选错行。 */
 static inline void area_drag(const Input *in, int count, int *scroll, int *press,
-                             int *sel, int view_h)
+                             int *sel, int view_top, int view_h)
 {
     int vis_top, vis_bot, row;
     if (in->drag_start) *press = *scroll;
@@ -127,7 +125,7 @@ static inline void area_drag(const Input *in, int count, int *scroll, int *press
     *scroll = ns;
     vis_top = *scroll / ROW_STRIDE;
     vis_bot = (*scroll + view_h) / ROW_STRIDE;
-    row = (in->drag_y - PANE_TOP + *scroll) / ROW_STRIDE;
+    row = (in->drag_y - view_top + *scroll) / ROW_STRIDE;
     if (row < vis_top) row = vis_top;
     if (row > vis_bot) row = vis_bot;
     if (row < 0) row = 0;

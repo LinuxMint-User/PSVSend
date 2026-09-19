@@ -14,6 +14,30 @@ vita2d_font *font_get(int size, int cjk);
 #define SCR_W 960
 #define SCR_H 544
 
+/* ---------- 布局常量（唯一来源）----------
+ * 列表页的几何口径都从这里取：页头/页脚高、列表可视区、行高与步进、行内边距、
+ * 行内字号档。页面不再各写一份数值；要调间距只改这里。 */
+#define HDR_H         52            /* 页头高（底沿 2px 分隔线） */
+#define FOOTER_H      46            /* 页脚提示条高 */
+#define LIST_GAP_TOP  24            /* 页头下沿 → 列表顶 */
+#define LIST_GAP_BOT  6             /* 列表底 → 页脚留白 */
+#define LIST_TOP      (HDR_H + LIST_GAP_TOP)              /* 76 */
+#define LIST_BOTTOM   (SCR_H - FOOTER_H - LIST_GAP_BOT)   /* 492 */
+#define LIST_VIEW_H   (LIST_BOTTOM - LIST_TOP)
+
+#define ROW_H         56            /* 行可见高 */
+#define ROW_STRIDE    62            /* 行步进 */
+#define ROW_PAD_X     24            /* 行内容左内边距 */
+#define ROW_PAD_R     24            /* 行内容右内边距 */
+#define ROW_GAP       12            /* 主文本与右端元素的最小间距 */
+
+/* 行内字号档（scale；像素字号 = scale * 20，见 w_font_px） */
+#define SC_TITLE      1.7f          /* 页头标题 */
+#define SC_GROUP      1.05f         /* 分组标题 */
+#define SC_MAIN       1.25f         /* 行主文本 */
+#define SC_SUB        1.0f          /* 行副文本 / 右端值 */
+#define SC_DENSE      1.1f          /* 密集行（进度页）主文本 */
+
 /* ---------- 输入抽象：页面只处理动作，不判断物理键 ---------- */
 typedef struct {
     bool confirm;   /* 确认（映射到 X 或 O，随布局设置） */
@@ -198,6 +222,32 @@ int  w_text_mid(float x, float y, float scale, uint32_t color,
                 const char *text, int max_w);
 void w_text_clip(float x, float y, float scale, uint32_t color,
                  const char *text, int max_w);
+/* 右对齐绘制：文本右边缘落在 x_right（内部先测量再定位） */
+void w_text_right(int x_right, float y, float scale, uint32_t color,
+                  const char *fmt, ...);
+
+/* ---------- 行几何（行型 → 锚点/字号）----------
+ * 页面按行型取几何，再自己画内容；要偏离默认只改取回的字段（如
+ * g.x_text = 20），不做第二套"默认表 + 覆写"。reserve_right = 右端要留出的
+ * 宽度（右端元素宽 + 间距），主文本可用宽由它扣出。 */
+typedef enum {
+    ROW_VALUE,   /* 单行主文本 + 右端（文字/色块/✕/勾选） */
+    ROW_2LINE,   /* 主上副下两行排 */
+    ROW_DENSE    /* 单行 + 下方附属进度条（进度页） */
+} RowKind;
+
+typedef struct {
+    int   x_text;    /* 内容左锚点 */
+    int   x_right;   /* 右端元素右边缘（w_text_right 用） */
+    int   w_text;    /* 主文本可用宽（已扣 reserve_right，不为负） */
+    int   y_main;    /* 主文本 y（行首升部线语义） */
+    int   y_sub;     /* 副文本 y；ROW_DENSE 时 = 附属进度条顶 */
+    float main_sc;   /* 主文本字号 */
+    float sub_sc;    /* 副文本 / 右端值字号 */
+    int   row_h;     /* 行可见高（= 传入 r.h） */
+} RowGeom;
+
+void row_geom(Rect r, RowKind kind, int reserve_right, RowGeom *g);
 void w_rect(Rect r, uint32_t color);
 void w_rect_outline(Rect r, uint32_t color);
 void w_bar(Rect r, uint32_t bg, uint32_t fg, int pct);
