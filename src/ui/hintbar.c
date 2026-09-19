@@ -114,6 +114,36 @@ static void w_icon(HintIcon ic, float cx, float cy, uint32_t c, uint8_t dir_off)
     }
 }
 
+/* ---------- 蓄力环（页脚） ---------- */
+
+/* 待画的蓄力环：w_page_footer_charge 设置，w_page_footer_segs 绘制时消费一次即清 */
+static HintKey g_charge_key = HKEY_NONE;
+static float   g_charge_pct;
+
+/* 蓄力环：以 (cx,cy) 为心、半径 r，从 12 点顺时针填充 pct 比例；未满部分画
+ * base（底环灰），用户能看出"还差多少"。24 段短线段拼弧（vita2d 没有画弧 API；
+ * 禁用 draw_array，见文件头）。 */
+static void w_hold_ring(float cx, float cy, float r, float pct,
+                        uint32_t c, uint32_t base)
+{
+    const float step = 6.2831853f / 24.0f;
+    int n = (int)(pct * 24.0f + 0.5f), i;
+    if (n > 24) n = 24;
+    for (i = 0; i < 24; i++) {
+        float a0 = -1.5707963f + step * i;   /* -90° = 12 点方向；角度增即顺时针 */
+        float a1 = a0 + step;
+        thick_seg(cx + r * cosf(a0), cy + r * sinf(a0),
+                  cx + r * cosf(a1), cy + r * sinf(a1),
+                  i < n ? c : base);
+    }
+}
+
+void w_page_footer_charge(HintKey key, float pct)
+{
+    g_charge_key = key;
+    g_charge_pct = pct;
+}
+
 /* ---------- 键 → 图标 / 键序 ---------- */
 
 /* 键位图形：确认/返回键按当前布局在 ○/✗ 之间取 */
@@ -240,6 +270,10 @@ void w_page_footer_segs(const HintSeg *segs, int n)
                 HintIcon t = ic; ic = ic2; ic2 = t;
             }
             w_icon(ic, x + 11, cy, ic_c, s[i].dir_off);
+            /* 蓄力环：只给单键段、且非 dim（列表已空时该段已灰，画环没意义） */
+            if (g_charge_pct > 0.0f && s[i].key == g_charge_key && !s[i].dim)
+                w_hold_ring(x + 11, cy, 14.0f, g_charge_pct,
+                            theme->accent, theme->border);
             if (ic2 != HICON_NONE) {
                 /* 第二个键：与第一个隔开，中间一个小号暗淡的 "/" 表示"或" */
                 int sw = 0;
@@ -264,4 +298,7 @@ void w_page_footer_segs(const HintSeg *segs, int n)
         }
         x += gap;
     }
+    /* 一次性设置：本帧消费完即清（页面要画就每帧设一次） */
+    g_charge_key = HKEY_NONE;
+    g_charge_pct = 0.0f;
 }

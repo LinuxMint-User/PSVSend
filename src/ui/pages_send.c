@@ -331,7 +331,7 @@ static void unpick(int idx)
     area_clamp(&pick_scroll, g_app.picked_count, PANE_VIEW_H);
 }
 
-/* 清空已选清单（三角键·文件栏聚焦时用） */
+/* 清空已选清单（三角键·文件栏聚焦 + 按住蓄满时用） */
 static void unpick_all(void)
 {
     g_app.picked_count = 0;
@@ -395,13 +395,17 @@ void page_devices_render(void)
         segs[ns++].text = g_app.picked_count > 0 ? tr("Remove") : tr("Select files");
     }
     segs[ns].key = HKEY_TRIANGLE;     segs[ns].varies = true;
-    /* 三角键语义随焦点栏变化：设备栏=扫描网段，文件栏=清空已选（无已选则灰掉） */
+    /* 三角键语义随焦点栏变化：设备栏=短按扫描网段；文件栏=按住蓄满清空已选
+     * （蓄力环画在该段图标周围；无已选则灰掉、不画环） */
     if (g_app.pane_focus == 0) {
         segs[ns++].text = tr("Scan");
     } else {
         segs[ns].dim = g_app.picked_count <= 0;
-        segs[ns++].text = tr("Remove all");
+        segs[ns++].text = tr("Hold to clear all");
     }
+    /* 蓄力环只给文件栏（设备栏那段是"Scan"，按住不该冒出进度环） */
+    w_page_footer_charge(HKEY_TRIANGLE,
+                         g_app.pane_focus == 1 ? ui_input_alt_charge() : 0.0f);
     w_page_footer_segs(segs, ns);
 }
 
@@ -437,8 +441,10 @@ void page_devices_input(const Input *in)
         return;
     }
     /* 十字键：←/→ 切栏，↑/↓ 在焦点栏内移动 */
-    if (in->left || in->right)
+    if (in->left || in->right) {
         g_app.pane_focus = g_app.pane_focus ? 0 : 1;
+        ui_input_alt_reset();   /* 切栏即作废蓄力：三角语义跟着栏走，别跨栏继承 */
+    }
     if (in->up || in->down) {
         if (g_app.pane_focus == 0 && count > 0) {
             if (in->up && g_app.dev_sel > 0) g_app.dev_sel--;
@@ -461,10 +467,13 @@ void page_devices_input(const Input *in)
             open_files();   /* 文件栏空态：确认 = 进文件选择页 */
     }
     if (in->square) open_files();     /* 方块键：随时进文件选择页 */
-    if (in->alt) {                    /* 三角键：设备栏=扫描网段；文件栏=清空已选 */
+    if (in->alt) {                    /* 三角键短按：设备栏=扫描网段 */
         if (g_app.pane_focus == 0)
             api_scan_trigger();
-        else if (g_app.picked_count > 0)
+        /* 文件栏不响应短按：清空已选改成"按住蓄满"，见下面的 alt_long */
+    }
+    if (in->alt_long) {               /* 三角键按住蓄满：文件栏清空已选 */
+        if (g_app.pane_focus == 1 && g_app.picked_count > 0)
             unpick_all();
     }
     if (in->menu) {

@@ -55,6 +55,12 @@ void w_page_footer_segs(const HintSeg *segs, int n);
 /* 底部提示条：单行纯文案（无键位图标） */
 void w_page_footer(const char *hint);
 
+/* 页脚蓄力环：在下一次 w_page_footer_segs 中，给 key 所在段的图标周围画一圈
+ * 进度环（pct 0..1，从 12 点顺时针；底环灰、进度弧主色）。
+ * 与 w_clear/w_add 同模式——一次性设置，绘制后自动清除：页面每帧设一次即可，
+ * 不设就不画（0 或未设为不画）。dim 段不画。 */
+void w_page_footer_charge(HintKey key, float pct);
+
 /* 独立"✕"图标（列表行尾删除按钮，不用在提示条里） */
 void w_icon_cross(float cx, float cy, float r, uint32_t c);
 

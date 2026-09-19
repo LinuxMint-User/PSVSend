@@ -525,8 +525,8 @@ void ui_run(void)
                 ui_input_resync();       /* 冻结期结束：先对齐边沿，别把"还在按着的键"当新按下 */
             ui_input_poll(&in);
             if (in.tap || in.up || in.down || in.left || in.right ||
-                in.confirm || in.back || in.menu || in.alt || in.square ||
-                in.drag_start || in.dragging)
+                in.confirm || in.back || in.menu || in.alt || in.alt_long ||
+                in.square || in.drag_start || in.dragging)
                 input_page(&in);
         }
         ime_was_busy = page_ime_busy();

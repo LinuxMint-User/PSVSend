@@ -44,7 +44,8 @@ typedef struct {
     bool back;      /* 返回（映射到另一键） */
     bool up, down, left, right;
     bool menu;      /* SELECT（打开设置） */
-    bool alt;       /* TRIANGLE */
+    bool alt;       /* TRIANGLE（按下沿） */
+    bool alt_long;  /* TRIANGLE 按住蓄满（长按事件；蓄力进度见 ui_input_alt_charge） */
     bool square;    /* SQUARE（接收页：模拟发送方取消请求） */
     bool tap;       /* 触摸单击（按住即抬起、无明显移动；屏幕坐标） */
     int  tap_x, tap_y;
@@ -176,6 +177,11 @@ void ui_input_poll(Input *in);
 /* 输入被冻结（系统键盘打开期间整段不轮询）后调用一次：把边沿状态对齐到
  * "此刻的真实按键/触摸"，避免解冻首帧凭空合成一次确认/返回或 tap。 */
 void ui_input_resync(void);
+/* 三角键"按住蓄力"进度 0..1：蓄力 / 回落 / 满格判定都实现在 input.c（见 ALT_*
+ * 常量），页面只读这个值画蓄力环，动作走 Input.alt_long。 */
+float ui_input_alt_charge(void);
+/* 作废当前蓄力（如切栏导致该键语义变了）：进度清零，且松开前不再重新蓄力 */
+void ui_input_alt_reset(void);
 
 /* ---------- 初始化（pages.c） ---------- */
 void pages_init(void);

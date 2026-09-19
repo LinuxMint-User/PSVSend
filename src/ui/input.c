@@ -19,6 +19,17 @@ static uint64_t rep_last[4];    /* 上次触发时刻 */
 #define REP_DELAY_US   300000   /* 长按 300ms 开始重复 */
 #define REP_INTERVAL_US 80000   /* 之后每 80ms 一次 */
 
+/* 三角键"按住蓄力"（主页文件栏清空列表用；长按口径的唯一真源）：
+ *   按住 → 进度按帧上涨，蓄满产生一次 Input.alt_long 事件并上锁（仍按着不再触发）；
+ *   松开 → 解锁，进度按帧回落到 0（不立刻归零：符合"蓄力泄掉"的直觉）。
+ * 页面只消费 alt_long 事件 + 读 ui_input_alt_charge() 画环，不判断物理键。 */
+#define ALT_HOLD_US    700000   /* 蓄满所需按住时长（0.7s） */
+#define ALT_REL_US     1000000  /* 松手后回落时长（1s） */
+#define ALT_FRAME_US   16667    /* 每帧步长：poll 每帧一次、vsync 恒 60Hz */
+
+static float alt_charge;        /* 当前蓄力进度 0..1（页面画环用） */
+static bool  alt_locked;        /* 本次按住不再蓄力（已触发 / 换栏作废），松开才解 */
+
 /* 触摸拖动状态机：
  *   按下            → 记录起点
  *   位移 < 阈值 抬起 → tap（单击）
@@ -169,6 +180,23 @@ void ui_input_poll(Input *in)
         in->down  = dir_event(b, SCE_CTRL_DOWN, 1, now);
         in->left  = dir_event(b, SCE_CTRL_LEFT, 2, now);
         in->right = dir_event(b, SCE_CTRL_RIGHT, 3, now);
+        /* 三角蓄力：按住上涨，满格产生一次 alt_long 事件并上锁；松开回落 */
+        if (b & SCE_CTRL_TRIANGLE) {
+            if (!alt_locked) {
+                alt_charge += (float)ALT_FRAME_US / (float)ALT_HOLD_US;
+                if (alt_charge >= 1.0f) {
+                    alt_charge = 0.0f;   /* 满格即清零：环立刻消失（动作已发生） */
+                    alt_locked = true;
+                    in->alt_long = true;
+                }
+            }
+        } else {
+            alt_locked = false;
+            if (alt_charge > 0.0f) {
+                alt_charge -= (float)ALT_FRAME_US / (float)ALT_REL_US;
+                if (alt_charge < 0.0f) alt_charge = 0.0f;
+            }
+        }
         prev_buttons = b;
     }
 
@@ -197,6 +225,8 @@ void ui_input_resync(void)
         prev_buttons = pad.buttons;
     for (i = 0; i < 4; i++)
         rep_press[i] = rep_last[i] = now;
+    alt_charge = 0.0f;   /* 冻结期没推进过蓄力：解冻不继承，避免凭空蓄满 */
+    alt_locked = false;
 
     t_drag = false;
     if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) >= 0 &&
@@ -214,4 +244,19 @@ void ui_input_resync(void)
 void ui_input_init(void)
 {
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+}
+
+/* 三角蓄力进度：页面拿它画环（0 = 不画） */
+float ui_input_alt_charge(void)
+{
+    return alt_charge;
+}
+
+/* 作废当前蓄力：清零并上锁，直到三角松开前都不再重新蓄力。
+ * 用于"该键的语义变了"（如主页左右切栏）：别把上一语义下攒的进度带过去。
+ * 三角没按着时上锁无副作用——下一帧 poll 走"松开"分支即自动解锁。 */
+void ui_input_alt_reset(void)
+{
+    alt_charge = 0.0f;
+    alt_locked = true;
 }
