@@ -538,7 +538,7 @@ void page_settings_render(void)
                 w_text_w(1.3f, "PSVSend", &lw, &lh);
                 w_text(28, top + 16, 1.3f, theme->accent, "PSVSend");
                 w_text(28 + lw + 16, top + 20, 1.0f, theme->text_dim,
-                       "v" PSVSEND_APP_VERSION);
+                       "v" PSVSEND_APP_VERSION " (" PSVSEND_BUILD_TAG ")");
             }
             if (slot == SET_SLOT_ABOUT_B)
                 w_text(28, top + 12, 0.9f, theme->text_dim, "%s",

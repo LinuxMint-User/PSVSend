@@ -604,23 +604,39 @@ static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn,
 
     /* 6) 按源格式解析 body */
     if (s->want == 2) {
-        /* config.h：取 PSVSEND_APP_VERSION 宏的字符串值。宏在文件前部
-         * （#define PSVSEND_APP_VERSION "2.0.0"），首个出现即定义处；
-         * 其后紧跟双引号包围的版本串。 */
-        const char *m = strstr(win, "PSVSEND_APP_VERSION");
-        const char *q, *e;
-        if (!m) {
+        /* config.h：取版本宏的字符串值。严格认"定义行"——宏名所在行的首个
+         * 记号必须是 #define（容忍缩进与 "# define"），且宏名后跳空白即为
+         * 双引号；否则只是注释/文档里提到了这个名字，继续往后找下一处。
+         * 值还要求以数字开头，防止把别的宏值（如构建号 "d158"）当版本串。
+         * 注：#define 与宏名之间是"跳空白"而非固定一个空格——文件里将来做
+         * 排版对齐时会变。 */
+        static const char NAME[] = "PSVSEND_APP_VERSION";
+        const char *m = win, *line, *p, *q = NULL, *e;
+        while ((m = strstr(m, NAME)) != NULL) {
+            line = m;                              /* 回退到本行行首 */
+            while (line > win && line[-1] != '\n') line--;
+            p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '#') p++;
+            while (*p == ' ' || *p == '\t') p++;
+            if (strncmp(p, "define", 6) == 0) {
+                p += 6;
+                while (*p == ' ' || *p == '\t') p++;
+                if (p == m) {                      /* 宏名正是 define 后的首个记号 */
+                    p += sizeof NAME - 1;
+                    while (*p == ' ' || *p == '\t') p++;
+                    if (*p == '"') { q = p + 1; break; }
+                }
+            }
+            m += sizeof NAME - 1;                  /* 不是定义处 → 继续找下一处 */
+        }
+        if (!q) {
             dlog("upd[%d]: %s no version macro (%d bytes)", idx, s->host, bn);
             goto fail;
         }
-        q = strchr(m, '"');
-        if (!q) {
-            dlog("upd[%d]: %s macro without value", idx, s->host);
-            goto fail;
-        }
-        q++;
         e = strchr(q, '"');
-        if (!e || e - q <= 0 || e - q >= tagn) {
+        if (!e || e - q <= 0 || e - q >= tagn ||
+            !(q[0] >= '0' && q[0] <= '9')) {
             dlog("upd[%d]: %s bad macro value (%d bytes)", idx, s->host, bn);
             goto fail;
         }

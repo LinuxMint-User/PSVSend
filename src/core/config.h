@@ -28,6 +28,12 @@
  * 两处一起改，SFO APP_VER 由 CMake 从 VERSION 派生，无需手改。 */
 #define PSVSEND_APP_VERSION "2.2.0"
 
+/* 构建魔数：每次交付构建递增（dXX），真机 boot 日志与设置页"关于"共用此宏，
+ * 装完直接看"关于"就能核对刷入的是不是对新固件，不必翻日志。
+ * 只用于显示/标识——不要拼进 PSVSEND_APP_VERSION：app/update.c 会解析远端
+ * config.h 里的该宏做版本比较，混入构建号会让比较失准。 */
+#define PSVSEND_BUILD_TAG "d158"
+
 typedef struct {
     char alias[64];          /* 设备名，广播给其他 LocalSend 设备 */
     char fingerprint[64];    /* 随机身份串：防自发现；首次生成后持久化 */
