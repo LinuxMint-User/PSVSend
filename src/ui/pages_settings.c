@@ -100,6 +100,7 @@ void settings_open(void)
     set_drawer_cur  = 0;
     set_drawer_w    = 0;
     set_drawer_t    = 0;
+    ui_font_preload_begin();   /* 后台预读另外两份 CJK：页内切语言不必等 1.6s 读盘 */
 }
 
 static int slot_item(int slot)
@@ -732,7 +733,10 @@ void page_settings_input(const Input *in)
     /* 确认键：动作行直接执行，值行开选项面板（"确认键布局"项也照此——面板里只需
      * 按一次就换身份，不再像以前那样专门给它开左右方向键）。 */
     if (in->confirm) set_row_activate(g_app.set_sel);
-    if (in->back) g_app.page = PAGE_DEVICES;
+    if (in->back) {
+        ui_font_preload_end();     /* 出设置页：停预读线程 + 释放非常驻字体副本 */
+        g_app.page = PAGE_DEVICES;
+    }
 }
 
 /* ================= 目录选择页 =================

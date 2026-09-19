@@ -680,6 +680,10 @@ static void open_recv_request(const RecvPending *rp)
     rs_scroll = 0;
     rename_pop = false;
     recv_focus = 2;
+    /* 设置页的另一种离开方式：接收请求把设置页顶掉（返回键那条出口在
+     * page_settings_input 里收）。不收尾的话预读线程与"另外两份 CJK"的 ~33MB
+     * 会一直留在页外。不在设置页时该调用是空操作。 */
+    ui_font_preload_end();
     g_app.page = PAGE_RECV_CONFIRM;
 }
 
