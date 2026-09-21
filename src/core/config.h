@@ -24,9 +24,9 @@
 #define PARALLEL_DEFAULT  3
 
 /* 客户端发布版本（运行时显示 / 设置页"关于"）。
- * 与 CMakeLists.txt 的 project(VERSION 2.2.0) 保持一致——升级版本号时
+ * 与 CMakeLists.txt 的 project(VERSION 2.3.0) 保持一致——升级版本号时
  * 两处一起改，SFO APP_VER 由 CMake 从 VERSION 派生，无需手改。 */
-#define PSVSEND_APP_VERSION "2.2.0"
+#define PSVSEND_APP_VERSION "2.3.0"
 
 /* 构建魔数：每次交付构建递增（dXX），真机 boot 日志与设置页"关于"共用此宏，
  * 装完直接看"关于"就能核对刷入的是不是对新固件，不必翻日志。
