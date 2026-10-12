@@ -364,6 +364,25 @@ void w_page_header(const char *title)
     w_rect((Rect){ 0, HDR_H - 2, SCR_W, 2 }, theme->border);
 }
 
+/* 页头右上角触摸按钮：方框 + 居中图标 + 热区（页头右侧原本全空，零抢占也不在
+ * 握持区）。方框是为了让人看出"这里能点"——页头别处都是纯图标，光有图标不一定
+ * 被当成按钮。dim=true 画灰且不注册热区。 */
+void w_hdr_button(int cx, int id, HdrBtn kind, bool dim)
+{
+    int y   = (HDR_H - HDR_BTN_SZ) / 2;   /* 方框顶：垂直居中于页头 */
+    int icy = y + HDR_BTN_SZ / 2;         /* 图标中心（线与圆都以它为中心） */
+    uint32_t c = dim ? theme->border : theme->text_dim;
+
+    w_rect_outline((Rect){ cx - HDR_BTN_SZ / 2, y, HDR_BTN_SZ, HDR_BTN_SZ }, c);
+    switch (kind) {
+    case HDRBTN_BACK:     w_icon_back((float)cx, (float)icy, 8.5f, c);   break;
+    case HDRBTN_SCAN:     w_icon_search((float)cx, (float)icy, 8.0f, c); break;
+    case HDRBTN_SETTINGS: w_icon_gear((float)cx, (float)icy, 9.0f, c);   break;
+    }
+    if (!dim)
+        w_add(id, (Rect){ cx - HDR_BTN_HITW / 2, 0, HDR_BTN_HITW, HDR_H });
+}
+
 /* w_row 实现（sub_c=0 用默认色；指定则覆盖——"检查更新"行发现新版时用 accent 强调）。
  * 右端值不再按写死的预留值让位：先量它自己的宽，主文本按"右值实测宽 + ROW_GAP"
  * 扣出可用宽；右值本身就长过整行时退化成"主文本让位为 0、右值左对齐裁尾"，

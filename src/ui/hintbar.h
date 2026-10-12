@@ -67,4 +67,14 @@ void w_icon_cross(float cx, float cy, float r, uint32_t c);
 /* 独立"✓"图标（设置页选项面板标记当前档；与 w_icon_cross 同一套线宽口径） */
 void w_icon_check(float cx, float cy, float r, uint32_t c);
 
+/* 独立"⚙"图标（主页页头"设置"触摸按钮；r = 外环半径）
+ * 独立"🔍"图标（主页页头"扫描"触摸按钮；r = 镜片半径）
+ * 与上面几个同一套线宽口径，空心环靠主题背景色挖空 → 只能画在纯色底上。 */
+void w_icon_gear(float cx, float cy, float r, uint32_t c);
+void w_icon_search(float cx, float cy, float r, uint32_t c);
+
+/* 独立"←"图标（页头"返回"触摸按钮；r = 箭尖到箭尾的一半长）
+ * 与上面几个同一套线宽口径。 */
+void w_icon_back(float cx, float cy, float r, uint32_t c);
+
 #endif /* PSVSEND_UI_HINTBAR_H */

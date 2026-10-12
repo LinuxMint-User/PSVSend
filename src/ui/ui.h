@@ -18,6 +18,14 @@ vita2d_font *font_get(int size, int cjk);
  * 列表页的几何口径都从这里取：页头/页脚高、列表可视区、行高与步进、行内边距、
  * 行内字号档。页面不再各写一份数值；要调间距只改这里。 */
 #define HDR_H         52            /* 页头高（底沿 2px 分隔线） */
+/* 页头右上角触摸按钮（触摸补齐）：方框 + 图标，热区比方框宽一圈且顶满页头高。
+ * 最右槽贴屏幕右缘 HDR_BTN_EDGE，左槽与它隔同样的距离；单按钮页用 HDR_SLOT_R，
+ * 主页两按钮 = HDR_SLOT_L（扫描）+ HDR_SLOT_R（设置）。 */
+#define HDR_BTN_SZ    40            /* 方框边长 */
+#define HDR_BTN_HITW  52            /* 触摸热区宽 */
+#define HDR_BTN_EDGE  16
+#define HDR_SLOT_R    (SCR_W - HDR_BTN_EDGE - HDR_BTN_SZ / 2)
+#define HDR_SLOT_L    (HDR_SLOT_R - HDR_BTN_SZ - HDR_BTN_EDGE)
 #define FOOTER_H      46            /* 页脚提示条高 */
 #define LIST_GAP_TOP  24            /* 页头下沿 → 列表顶 */
 #define LIST_GAP_BOT  6             /* 列表底 → 页脚留白 */
@@ -264,6 +272,11 @@ void w_rect(Rect r, uint32_t color);
 void w_rect_outline(Rect r, uint32_t color);
 void w_bar(Rect r, uint32_t bg, uint32_t fg, int pct);
 void w_page_header(const char *title);
+
+/* 页头右上角触摸按钮：画方框 + 图标并注册热区（样式/位置口径只在 widgets.c 一处，
+ * 各页只挑槽位与图标）。dim=true 画灰且不注册热区（该动作当前按不动）。 */
+typedef enum { HDRBTN_BACK, HDRBTN_SCAN, HDRBTN_SETTINGS } HdrBtn;
+void w_hdr_button(int cx, int id, HdrBtn kind, bool dim);
 void w_row(Rect r, const char *main_text, const char *sub_text, bool selected);
 /* 同 w_row，但右值文本颜色指定（0=默认：选中 accent_text / 未选 text_dim） */
 void w_row_c(Rect r, const char *main_text, const char *sub_text,

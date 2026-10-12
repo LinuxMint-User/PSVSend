@@ -58,6 +58,40 @@ void w_icon_check(float cx, float cy, float r, uint32_t c)
     thick_seg(cx - r * 0.2f, cy + r * 0.7f, cx + r * 0.95f, cy - r * 0.75f, c);
 }
 
+/* "🔍"图标：镜片环 + 右下斜柄 */
+void w_icon_search(float cx, float cy, float r, uint32_t c)
+{
+    float k = r * 0.62f;              /* 柄起点落在环上（45° 处略往内，接缝不留缝） */
+    vita2d_draw_fill_circle(cx, cy, r, c);
+    vita2d_draw_fill_circle(cx, cy, r - 2.5f, theme->bg);
+    thick_seg(cx + k, cy + k, cx + r + 3.5f, cy + r + 3.5f, c);
+}
+
+/* "←"图标：箭尖 + 一条横杆（<-- ）。尖头两臂 45° 张开，杆横穿到箭尾。 */
+void w_icon_back(float cx, float cy, float r, uint32_t c)
+{
+    float tip = cx - r;
+    float k   = r * 0.62f;            /* 尖头两臂的横/竖分量 */
+    thick_seg(tip, cy, tip + k, cy - k, c);
+    thick_seg(tip, cy, tip + k, cy + k, c);
+    thick_seg(tip, cy, cx + r, cy, c);
+}
+
+/* "⚙"图标：外环 + 8 根齿（每 45° 一根，从环外探出 ~2.5px）。
+ * 齿先画、环后画：环的挖空圆会把探进内圈的那截齿盖掉，接缝干净。 */
+void w_icon_gear(float cx, float cy, float r, uint32_t c)
+{
+    int i;
+    for (i = 0; i < 8; i++) {
+        float a = 0.7853982f * (float)i;
+        float ux = cosf(a), uy = sinf(a);
+        thick_seg(cx + ux * (r - 1.0f), cy + uy * (r - 1.0f),
+                  cx + ux * (r + 2.5f), cy + uy * (r + 2.5f), c);
+    }
+    vita2d_draw_fill_circle(cx, cy, r, c);
+    vita2d_draw_fill_circle(cx, cy, r - 2.5f, theme->bg);
+}
+
 static void w_icon(HintIcon ic, float cx, float cy, uint32_t c, uint8_t dir_off)
 {
     switch (ic) {

@@ -19,6 +19,7 @@
  * 本组页面专用的控件 id 与后缀。 */
 #define WID_FILES_DONE 0x8001    /* 文件选择页"完成"触摸按钮 */
 #define WID_DIRPICK_SAVE 0x9001  /* 目录选择页"存到当前目录"触摸按钮 */
+#define WID_CP_SAVE      0x9002  /* 色盘页"保存"触摸按钮（与确认键同义） */
 #define DIR_SUFFIX   "/"         /* 目录名后缀 */
 
 /* ---------- 发送主页两栏布局 ----------
@@ -37,6 +38,16 @@
 #define WID_PICKS_BASE  0x2000                /* + 已选文件行下标 */
 #define WID_PICKX_BASE  0x3000                /* + 已选文件行尾"✕"下标 */
 #define WID_FILES_PICK  0x8002                /* 空文件栏的"选择文件"按钮 */
+/* 主页页头的两个触摸按钮（触摸补齐）：此前进设置只有 SELECT、扫描只有 △，
+ * 触摸用户无路可走（无设备时设备栏更是没有任何可点之物）。 */
+#define WID_HDR_SCAN     0x8201               /* 页头右侧偏左：触发扫描（扫描中不注册） */
+#define WID_HDR_SETTINGS 0x8202               /* 页头最右角：进设置页 */
+/* 各页页头最右角的"返回"按钮（触摸补齐）：这些页原本只有 ✗/方块键能退，
+ * 触摸进来就出不去。动作一律沿用该页 ✗/方块键的既有语义，不自创。 */
+#define WID_HDR_BACK_SET 0x8203               /* 设置页：回主页 */
+#define WID_HDR_BACK_CP  0x8204               /* 色盘页：取消选色并返回 */
+#define WID_HDR_BACK_DP  0x8205               /* 目录选择页：退出选择（不改目录） */
+#define WID_HDR_BACK_RS  0x8206               /* 接收设置页：回接收确认页 */
 
 /* ---------- 各页共用的小工具 ---------- */
 
@@ -153,7 +164,8 @@ static inline void add_row_hit(int id, int top)
 
 /* ---------- 跨页符号 ---------- */
 void files_load(void);          /* pages_send.c：按 cur_dir 重载 g_app.files */
-void enter_dir(const char *name);   /* pages_send.c：进入子目录并重载 */
+int  files_first_sel(void);     /* pages_send.c：files_load 后光标默认落点（跳过首行".."） */
+void enter_dir(const char *name);   /* pages_send.c：进入子目录并重载（".." = 回上级） */
 void parent_dir(void);              /* pages_send.c：回上级目录（根则退回设备页） */
 void pane_focus_default(void);      /* pages_send.c：按已选文件数定主页焦点栏（有文件→设备栏） */
 void goto_devices(void);            /* pages_progress.c：回设备页并复位传输态（接收收尾/离开进度页用） */

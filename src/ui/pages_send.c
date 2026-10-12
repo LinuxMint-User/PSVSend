@@ -384,11 +384,24 @@ static void try_send(int dev_idx)
     start_send(dev_idx);
 }
 
+/* ---------- 页头右侧触摸按钮（触摸补齐） ----------
+ * 此前进设置只有 SELECT、扫描只有 △，触摸用户无路可走（无设备时设备栏更是没有
+ * 任何可点之物）。方框 + 图标、槽位与热区口径统一在 widgets.c 的 w_hdr_button。
+ * 只触发动作、**不改焦点**：页头是全局入口，与左右栏无关；页脚提示条照旧只讲
+ * 按键，两个入口各说各的。扫描按钮只在空闲时可点（扫描中画灰）——按不动比
+ * "再按一下顺延下一轮"那套次级语义更好懂，那是给按键的。 */
+static void hdr_buttons(void)
+{
+    w_hdr_button(HDR_SLOT_L, WID_HDR_SCAN, HDRBTN_SCAN, api_scan_active());
+    w_hdr_button(HDR_SLOT_R, WID_HDR_SETTINGS, HDRBTN_SETTINGS, false);
+}
+
 void page_devices_render(void)
 {
     PaneRect dev, fil;
     dev_sync();
     w_page_header("PSVSend");
+    hdr_buttons();
     dev_strip();
     pane_rects(&dev, &fil);
     dev_pane_render(&dev, g_app.pane_focus == 0);
@@ -465,6 +478,11 @@ void page_devices_input(const Input *in)
             g_app.picked_sel = id - WID_PICKS_BASE;
         } else if (id == WID_FILES_PICK) {
             open_files();
+        } else if (id == WID_HDR_SETTINGS) {
+            settings_open();
+            g_app.page = PAGE_SETTINGS;
+        } else if (id == WID_HDR_SCAN) {
+            api_scan_trigger();   /* 不切焦点：页头是全局入口，与左右栏无关 */
         }
         return;
     }
@@ -515,10 +533,20 @@ void files_load(void)
 {
     SceUID fd = sceIoDopen(g_app.cur_dir);
     SceIoDirent de;
+    bool has_up = strlen(g_app.cur_dir) > 5;   /* 非根目录才有上一级 */
     int n = 0;
     g_app.file_count = 0;
     if (fd < 0) return;
     memset(&de, 0, sizeof de);
+    /* 第 0 行固定放 ".."（上级目录）：触摸用户靠它回上一层（✗ 键他们按不到）。
+     * 文件系统读出来的 "."/".." 照旧跳过，这项是我们自己造的；不参与下面的
+     * 排序，天然钉在首行。根目录不插——无处可回。 */
+    if (has_up) {
+        strcpy(g_app.files[0].name, "..");
+        g_app.files[0].is_dir = true;
+        g_app.files[0].size  = 0;
+        n = 1;
+    }
     while (n < MAX_FILES && sceIoDread(fd, &de) > 0) {
         if (strcmp(de.d_name, ".") == 0 || strcmp(de.d_name, "..") == 0)
             continue;
@@ -530,9 +558,9 @@ void files_load(void)
     }
     sceIoDclose(fd);
     g_app.file_count = n;
-    /* 目录在前，名称升序 */
+    /* 目录在前，名称升序（".." 是第 0 项，从它后面开始排） */
     int i, j;
-    for (i = 0; i < n; i++) {
+    for (i = has_up ? 1 : 0; i < n; i++) {
         for (j = i + 1; j < n; j++) {
             int ai = g_app.files[i].is_dir ? 0 : 1;
             int aj = g_app.files[j].is_dir ? 0 : 1;
@@ -545,6 +573,13 @@ void files_load(void)
         }
     }
     if (g_app.file_sel >= g_app.file_count) g_app.file_sel = 0;
+}
+
+/* files_load 之后光标的默认落点：跳过第 0 行的 ".."，省得每次进目录都先往下按一下
+ * （空目录只剩 ".."、根目录没有它时落 0）。 */
+int files_first_sel(void)
+{
+    return (g_app.file_count > 1 && strcmp(g_app.files[0].name, "..") == 0) ? 1 : 0;
 }
 
 /* 当前浏览目录 + 文件名拼成完整路径（去重/发送都按它比，不用裸文件名） */
@@ -640,15 +675,18 @@ static void done_files(void)
 
 void enter_dir(const char *name)
 {
-    size_t len = strlen(g_app.cur_dir);
+    size_t len;
+    /* 列表首行的 ".." 不是真目录名：直接回上级，别拼出 "ux0:/dir/.." 这种路径 */
+    if (strcmp(name, "..") == 0) { parent_dir(); return; }
+    len = strlen(g_app.cur_dir);
     if (len > 0 && g_app.cur_dir[len - 1] == '/')
         snprintf(g_app.cur_dir, sizeof g_app.cur_dir, "%s%s", g_app.cur_dir, name);
     else
         snprintf(g_app.cur_dir, sizeof g_app.cur_dir, "%s/%s", g_app.cur_dir, name);
-    g_app.file_sel = 0;
     file_scroll = 0;
     remember_dir();
     files_load();
+    g_app.file_sel = files_first_sel();   /* 落在第一个真实项上，不停在 ".." */
 }
 
 void parent_dir(void)
@@ -665,10 +703,10 @@ void parent_dir(void)
     } else {
         strcpy(g_app.cur_dir, "ux0:/");
     }
-    g_app.file_sel = 0;
     file_scroll = 0;
     remember_dir();
     files_load();
+    g_app.file_sel = files_first_sel();
 }
 
 void page_files_render(void)
@@ -695,13 +733,16 @@ void page_files_render(void)
             Rect r = { 24, top, SCR_W - 48, ROW_H };
             add_row_hit(i, top);
             char main[280], sub[32];
+            bool is_up = strcmp(g_app.files[i].name, "..") == 0;
             if (g_app.files[i].is_dir)
                 snprintf(main, sizeof main, "%s%s", g_app.files[i].name, DIR_SUFFIX);
             else if (is_picked(i))
                 snprintf(main, sizeof main, "* %s", g_app.files[i].name);
             else
                 snprintf(main, sizeof main, "%s", g_app.files[i].name);
-            if (g_app.files[i].is_dir)
+            if (is_up)
+                sub[0] = 0;              /* ".."是我们造的上级入口，不显示"文件夹"副文本 */
+            else if (g_app.files[i].is_dir)
                 strcpy(sub, tr("folder"));
             else
                 w_human_size(g_app.files[i].size, sub);
@@ -715,8 +756,11 @@ void page_files_render(void)
     HintSeg segs[6] = { 0 };
     int ns = 0;
     /* 只声明本页用到的键，顺序由 hintbar 排。空目录里没有可选项：
-     * 选择/打开/全选都灰掉 */
-    bool has = count > 0;
+     * 选择/打开/全选都灰掉。首行的 ".." 是我们插的上级入口、不是内容，
+     * 不能拿它把空目录撑成"非空"（否则只剩 ".." 时全选提示不灰）。 */
+    int entries = count;
+    if (entries > 0 && strcmp(g_app.files[0].name, "..") == 0) entries--;
+    bool has = entries > 0;
     /* 上下选文件：选到首/末行时把方向键对应臂画灰 */
     uint8_t off = HDIR_HORZ;
     if (g_app.file_sel <= 0)         off |= HDIR_UP;
@@ -785,9 +829,9 @@ static void open_files(void)
 {
     strncpy(g_app.cur_dir, pick_dir, sizeof g_app.cur_dir - 1);
     g_app.cur_dir[sizeof g_app.cur_dir - 1] = 0;
-    g_app.file_sel = 0;
     file_scroll = 0;
     files_load();
+    g_app.file_sel = files_first_sel();
     g_app.page = PAGE_FILES;
 }
 

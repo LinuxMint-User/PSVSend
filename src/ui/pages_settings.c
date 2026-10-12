@@ -480,6 +480,7 @@ void page_settings_render(void)
     shrink = set_drawer_w * SET_PANEL_SHRINK / SET_PANEL_W;
 
     w_page_header(tr("Settings"));
+    w_hdr_button(HDR_SLOT_R, WID_HDR_BACK_SET, HDRBTN_BACK, false);
     set_clamp_scroll();
     snprintf(theme_v, sizeof theme_v, "%s", tr(theme_names[g_cfg.theme_id]));
     /* 外观行：OLED 无浅色变体，恒显"深色（固定）" */
@@ -680,6 +681,14 @@ void page_settings_render(void)
     w_page_footer_segs(segs, ns);
 }
 
+/* 出设置页：停字体预读线程 + 释放非常驻字体副本，回主页。
+ * ✗ 键与页头"返回"触摸按钮共用（触摸进来必须能出去）。 */
+static void settings_leave(void)
+{
+    ui_font_preload_end();
+    g_app.page = PAGE_DEVICES;
+}
+
 void page_settings_input(const Input *in)
 {
     /* 面板态：拖动滚动冻结、列表焦点不动，其余按键一律吞掉，只认面板内的动作 */
@@ -716,6 +725,7 @@ void page_settings_input(const Input *in)
     }
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
+        if (id == WID_HDR_BACK_SET) { settings_leave(); return; }
         if (id >= 0) {
             int item = id / 2;           /* 行 id 仍留 2 的步长，与面板 id 段不撞 */
             if (item >= 0 && item < SET_ITEM_N) {
@@ -734,10 +744,7 @@ void page_settings_input(const Input *in)
     /* 确认键：动作行直接执行，值行开选项面板（"确认键布局"项也照此——面板里只需
      * 按一次就换身份，不再像以前那样专门给它开左右方向键）。 */
     if (in->confirm) set_row_activate(g_app.set_sel);
-    if (in->back) {
-        ui_font_preload_end();     /* 出设置页：停预读线程 + 释放非常驻字体副本 */
-        g_app.page = PAGE_DEVICES;
-    }
+    if (in->back) settings_leave();
 }
 
 /* ================= 目录选择页 =================
@@ -772,6 +779,9 @@ void open_dir_pick(PageId origin, bool persist, const char *start_dir)
     dpick_scroll = 0;
     files_load();
     dpick_build();
+    /* 光标跳过首行 ".."（与文件页同口径，省得每次进选择页都先往下按一下） */
+    if (dpick_dcount > 1 && strcmp(g_app.files[dpick_dirs[0]].name, "..") == 0)
+        g_app.file_sel = 1;
     g_app.page = PAGE_DIR_PICK;
 }
 
@@ -783,11 +793,17 @@ static void dpick_enter(int dn)
     dpick_scroll = 0;
 }
 
+/* 退出目录选择、一个目录都不改，回来源页（方块键与页头"返回"触摸按钮共用） */
+static void dpick_exit(void)
+{
+    g_app.page = dpick_origin;
+}
+
 static void dpick_up(void)
 {
     size_t len = strlen(g_app.cur_dir);
     if (len <= 5) {                 /* 已在 ux0:/ 根：回来源页，不改任何目录 */
-        g_app.page = dpick_origin;
+        dpick_exit();
         return;
     }
     parent_dir();
@@ -812,6 +828,7 @@ void page_dir_pick_render(void)
 {
     int i;
     w_page_header(tr("Choose folder"));
+    w_hdr_button(HDR_SLOT_R, WID_HDR_BACK_DP, HDRBTN_BACK, false);
     w_text_lead(28, 56, 1.0f, theme->text_dim, g_app.cur_dir, SCR_W - 56);
     if (dpick_dcount > 0) {
         clamp_scroll(&dpick_scroll, dpick_dcount);
@@ -832,12 +849,6 @@ void page_dir_pick_render(void)
         w_text(28, LIST_TOP + 8, 1.1f, theme->text_dim, "%s",
                tr("(empty folder)"));
     }
-    /* 右下"存到此处"按钮，左侧同行走当前目录路径（即将写入的路径） */
-    Rect bt = { SCR_W - 280, SCR_H - 42, 256, 36 };
-    w_add(WID_DIRPICK_SAVE, bt);
-    w_button(bt, tr("Save here"), true);
-    w_text_lead(24, SCR_H - 38, 1.0f, theme->text_dim,
-                g_app.cur_dir, SCR_W - 296);
     HintSeg segs[6] = { 0 };
     int ns = 0;
     /* 空目录里没有可选项：选择/打开灰掉 */
@@ -855,6 +866,11 @@ void page_dir_pick_render(void)
     segs[ns].key = HKEY_SQUARE;      segs[ns++].text = tr("Exit");
     segs[ns].key = HKEY_TRIANGLE;    segs[ns++].text = tr("Save here");
     w_page_footer_segs(segs, ns);
+    /* 右下角"存到此处"触摸按钮（与三角键同义）：保留当前目录回来源页。
+     * 必须画在页脚**之后**——页脚整条铺了不透明背景，先画会被它盖掉看不见。 */
+    Rect bt = { SCR_W - 216, SCR_H - 42, 192, 36 };
+    w_add(WID_DIRPICK_SAVE, bt);
+    w_button(bt, tr("Save here"), true);
 }
 
 void page_dir_pick_input(const Input *in)
@@ -867,6 +883,7 @@ void page_dir_pick_input(const Input *in)
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id == WID_DIRPICK_SAVE) { dpick_save(); return; }
+        if (id == WID_HDR_BACK_DP) { dpick_exit(); return; }
         if (id >= 0 && id < dpick_dcount) {
             g_app.file_sel = id;
             dpick_enter(id);
@@ -885,7 +902,7 @@ void page_dir_pick_input(const Input *in)
         dpick_enter(g_app.file_sel);
     if (in->alt) { dpick_save(); return; }   /* 三角：选定当前目录并返回 */
     if (in->square) {                        /* 方块：退出选择，不改任何目录 */
-        g_app.page = dpick_origin;
+        dpick_exit();
         return;
     }
     if (in->back) dpick_up();
@@ -1032,6 +1049,7 @@ void page_color_pick_render(void)
     int axis;
 
     w_page_header(tr("Choose color"));
+    w_hdr_button(HDR_SLOT_R, WID_HDR_BACK_CP, HDRBTN_BACK, false);
     for (axis = 0; axis < 3; axis++)
         cp_draw_bar(axis, tr(cp_labels[axis]));
 
@@ -1058,6 +1076,12 @@ void page_color_pick_render(void)
     segs[ns].key = HKEY_CONFIRM; segs[ns++].text = tr("Save");
     segs[ns].key = HKEY_BACK;    segs[ns++].text = tr("Cancel");
     w_page_footer_segs(segs, ns);
+    /* 右下角"保存"触摸按钮（与确认键同义）：此前触摸只能调、只能取消，
+     * 没法落盘，自定义主色对纯触摸用户等于不可用。与其它页同口径，
+     * 画在页脚之后，免得被页脚背景盖掉。 */
+    Rect sv = { SCR_W - 216, SCR_H - 42, 192, 36 };
+    w_add(WID_CP_SAVE, sv);
+    w_button(sv, tr("Save"), true);
 }
 
 void page_color_pick_input(const Input *in)
@@ -1075,6 +1099,9 @@ void page_color_pick_input(const Input *in)
         return;
     }
     if (in->tap) {
+        int id = w_hit(in->tap_x, in->tap_y);
+        if (id == WID_HDR_BACK_CP) { cp_cancel(); return; }
+        if (id == WID_CP_SAVE)     { cp_commit(); return; }
         axis = cp_axis_at(in->tap_y);
         if (axis >= 0) { cp_focus = axis; cp_set_from_x(axis, in->tap_x); }
         return;

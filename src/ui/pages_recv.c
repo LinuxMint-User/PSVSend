@@ -501,6 +501,7 @@ static void rss_add_hit(int id, Rect r)
 void page_recv_setup_render(void)
 {
     w_page_header(tr("Receive setup"));
+    w_hdr_button(HDR_SLOT_R, WID_HDR_BACK_RS, HDRBTN_BACK, false);
     int rows = 1 + g_app.inc_count;
     char sz[16];
     rs_clamp();
@@ -604,6 +605,14 @@ void page_recv_setup_render(void)
     w_page_footer_segs(segs, ns);
 }
 
+/* 回接收确认页（✗ 键与页头"返回"触摸按钮共用）：本次临时设置已生效 */
+static void rs_leave(void)
+{
+    rename_pop = false;
+    recv_focus_sane();
+    g_app.page = PAGE_RECV_CONFIRM;
+}
+
 void page_recv_setup_input(const Input *in)
 {
     int rows = 1 + g_app.inc_count;
@@ -627,6 +636,7 @@ void page_recv_setup_input(const Input *in)
     }
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
+        if (id == WID_HDR_BACK_RS) { rs_leave(); return; }
         if (id >= RS_REN_ID && id < RS_REN_ID + rows) {
             int row = id - RS_REN_ID;
             g_app.inc_sel = row;
@@ -667,11 +677,7 @@ void page_recv_setup_input(const Input *in)
     if (in->alt) {
         if (g_app.inc_sel > 0) ask_rename(g_app.inc_sel - 1);
     }
-    if (in->back) {
-        rename_pop = false;
-        recv_focus_sane();
-        g_app.page = PAGE_RECV_CONFIRM;   /* 临时设置已生效，返回接收页 */
-    }
+    if (in->back) rs_leave();
 }
 
 /* ================= 新接收请求自动弹窗 ================= */
