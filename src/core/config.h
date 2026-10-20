@@ -32,7 +32,7 @@
  * 装完直接看"关于"就能核对刷入的是不是对新固件，不必翻日志。
  * 只用于显示/标识——不要拼进 PSVSEND_APP_VERSION：app/update.c 会解析远端
  * config.h 里的该宏做版本比较，混入构建号会让比较失准。 */
-#define PSVSEND_BUILD_TAG "d185"
+#define PSVSEND_BUILD_TAG "d186"
 
 typedef struct {
     char alias[64];          /* 设备名，广播给其他 LocalSend 设备 */
@@ -50,6 +50,9 @@ typedef struct {
     int  send_sha;           /* 发送前计算 sha256 并写进 prepare（默认开）。
                               * 代价实测约 12 s / 100MB（读+哈希流水 8.41MiB/s）；
                               * 关掉即与旧版一致（prepare 里不带 sha256）。 */
+    int  recv_sha;           /* 接收时校验对端给的 sha256（默认开）。本机校验与
+                              * 写盘/解密并行，实测零墙钟成本；关掉的用途是兼容
+                              * 对端哈希实现有误时的逃生舱（否则会被 422 拒收）。 */
     int  lang;               /* 界面语言偏好：I18N_LANG_*（0=跟随系统，见 core/i18n.h） */
     int  known_n;            /* 历史设备 IP 条数（最近发现优先，作扫描种子） */
     char known_ips[KNOWN_MAX][16]; /* 历史设备 IP，最新在前 */

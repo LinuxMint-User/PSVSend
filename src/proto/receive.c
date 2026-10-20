@@ -917,7 +917,9 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     g_sess.state = RECV_ST_RECEIVING;
     g_sess.last_us = now_us();
     f->got = 0;
-    check_sha = f->sha256[0] != 0;
+    /* 对端给了 sha256 且用户没关"接收时校验"才校验（设置项 recv_sha，默认开）。
+     * 关掉只是不比对，仍然照收——用途是对端哈希实现有误时不被 422 卡死。 */
+    check_sha = f->sha256[0] != 0 && g_cfg.recv_sha;
     unlock();
 
     if (check_sha) {
