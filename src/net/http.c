@@ -88,10 +88,12 @@ static const char *reason_of(int code)
     case 200: return "OK";
     case 204: return "No Content";
     case 400: return "Bad Request";
+    case 401: return "Unauthorized";
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 409: return "Conflict";
     case 422: return "Unprocessable Entity";
+    case 429: return "Too Many Requests";
     case 500: return "Internal Server Error";
     default:  return "Error";
     }
@@ -367,6 +369,10 @@ static int srv_tls_send(void *ctx, const unsigned char *buf, size_t len)
     if (r > 0) return r;
     if (r == 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
     if (NET_AGAIN(r)) return MBEDTLS_ERR_SSL_WANT_WRITE;
+    /* 真错误原样打进日志：mbedTLS 拿到这里统一报成 INTERNAL_ERROR(-0x6C00)，
+     * 否则日志只剩 -0x6C00，分不清对端 RST(0x80410136)、连接已断(ENOTCONN)
+     * 还是别的。与 srv_tls_recv 对齐。 */
+    dlog("http: tls bio send 0x%08X", (unsigned)r);
     return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
 }
 

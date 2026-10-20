@@ -183,6 +183,12 @@ static const TrEntry s_tr[] = {
       "請在對方裝置上確認接收。",
       "請在對方裝置上確認接收。",
       "相手のデバイスで受信を許可してください。" },
+    /* 对方开了 receive PIN（协 prepare-upload 的 401 语义） */
+    { "PIN required", "需要 PIN", "需要 PIN", "需要 PIN", "PIN が必要です" },
+    { "Enter the PIN to continue.", "请输入 PIN 继续。", "請輸入 PIN 繼續。",
+      "請輸入 PIN 繼續。", "PIN を入力してください。" },
+    { "PIN incorrect, try again.", "PIN 错误，请重试。", "PIN 錯誤，請重試。",
+      "PIN 錯誤，請重試。", "PIN が違います。もう一度お試しください。" },
     { "Sending...", "发送中…", "傳送中…", "傳送中…", "送信中…" },
     { "Sending", "发送", "傳送", "傳送", "送信中" },
     { "Receive failed", "接收失败", "接收失敗", "接收失敗", "受信に失敗しました" },

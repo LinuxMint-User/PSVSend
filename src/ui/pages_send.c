@@ -915,6 +915,13 @@ void page_send_wait_render(void)
                       : (xv.msg[0] ? xv.msg : tr("Transfer failed"));
         w_text_clip(48, 190, 1.2f, failed ? theme->danger : theme->text,
                     m, card.w - 48);
+    } else if (xv.pin_need) {
+        /* 对方开了 receive PIN：后台已挂起等输入，系统键盘由 pages_tick 弹 */
+        w_text_clip(48, 190, 1.3f, theme->accent,
+                    xv.pin_need == 2 ? tr("PIN incorrect, try again.")
+                                     : tr("PIN required"), card.w - 48);
+        w_text_clip(48, 230, 1.0f, theme->text_dim,
+                    tr("Enter the PIN to continue."), card.w - 48);
     } else {
         w_text_clip(48, 190, 1.3f, theme->accent,
                     tr("Waiting for receiver to accept..."), card.w - 48);

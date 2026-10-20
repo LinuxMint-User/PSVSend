@@ -58,6 +58,9 @@ int  api_send_start(const char *ip, int port, const char *proto, const char *fp,
                     const XferFile *files, int n);
 /* 请求取消发送：置标志，后台线程轮询到后尽快收尾 */
 void api_send_cancel(void);
+/* 对方要求 PIN（快照 pin_need != 0）时由 UI 回填：确认输入 / 用户取消 */
+void api_send_set_pin(const char *pin);
+void api_send_pin_cancel(void);
 /* 锁内拷贝当前发送快照（每帧可调；线程结束后保留最后一次状态） */
 void api_send_info(XferInfo *out);
 

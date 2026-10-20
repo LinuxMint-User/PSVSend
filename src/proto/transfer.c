@@ -46,6 +46,9 @@
 #define TX_SOCK_BUF   8192           /* 响应收包缓冲 */
 #define TX_CHUNK      32768          /* 上传分块 */
 #define RSP_BUF       65536          /* prepare 应答缓冲上限（头+body） */
+#define PREPARE_PATH  "/api/localsend/v2/prepare-upload"
+#define PIN_MAX_TRY   3              /* 401 时最多尝试的 PIN 次数（含首次无 PIN） */
+#define PIN_WAIT_US   (120LL * 1000000LL)  /* 等 UI 输入 PIN 的上限 */
 
 /* prepare-upload 是"等到接收方接受/拒绝"的长请求，给足时间；
  * 期间每 20ms 检查取消标志，本地取消立即退出。 */
@@ -71,6 +74,9 @@ typedef struct {
     int        port;
     int        tls;                  /* 1=HTTPS(mbedTLS) 0=HTTP */
     char       pin[96];              /* TLS pin：对方证书 SHA-256（hex） */
+    volatile int pin_got;            /* 0=未回填 1=已输入 2=用户取消（UI 写） */
+    char       pin_in[32];           /* UI 输入的 PIN（锁内读写） */
+    char       pin_code[32];         /* 本次重试实际带上的 PIN（线程私有） */
     XferFile   files[XFER_MAX_FILES];
     int        count;
     char       session[64];          /* prepare 应答的会话 ID */
@@ -907,28 +913,102 @@ static int upload_worker(SceSize args, void *argp)
 }
 
 /* ---------- 传输线程 ---------- */
+
+/* prepare-upload 的请求路径：有 PIN 时追加 ?pin=（RFC3986 百分号编码——
+ * 官方 PIN 对话框不限字符集，用户可能输入非字母数字，不编码会让请求行坏掉）。 */
+static void build_prepare_path(char *out, int cap)
+{
+    const char *p;
+    int o;
+    if (!g_j.pin_code[0]) {
+        snprintf(out, (size_t)cap, "%s", PREPARE_PATH);
+        return;
+    }
+    o = snprintf(out, (size_t)cap, "%s?pin=", PREPARE_PATH);
+    if (o < 0) o = 0;
+    for (p = g_j.pin_code; *p && o < cap - 4; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '.' ||
+            ch == '_' || ch == '~')
+            out[o++] = (char)ch;
+        else
+            o += snprintf(out + o, (size_t)(cap - o), "%%%02X", ch);
+    }
+    if (o > cap - 1) o = cap - 1;
+    out[o] = 0;
+}
+
+/* 对方回 401：把"要 PIN"写进快照请 UI 弹键盘，然后阻塞等回填
+ * （≤ PIN_WAIT_US，每 20ms 查取消）。返回 1=拿到 PIN（已写入 pin_code），
+ * 0=用户取消输入 / 等超时 / 传输被取消。 */
+static int wait_user_pin(int invalid)
+{
+    SceLong64 dl = sceKernelGetSystemTimeWide() + PIN_WAIT_US;
+    lock();
+    g_j.pin_got = 0;
+    g_j.v.pin_need = invalid ? 2 : 1;
+    unlock();
+    set_msg("Waiting for PIN...");
+    for (;;) {
+        int got;
+        lock();
+        got = g_j.pin_got;
+        if (got == 1) {
+            snprintf(g_j.pin_code, sizeof g_j.pin_code, "%s", g_j.pin_in);
+            g_j.pin_got = 0;
+            g_j.v.pin_need = 0;
+            unlock();
+            return 1;
+        }
+        if (got == 2) {
+            g_j.pin_got = 0;
+            g_j.v.pin_need = 0;
+        }
+        unlock();
+        if (got == 2) return 0;
+        if (g_j.cancel) {
+            lock();
+            g_j.v.pin_need = 0;
+            unlock();
+            return 0;
+        }
+        if (sceKernelGetSystemTimeWide() >= dl) {
+            lock();
+            g_j.v.pin_need = 0;
+            unlock();
+            dlog("xfer: pin wait timeout");
+            return 0;
+        }
+        sceKernelDelayThread(POLL_US);
+    }
+}
+
 static int xfer_thr(SceSize args, void *argp)
 {
     char *body = NULL;
     char *prep = NULL;              /* prepare 应答缓冲（堆上，容大文件列表） */
-    int code = 0, rc, i;
+    int code = 0, rc, i, attempt;
     (void)args; (void)argp;
     dlog("xfer: thread entered, target %s:%d (%s)%s, %d file(s)",
          g_j.ip, g_j.port, g_j.tls ? "https" : "http",
          g_j.tls ? " tls" : "", g_j.count);
 
-    /* 阶段 1：prepare-upload（长等接收方决定） */
+    /* 阶段 1：prepare-upload（长等接收方决定）。401 = 对方要求 PIN：
+     * 挂起等 UI 用系统键盘输入后带 ?pin= 重发（协议语义），最多 PIN_MAX_TRY 次。 */
     set_msg("Waiting for %s to accept...", g_j.ip);
     body = build_prepare_json();
     if (!body) { fail("cannot build prepare request"); goto out; }
     prep = (char *)malloc(RSP_BUF);
     if (!prep) { fail("out of memory"); goto out; }
-    {
+    for (attempt = 0; ; attempt++) {
+        char path[256];      /* 路径 + "?pin=" + 百分号编码后最长 ~3×32 字节 */
         Conn c;
+        build_prepare_path(path, (int)sizeof path);
         memset(&c, 0, sizeof c);
         c.fd = -1;
         c.tls = g_j.tls;
-        rc = conn_open(&c, "/api/localsend/v2/prepare-upload", (SceOff)strlen(body));
+        rc = conn_open(&c, path, (SceOff)strlen(body));
         if (rc == 0)
             rc = conn_send_all(&c, body, (int)strlen(body));
         if (rc == 0)
@@ -945,6 +1025,18 @@ static int xfer_thr(SceSize args, void *argp)
             goto out;
         }
         conn_close(&c);
+        if (code != 401) break;
+        if (attempt + 1 >= PIN_MAX_TRY) {
+            fail("receiver PIN incorrect (HTTP 401)");
+            goto out;
+        }
+        if (!wait_user_pin(attempt > 0)) {
+            if (g_j.cancel) { finish_cancelled(); goto out; }
+            fail("receiver requires a PIN");
+            goto out;
+        }
+        dlog("xfer: retry prepare with pin (%d/%d)", attempt + 2, PIN_MAX_TRY);
+        set_msg("Waiting for %s to accept...", g_j.ip);
     }
     if (code == 204) {          /* 无需传输文件：直接成功 */
         lock();
@@ -959,6 +1051,7 @@ static int xfer_thr(SceSize args, void *argp)
     if (code != 200) {
         if (code == 403) fail("receiver rejected the request (HTTP 403)");
         else if (code == 400) fail("receiver: bad request body (HTTP 400)");
+        else if (code == 429) fail("receiver is busy (HTTP 429, too many requests)");
         else fail("prepare failed (HTTP %d)", code);
         goto out;
     }
@@ -1148,6 +1241,23 @@ int xfer_start(const char *ip, int port, const char *proto, const char *fp,
 void xfer_cancel(void)
 {
     g_j.cancel = 1;
+}
+
+void xfer_set_pin(const char *pin)
+{
+    lock();
+    snprintf(g_j.pin_in, sizeof g_j.pin_in, "%s", pin ? pin : "");
+    g_j.pin_got = 1;
+    g_j.v.pin_need = 0;     /* 立刻消掉提示：UI 每帧据此决定是否弹键盘，别重复弹 */
+    unlock();
+}
+
+void xfer_pin_cancel(void)
+{
+    lock();
+    g_j.pin_got = 2;
+    g_j.v.pin_need = 0;
+    unlock();
 }
 
 void xfer_info(XferInfo *out)

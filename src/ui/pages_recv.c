@@ -321,12 +321,14 @@ static void start_recv(void)
 #define RS_REN_ID   0x4000             /* 触摸 id：改名按钮 = 基址 + 行号 */
 #define RS_CHK_ID   0x8000             /* 触摸 id：勾选框  = 基址 + 行号 */
 
-/* 系统键盘挂起事务：设置页主机名与接收设置逐文件改名共用同一状态机
- * （分属不同页面不会同时出现）。busy 供主循环据此跳过页面按键/触摸。 */
+/* 系统键盘挂起事务：设置页主机名、接收设置逐文件改名、发送等待页输入 PIN
+ * 共用同一状态机（分属不同页面不会同时出现）。busy 供主循环据此跳过页面
+ * 按键/触摸。 */
 enum {
     IME_TX_NONE = 0,
     IME_TX_RENAME,     /* 接收设置：改 inc_files[ime_tx_fi] 的保存名 */
     IME_TX_HOST,       /* 设置页：改本机设备名 alias（config） */
+    IME_TX_PIN,        /* 发送等待页：对方要求 PIN（回填给 transfer.c） */
 };
 /* 接收改名的键盘时限：须赶在 prepare 等 UI 决定窗口（receive.c 的
  * RECV_DECIDE_TIMEOUT_US = 60s）内完成，窗口一过 pending 清场、改名白做；
@@ -336,6 +338,9 @@ enum {
  * 正常改名远用不到，真卡住时还能自己回来（见 ime.h limit_us）。 */
 #define RN_IME_LIMIT_US   (50ll * 1000 * 1000)
 #define HOST_IME_LIMIT_US (300ll * 1000 * 1000)
+/* PIN 键盘：须短于 transfer.c 的 PIN_WAIT_US（120s），键盘假死时后台也能先
+ * 超时收尾，不会两边一起挂住。 */
+#define PIN_IME_LIMIT_US  (110ll * 1000 * 1000)
 static int  ime_tx = IME_TX_NONE;  /* 当前挂起/打开的事务（NONE=空闲） */
 static int  ime_tx_fi = -1;        /* RENAME 的目标行（HOST 不使用） */
 static char ime_out[128];          /* 键盘结果落点（须存活到 poll 结束，ime 异步写） */
@@ -410,6 +415,13 @@ void ask_ime_host(void)
     ime_tx = IME_TX_HOST;
 }
 
+/* 发送等待页：对方回 401 要求 PIN → 登记键盘事务（实际弹窗在 page_ime_pump）。 */
+void ask_ime_pin(void)
+{
+    if (ime_tx != IME_TX_NONE) return;
+    ime_tx = IME_TX_PIN;
+}
+
 /* 系统键盘改名事务进行中（已登记或已打开）？主循环据此跳过页面按键/触摸。 */
 bool page_ime_busy(void)
 {
@@ -429,6 +441,10 @@ void page_ime_pump(void)
         if (r == 1) {
             if (ime_tx == IME_TX_RENAME) rename_apply(ime_tx_fi, ime_out);
             else if (ime_tx == IME_TX_HOST) host_apply(ime_out);
+            else if (ime_tx == IME_TX_PIN) api_send_set_pin(ime_out);
+        } else if (ime_tx == IME_TX_PIN) {
+            /* PIN 被取消：唤醒后台按失败收尾，别让它干等 2 分钟 */
+            api_send_pin_cancel();
         }
         ime_tx = IME_TX_NONE;
         return;
@@ -446,6 +462,12 @@ void page_ime_pump(void)
         if (ime_ask_begin(tr("Hostname"), al[0] ? al : DEFAULT_ALIAS,
                           ime_out, sizeof ime_out, HOST_IME_LIMIT_US) != 1)
             ime_tx = IME_TX_NONE;
+    } else if (ime_tx == IME_TX_PIN) {
+        if (ime_ask_begin(tr("PIN required"), "", ime_out, sizeof ime_out,
+                          PIN_IME_LIMIT_US) != 1) {
+            ime_tx = IME_TX_NONE;
+            api_send_pin_cancel();      /* 键盘打不开：立即唤醒后台按失败收尾 */
+        }
     }
 }
 
@@ -729,6 +751,8 @@ void pages_tick(void)
         api_send_info(&xv);
         if (xv.cur >= 0 || xv.total_sent > 0)
             g_app.page = PAGE_PROGRESS;
+        else if (xv.pin_need && !xv.finished)
+            ask_ime_pin();       /* 对方要求 PIN → 本帧登记，page_ime_pump 随后弹键盘 */
     }
 
     if (now_ms < g_recv_supp_ms) return;     /* 决定后的抑制窗内不弹 */

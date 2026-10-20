@@ -5,6 +5,7 @@
  * 接收由 pages_recv.c 的 start_recv 写入（首帧兜底），本页每帧覆盖。 */
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 #include <vita2d.h>
 #include <psp2/kernel/threadmgr/thread.h>
 #include "ui/ui.h"
@@ -22,6 +23,63 @@
 #define XF_BAR_W      660      /* 行内细进度条宽 */
 
 static int xf_press_scroll = 0;
+
+/* ---- 速度读数：2s 滑动窗口 ----
+ * 旧算法是"累计平均"：分子 = 已传字节，分母 = 从点击发送（或会话建立）起的
+ * 全部耗时——里面含 prepare 等待、对方确认、PIN 键盘输入。分母先涨、分子
+ * 后涨，读数就从 0 慢慢往上爬，且永远追不上真实链路速率（实测 148MB：界面
+ * 终值 2.48 MB/s，实际 3.56 MB/s）。改成每 200ms 采样、回看 2s 求速率：
+ * 分母固定 2s，停传时读数在 2s 内自然衰减；结束后冻结终值，不再跌成 0。 */
+#define SPD_SAMPLE_US  (200 * 1000)
+#define SPD_WINDOW_US  (2000 * 1000)
+#define SPD_MIN_US     (300 * 1000)   /* 窗口内不足 300ms 不出数（首帧抖动） */
+#define SPD_MAX        16             /* 16 × 200ms = 3.2s，够放 2s 窗口 */
+
+static struct { uint64_t t; SceOff bytes; } s_spd[SPD_MAX];
+static int s_spd_n, s_spd_head;
+static uint64_t s_spd_push_t, s_spd_draw_t;
+static double s_spd_last;
+
+static void spd_add(uint64_t now, SceOff bytes)
+{
+    s_spd[s_spd_head].t = now;
+    s_spd[s_spd_head].bytes = bytes;
+    s_spd_head = (s_spd_head + 1) % SPD_MAX;
+    if (s_spd_n < SPD_MAX) s_spd_n++;
+    s_spd_push_t = now;
+}
+
+/* 每帧调用一次（仅在高级面板可见时）：推进采样并返回窗口速率（十进制 MB/s） */
+static double spd_update(SceOff bytes)
+{
+    uint64_t now = (uint64_t)sceKernelGetSystemTimeWide();
+    int i, oldest;
+    /* 页面刚进来 / 离开过（>1s 没画）→ 旧采样作废，避免跨传输算差 */
+    if (s_spd_draw_t == 0 || now - s_spd_draw_t > 1000000ull) {
+        s_spd_n = 0;
+        s_spd_head = 0;
+        s_spd_push_t = 0;
+        spd_add(now, bytes);
+    }
+    s_spd_draw_t = now;
+    if (now - s_spd_push_t >= SPD_SAMPLE_US) spd_add(now, bytes);
+    if (s_spd_n < 2) return 0.0;
+    oldest = (s_spd_head - s_spd_n + SPD_MAX) % SPD_MAX;
+    for (i = 0; i < s_spd_n; i++) {          /* 取窗口内最旧的那个采样 */
+        int k = (oldest + i) % SPD_MAX;
+        if (now - s_spd[k].t <= SPD_WINDOW_US) break;
+    }
+    if (i >= s_spd_n) return 0.0;
+    {
+        int k = (oldest + i) % SPD_MAX;
+        uint64_t dt = now - s_spd[k].t;
+        double db;
+        if (dt < SPD_MIN_US) return 0.0;
+        db = (double)(bytes - s_spd[k].bytes);
+        if (db <= 0.0) return 0.0;
+        return db / 1000000.0 / ((double)dt / 1000000.0);
+    }
+}
 
 void goto_devices(void)
 {
@@ -225,12 +283,17 @@ void page_progress_render(void)
         w_text_clip(40, 418, 1.0f, msg_col, msg, 880);
     }
 
-    /* 高级面板：文件计数 / 耗时 / 速度（十进制 MB，1 MB = 1,000,000 B） */
+    /* 高级面板：文件计数 / 耗时 / 速度（十进制 MB，1 MB = 1,000,000 B）。
+     * 速度是 2s 滑动窗口的瞬时值；运行中每帧刷新，结束后冻结终值。 */
     if (g_app.prog_info) {
-        double sec = g_app.prog_ms / 1000.0;
-        double mb = (double)sent_bytes / 1000000.0;
-        double speed = sec > 0.05 ? mb / sec : 0.0;
+        double speed;
         char st[160];
+        if (g_app.prog_running) {
+            speed = spd_update(sent_bytes);
+            s_spd_last = speed;
+        } else {
+            speed = s_spd_last;      /* 结束后别让读数在 2s 内衰减到 0 */
+        }
         snprintf(st, sizeof st,
                  tr("Files %d/%d    Elapsed %d:%02d    Speed %.2f MB/s"),
                  fin, xf_count, g_app.prog_ms / 60000,

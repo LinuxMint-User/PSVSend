@@ -354,6 +354,16 @@ void api_send_cancel(void)
     xfer_cancel();
 }
 
+void api_send_set_pin(const char *pin)
+{
+    xfer_set_pin(pin);
+}
+
+void api_send_pin_cancel(void)
+{
+    xfer_pin_cancel();
+}
+
 void api_send_info(XferInfo *out)
 {
     xfer_info(out);

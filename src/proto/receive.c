@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>               /* getentropy */
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/io/dirent.h>
@@ -130,18 +131,31 @@ static void update_cur_locked(void)
         if (g_sess.f[i].busy) { g_sess.cur = i; break; }
 }
 
-/* 随机 hex（sessionId/token） */
+/* 随机 hex（sessionId/token）。优先 libc getentropy（Vita 实测可用，与
+ * identity.c 取熵同一写法）；失败再退回"系统时间 + 进程时间"混洗的 LCG。
+ * 旧实现纯由时间推导，同批 sessionId/token 可被枚举——token 是 upload 的
+ * 唯一凭据，可预测就等于把会话交给同网段的人（upload 另有来源 IP 校验，
+ * 跨机劫持不成立，但仍是该堵的口子）。 */
 static void gen_hex(char *out, int bytes)
 {
+    unsigned char buf[32];
     int i;
-    uint64_t t = (uint64_t)sceKernelGetSystemTimeWide();
-    uint64_t p = (uint64_t)sceKernelGetProcessTimeWide();
-    for (i = 0; i < bytes; i++) {
-        if ((i % 8) == 0) t = t * 6364136223846793005ULL + (p ^ (i + 1));
-        snprintf(out + i * 2, 3, "%02x",
-                 (unsigned)((t >> ((unsigned)((i * 5) % 56))) & 0xFF));
+    if (bytes > (int)sizeof buf) bytes = (int)sizeof buf;
+    if (getentropy(buf, (size_t)bytes) == 0) {
+        for (i = 0; i < bytes; i++) snprintf(out + i * 2, 3, "%02x", buf[i]);
+        out[bytes * 2] = 0;
+        return;
     }
-    out[bytes * 2] = 0;
+    {
+        uint64_t t = (uint64_t)sceKernelGetSystemTimeWide();
+        uint64_t p = (uint64_t)sceKernelGetProcessTimeWide();
+        for (i = 0; i < bytes; i++) {
+            if ((i % 8) == 0) t = t * 6364136223846793005ULL + (p ^ (i + 1));
+            snprintf(out + i * 2, 3, "%02x",
+                     (unsigned)((t >> ((unsigned)((i * 5) % 56))) & 0xFF));
+        }
+        out[bytes * 2] = 0;
+    }
 }
 
 /* 落盘名单个名字的字节上限：RFile / RecvPending / RecvStatus 的 name[] 都是 192。
@@ -752,28 +766,57 @@ static void sess_fail_locked(const char *err)
         sess_terminal(RECV_ST_FAIL, err);
 }
 
-/* ---- 收体写盘线程：解密与写盘/校验重叠 ----
- * 生产者（http worker）只做 fn()（socket 收 + TLS 解密）并攒满 64KB；消费者做
- * sha256 与 sceIoWrite。双缓冲 + 两个计数信号量：
- *   sem_free = 空闲缓冲数（初值 2），sem_job = 已发布待写任务数（初值 0）。
- * 顺序性：生产者按 idx_in 轮转发布、消费者按 idx_out 轮转取用，天然 FIFO，
- * 所以 sha256 的输入顺序与文件内容一致；f->got/got_total 也由消费者推进
- * （= 已落盘字节），进度条不会跑到实际写入前面。
- * 真机口径（148MB 单文件）：不拆时读 16.3s + 写 15.8s 串行，共 50.5s /
- * 2.81MiB/s；拆分后 39.4s / 3.60MiB/s（read 24.5s、write 16.4s、sha 17.4s，
- * 生产者反而在等空缓冲——瓶颈移到了写线程，sha256 本身就要 17s）。 */
+/* ---- 收体三级流水：解密 / sha256 / 写盘各占一条线程 ----
+ * 生产者（http worker）只做 fn()（socket 收 + TLS 解密）并攒满 64KB；sha 线程
+ * 只算校验和；写盘线程只做 sceIoWrite。三块轮转缓冲 + 三个计数信号量：
+ *   sem_free = 空闲块数（初值 3）、sem_sha = 待校验块数、sem_job = 待写块数。
+ * 块在流水线里逐级传递：生产者填满 → sem_sha → sha 算完 → sem_job → 写盘完成
+ * → sem_free。所以 sha 与写盘处理的是**不同块**，两者真正重叠（旧实现把这两
+ * 步放在同一条线程里串行相加，是 4.08MiB/s 的天花板）。
+ * 顺序性：三个阶段各按自己的游标轮转、天然 FIFO，sha256 输入顺序与文件内容
+ * 一致；f->got/got_total 仍由写盘线程推进（= 已落盘字节），进度条不会超前。
+ * 对方没给 sha256（check_sha=0）就不起 sha 线程，生产者直接投 sem_job。
+ * 注意：每块 64KB，三块共 192KB/文件；多文件并发时线程与内存都按文件数倍增。 */
+#define RECV_BLOCKS 3
+
 typedef struct {
-    SceUID thr, sem_free, sem_job, fd;
-    volatile int quit;                /* 生产者收完后置位，唤醒消费者退出 */
-    volatile int fail;                /* 消费者写盘失败 */
-    int    idx_in, idx_out;           /* 生产者/消费者各自的游标（各自独占，无需锁） */
-    int    len[2];                    /* 已发布任务长度（发布后不再改） */
-    unsigned char *buf;               /* 2 * RECV_CHUNK */
+    SceUID thr_sha, thr_wr, sem_free, sem_sha, sem_job, fd;
+    volatile int quit;                /* 生产者收完后置位，唤醒两条消费者退出 */
+    volatile int fail;                /* 写盘线程写失败 */
+    int    idx_in, idx_sha, idx_out;  /* 三个阶段各自的游标（各自独占，无需锁） */
+    int    len[RECV_BLOCKS];          /* 已发布块长度（发布后不再改） */
+    unsigned char *buf;               /* RECV_BLOCKS * RECV_CHUNK */
     mbedtls_sha256_context *sha;
     int    check_sha;
-    uint64_t t_write, t_sha;          /* 仅消费者累加，join 后由生产者读 */
+    uint64_t t_write, t_sha;          /* 各自线程累加，锁内更新（见下） */
     RFile *f;
 } WrCtx;
+
+static int sha_thread(SceSize args, void *argp)
+{
+    WrCtx *w = *(WrCtx **)argp;
+    (void)args;
+    for (;;) {
+        int s, len;
+        unsigned char *p;
+        uint64_t t, dt;
+        sceKernelWaitSema(w->sem_sha, 1, NULL);
+        if (w->quit) break;
+        s = w->idx_sha % RECV_BLOCKS;
+        len = w->len[s];
+        p = w->buf + (size_t)s * RECV_CHUNK;
+        ++w->idx_sha;
+        t = now_us();
+        mbedtls_sha256_update(w->sha, p, (unsigned)len);
+        dt = now_us() - t;
+        /* 累计值进锁：生产者每 2s 在锁内读它打诊断日志，64 位量不加锁读会撕裂 */
+        lock();
+        w->t_sha += dt;
+        unlock();
+        sceKernelSignalSema(w->sem_job, 1);
+    }
+    return 0;
+}
 
 static int wr_thread(SceSize args, void *argp)
 {
@@ -782,22 +825,18 @@ static int wr_thread(SceSize args, void *argp)
     for (;;) {
         int s, len;
         unsigned char *p;
-        uint64_t t;
+        uint64_t t, dt;
         sceKernelWaitSema(w->sem_job, 1, NULL);
         if (w->quit) break;
-        s = w->idx_out & 1;
+        s = w->idx_out % RECV_BLOCKS;
         len = w->len[s];
         p = w->buf + (size_t)s * RECV_CHUNK;
         ++w->idx_out;
-        if (w->check_sha) {
-            t = now_us();
-            mbedtls_sha256_update(w->sha, p, (unsigned)len);
-            w->t_sha += now_us() - t;
-        }
         t = now_us();
         if (sceIoWrite(w->fd, p, (unsigned)len) != len) w->fail = 1;
-        w->t_write += now_us() - t;
+        dt = now_us() - t;
         lock();
+        w->t_write += dt;
         w->f->got += len;
         g_sess.got_total += len;
         unlock();
@@ -819,12 +858,15 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     bool check_sha = false, aborted = false;
     mbedtls_sha256_context hctx;
     unsigned char digest[32];
-    WrCtx w;                         /* 写盘线程 + 双缓冲（见 wr_thread） */
+    WrCtx w;                         /* 三级流水（见 sha_thread / wr_thread） */
     SceOff produced = 0;             /* 已从 socket 收下的字节（写线程可能还在追） */
     int rd_fail = 0;                 /* fn 的失败返回值（0 = 正常） */
-    int wr_ok = 0;                   /* 写线程是否起来了 */
+    int wr_ok = 0;                   /* 流水线线程是否都起来了 */
+    int wr_started = 0;              /* 写线程已 StartThread（清理时才知道要不要收尸） */
     uint64_t t0, t_log;              /* 收体耗时/进度打点（2s 一条，用于定位掉速与截断） */
     uint64_t t_read = 0, t_mark;     /* 生产者侧（socket 收 + TLS 解密）累计耗时 */
+    uint64_t t_wait = 0, w_mark;     /* 生产者等空缓冲（=写线程追不上）的累计耗时 */
+    uint64_t l_read = 0, l_wait = 0, l_write = 0, l_sha = 0; /* 上一条日志时的累计值 */
     SceOff log_got = 0;
 
     if (!query || !fn || !ctx) return 400;
@@ -894,31 +936,51 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         return 500;
     }
 
-    /* 起写盘线程：解密留在本线程，sha256 + 写盘交给它，两者重叠。
-     * 失败就按会话失败处理（只可能是内存/句柄耗尽），不做单线程退化分支。 */
+    /* 起两条消费者线程（sha256 / 写盘）：解密留在本线程，三级流水。
+     * 失败就按会话失败处理（只可能是内存/句柄耗尽），不做退化分支。 */
     memset(&w, 0, sizeof w);
-    w.sem_free = w.sem_job = w.thr = -1;
+    w.sem_free = w.sem_sha = w.sem_job = w.thr_sha = w.thr_wr = -1;
     w.fd = fd;
     w.f = f;
     w.check_sha = check_sha ? 1 : 0;
     w.sha = &hctx;
-    w.buf = (unsigned char *)malloc((size_t)RECV_CHUNK * 2);
+    w.buf = (unsigned char *)malloc((size_t)RECV_CHUNK * RECV_BLOCKS);
     if (w.buf)
-        w.sem_free = sceKernelCreateSema("psvsend_wfree", 0, 2, 2, NULL);
+        w.sem_free = sceKernelCreateSema("psvsend_wfree", 0, RECV_BLOCKS, RECV_BLOCKS, NULL);
     if (w.sem_free >= 0)
-        w.sem_job = sceKernelCreateSema("psvsend_wjob", 0, 0, 2, NULL);
+        w.sem_sha = sceKernelCreateSema("psvsend_wsha", 0, 0, RECV_BLOCKS, NULL);
+    if (w.sem_sha >= 0)
+        w.sem_job = sceKernelCreateSema("psvsend_wjob", 0, 0, RECV_BLOCKS, NULL);
     if (w.sem_job >= 0)
-        w.thr = sceKernelCreateThread("psvsend_wr", wr_thread, 0x40, 0x20000, 0,
-                                      SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
-    if (w.thr >= 0) {
+        w.thr_wr = sceKernelCreateThread("psvsend_wr", wr_thread, 0x40, 0x20000, 0,
+                                         SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
+    /* 对方给了 sha256 才起校验线程；没给就让生产者直接投 sem_job。 */
+    if (w.thr_wr >= 0 && w.check_sha)
+        w.thr_sha = sceKernelCreateThread("psvsend_sha", sha_thread, 0x40, 0x20000, 0,
+                                          SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
+    if (w.thr_wr >= 0 && (!w.check_sha || w.thr_sha >= 0)) {
         WrCtx *wp = &w;
-        wr_ok = sceKernelStartThread(w.thr, sizeof wp, &wp) >= 0;
+        wr_ok = sceKernelStartThread(w.thr_wr, sizeof wp, &wp) >= 0;
+        wr_started = wr_ok;
+        if (wr_ok && w.check_sha)
+            wr_ok = sceKernelStartThread(w.thr_sha, sizeof wp, &wp) >= 0;
     }
     if (!wr_ok) {
-        dlog("recv: writer setup fail (thr=%d sem=%d/%d buf=%d)", (int)w.thr,
-             (int)w.sem_free, (int)w.sem_job, w.buf != NULL);
-        if (w.thr >= 0) sceKernelDeleteThread(w.thr);
+        dlog("recv: pipeline setup fail (wr=%d sha=%d sem=%d/%d/%d buf=%d)",
+             (int)w.thr_wr, (int)w.thr_sha, (int)w.sem_free, (int)w.sem_sha,
+             (int)w.sem_job, w.buf != NULL);
+        /* 写线程可能已经起来并阻塞在 sem_job：置 quit 唤醒它收尸 */
+        if (wr_started) {
+            w.quit = 1;
+            sceKernelSignalSema(w.sem_job, 1);
+            sceKernelWaitThreadEnd(w.thr_wr, NULL, NULL);
+            sceKernelDeleteThread(w.thr_wr);
+        } else if (w.thr_wr >= 0) {
+            sceKernelDeleteThread(w.thr_wr);
+        }
+        if (w.thr_sha >= 0) sceKernelDeleteThread(w.thr_sha);
         if (w.sem_job >= 0) sceKernelDeleteSema(w.sem_job);
+        if (w.sem_sha >= 0) sceKernelDeleteSema(w.sem_sha);
         if (w.sem_free >= 0) sceKernelDeleteSema(w.sem_free);
         free(w.buf);
         sceIoClose(fd); fd = -1;
@@ -930,7 +992,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         return 500;
     }
 
-    /* 生产者：只负责收 + 解密，攒满一块就交给写线程 */
+    /* 生产者：只负责收 + 解密，攒满一块就交给 sha 线程（无校验则直接投写队列） */
     t0 = t_log = now_us();
     for (;;) {
         unsigned char *pbuf;
@@ -941,8 +1003,10 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         unlock();
         if (aborted) break;
         if (w.fail) break;                      /* 写盘失败：不再收 */
-        if (sceKernelWaitSema(w.sem_free, 1, NULL) < 0) break;   /* 等空缓冲 */
-        pbuf = w.buf + (size_t)(w.idx_in & 1) * RECV_CHUNK;
+        w_mark = now_us();
+        if (sceKernelWaitSema(w.sem_free, 1, NULL) < 0) break;   /* 等空块 */
+        t_wait += now_us() - w_mark;
+        pbuf = w.buf + (size_t)(w.idx_in % RECV_BLOCKS) * RECV_CHUNK;
         while (fill < RECV_CHUNK && produced + fill < f->size) {
             int want = RECV_CHUNK - fill;
             if (f->size - produced - fill < want)
@@ -954,40 +1018,65 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             fill += n;
         }
         if (fill > 0) {
-            w.len[w.idx_in & 1] = fill;
+            w.len[w.idx_in % RECV_BLOCKS] = fill;
             ++w.idx_in;
             produced += fill;
-            sceKernelSignalSema(w.sem_job, 1);
+            sceKernelSignalSema(w.check_sha ? w.sem_sha : w.sem_job, 1);
         } else {
             sceKernelSignalSema(w.sem_free, 1); /* 一块都没收到（失败路径）：还回去 */
         }
         if (rd_fail) break;
         if (now_us() - t_log >= 2000000ull) {   /* 2s 一条：速率 + 是否还在推进 */
             uint64_t tn = now_us();
-            dlog("recv: progress %lld/%lld B  %.2f MiB/s",
+            /* wait/read 是生产者侧，write/sha 分别来自写盘线程与 sha 线程
+             * （累计值在锁内读）：
+             *   wait 占满窗口 → 流水线下游追不上（盘慢 / 下游线程被抢占）
+             *   read 占满窗口 → 在等对端数据（网络受限；含 TLS 解密）
+             *   write、sha 同时接近窗口 → 两者已各自跑满，任一慢就是瓶颈
+             *   三者都不满但仍慢 → CPU 抢占（UI/握手），看三者之和 */
+            uint64_t ww, ws;
+            lock();
+            ww = w.t_write;
+            ws = w.t_sha;
+            unlock();
+            dlog("recv: progress %lld/%lld B  %.2f MiB/s"
+                 "  [wait %llu read %llu write %llu sha %llu ms]",
                  (long long)f->got, (long long)f->size,
                  (double)(f->got - log_got) / 1048576.0
-                     / ((double)(tn - t_log) / 1000000.0));
+                     / ((double)(tn - t_log) / 1000000.0),
+                 (unsigned long long)((t_wait - l_wait) / 1000),
+                 (unsigned long long)((t_read - l_read) / 1000),
+                 (unsigned long long)((ww - l_write) / 1000),
+                 (unsigned long long)((ws - l_sha) / 1000));
             t_log = tn;
             log_got = f->got;
+            l_wait = t_wait;
+            l_read = t_read;
+            l_write = ww;
+            l_sha = ws;
         }
     }
 
-    /* 收尾顺序：先把在途块落盘、停掉写线程，再关 fd —— 否则消费者会对着
-     * 已关闭的 fd 继续写。超时兜底（正常 ≤128KB，几百毫秒内就该回来）。 */
+    /* 收尾顺序：先等三块全部回到空闲（= sha 与写盘都把在途块处理完），再停
+     * 线程，最后关 fd —— 否则消费者会对着已关闭的 fd 继续写。
+     * 超时兜底（正常 ≤192KB，几百毫秒内就该回来）。 */
     {
         SceUInt tmo = 10000000;
-        sceKernelWaitSema(w.sem_free, 2, &tmo);
-        sceKernelSignalSema(w.sem_free, 2);
+        sceKernelWaitSema(w.sem_free, RECV_BLOCKS, &tmo);
+        sceKernelSignalSema(w.sem_free, RECV_BLOCKS);
     }
     w.quit = 1;
+    if (w.thr_sha >= 0) sceKernelSignalSema(w.sem_sha, 1);
     sceKernelSignalSema(w.sem_job, 1);
     {
         SceUInt tmo = 10000000;
-        sceKernelWaitThreadEnd(w.thr, NULL, &tmo);
+        sceKernelWaitThreadEnd(w.thr_wr, NULL, &tmo);
+        if (w.thr_sha >= 0) sceKernelWaitThreadEnd(w.thr_sha, NULL, &tmo);
     }
-    sceKernelDeleteThread(w.thr);
+    if (w.thr_sha >= 0) sceKernelDeleteThread(w.thr_sha);
+    sceKernelDeleteThread(w.thr_wr);
     sceKernelDeleteSema(w.sem_free);
+    sceKernelDeleteSema(w.sem_sha);
     sceKernelDeleteSema(w.sem_job);
     free(w.buf);
     sceIoClose(fd); fd = -1;

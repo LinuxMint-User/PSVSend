@@ -35,6 +35,7 @@ typedef struct {
     bool    ok;             /* 全部成功 */
     bool    cancelled;      /* 用户取消 */
     int     last_code;      /* 最近 HTTP 状态码 */
+    int     pin_need;       /* 0=无 1=对方要求 PIN（UI 弹键盘）2=上次 PIN 不对 */
     SceOff  total;          /* 总字节 */
     SceOff  total_sent;     /* 已发字节 */
     uint64_t start_us;      /* 启动时刻（sceKernelGetSystemTimeWide） */
@@ -52,6 +53,12 @@ int  xfer_start(const char *ip, int port, const char *proto, const char *fp,
 
 /* 请求取消：置标志，线程在轮询/发送中检测并尽快收尾（不进 abort 流程） */
 void xfer_cancel(void);
+
+/* 对方回 401（要求 PIN）时，UI 用系统键盘输入后回填（IME 确认时调用）：
+ * xfer_set_pin 交出输入并唤醒等待中的 prepare 重试；xfer_pin_cancel 表示
+ * 用户放弃输入（线程按失败收尾，不再干等）。 */
+void xfer_set_pin(const char *pin);
+void xfer_pin_cancel(void);
 
 /* 锁内拷贝当前快照（每帧调用无妨；线程结束时快照保留最后一次状态） */
 void xfer_info(XferInfo *out);

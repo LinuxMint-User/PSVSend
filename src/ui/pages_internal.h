@@ -172,6 +172,7 @@ void goto_devices(void);            /* pages_progress.c：回设备页并复位�
 void open_dir_pick(PageId origin, bool persist, const char *start_dir); /* pages_settings.c */
 void open_color_pick(void);         /* pages_settings.c：进自定义色盘页（实时预览、确认落盘） */
 void ask_ime_host(void);            /* pages_recv.c：打开系统键盘改本机设备名（设置页主机名行用） */
+void ask_ime_pin(void);             /* pages_recv.c：发送等待页对方要求 PIN → 弹键盘输入 */
 void settings_open(void);           /* pages_settings.c：进设置页（焦点回首项、滚动归顶） */
 void ui_font_preload_begin(void);   /* ui_main.c：进设置页 → 后台预读另外两份 CJK */
 void ui_font_preload_end(void);     /* ui_main.c：出设置页 → 停预读并释放非常驻副本 */
