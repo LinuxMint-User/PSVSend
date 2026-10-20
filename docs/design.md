@@ -10,9 +10,10 @@
 ### 实现现状（2026-09）
 
 - **已落地（发送方向）**：UDP 组播发现 / register 入表 → UI 选设备、浏览 ux0 选文件 → `transfer.c` 按对方 announce 的 protocol 走 HTTP 明文或 HTTPS（mbedTLS 3.6.5、锁定 TLS1.2）执行 `prepare-upload` / `upload`，带进度回写与本地取消。HTTPS 连接自动出示内嵌设备身份证书（mTLS，应对 2026 官方 Rust 内核接收端强制客户端证书），并按对方指纹锁定其证书（详见 §3 决策表）。
-- **已落地（接收方向）**：对方 prepare-upload → 自动弹接收确认页（Accept / Setup 逐文件勾选 / Reject）→ upload 由 http.c 提供流读回调、receive.c 边收边写 `ux0:data/psvsend/downloads/`（先 `.part` 收完改名，sha256 可选校验，断流/校验失败删残留，开机清扫遗留）。兼容对方无 Content-Length 的 **chunked 流式上传**（http.c 内嵌解码状态机）；同一会话内多文件由对方**并发**发起 upload，接收侧按文件独立流式收体（每文件各自 busy 状态，互不阻塞；d68 修复了 v2.1.0 起后到文件被 409 拒绝的缺陷）。取消/放弃/空闲超时等状态经快照接口给 UI 展示结束原因。announce 已声明 `download:true`。
+- **已落地（接收方向）**：对方 prepare-upload → 自动弹接收确认页（Accept / Setup 逐文件勾选 / Reject）→ upload 由 http.c 提供流读回调、receive.c 边收边写 `ux0:data/psvsend/downloads/`（先 `.psvsend.tmp` 收完改名，sha256 可选校验，断流/校验失败删残留，开机清扫遗留）。兼容对方无 Content-Length 的 **chunked 流式上传**（http.c 内嵌解码状态机）；同一会话内多文件由对方**并发**发起 upload，接收侧按文件独立流式收体（每文件各自 busy 状态，互不阻塞；d68 修复了 v2.1.0 起后到文件被 409 拒绝的缺陷）。取消/放弃/空闲超时等状态经快照接口给 UI 展示结束原因。announce 已声明 `download:true`。
+- **已落地（接收方向 TLS 化，d173~d177）**：http.c 服务器改为**单端口双栈**——worker 先 `sceNetRecv(fd,p,1,0)` 嗅探首字节，`0x16`（TLS handshake record）走 mbedTLS 服务端握手，否则按明文 HTTP 解析（嗅探字节缓存在 `Conn.p`，不丢包）。服务端出示同一张设备身份证书，announce / self_info / prepare 三处统一声明 `protocol:https` + 该证书指纹；TLS 锁 1.2，密码套件优先 **ChaCha20-Poly1305**（Cortex-A9 无 AES/SHA 硬件指令，AES-GCM 实测慢约 20%），再回退 AES-128/256-GCM。信任 **trust-first**：`VERIFY_OPTIONAL` + 空 CA 占位，`srv_verify` 只记对端指纹、`*flags = 0`（不拒绝），**不防主动 MITM**，白名单 / 验证码后置（§9）。**握手去关键路径**（d175）：设备身份（解析证书 + RSA CRT）改为全局解析一次并在启动预热，握手内不写 dlog（dlog 是同步写 ux0，每次几十毫秒）——握手 447~521ms → **230~250ms**，稳定进官方 register 请求的 500ms 总预算，官方客户端重新能主动发现 / 扫描到 PSV。**数据面分线程**（d177，见 §4.3）：收体解密与写盘 / sha256 校验重叠，实测 2.81 → **3.60MiB/s**（148.6MB / 39.4s；明文约 4MiB/s），瓶颈已转移到 ux0 顺序写（~9.4MB/s）与纯 C SHA-256（148MB 约 17.4s）。
 - **已落地（发现补充）**：Vita 收不了 UDP 组播、也绑不了 53317，设备表主要靠对方主动 register 与 `scan.c` 主动扫描（向 /24 各 IP 的 53317 POST register 拿 member info）。扫描按 **TLS→明文顺序**探测并携带设备身份证书（2026 官方 Rust 内核接收端强制 mTLS 客户端证书），明文兜底兼容纯 HTTP 端；**优先探测历史在线设备**（config `knownIps` 持久化、LRU、上限 24，入表即记录），常用设备实测轮次开始 ~0.7s 内出现。曾修复两处致手动扫描失效的 bug：`s_read_resp` 未把响应 body 移到缓冲区头部（JSON 解析永远失败、found 恒 0）；TLS 探测静默失败。UI 三角键手动触发。
-- 实现边界的完整清单（忙时 409 / 每连接 worker 上限 8、清单 64 文件/32KB、超时 60s/120s/30s 三档、接收仅明文 HTTP、/24 扫描范围等）见 README「边界与已知限制」。
+- 实现边界的完整清单（忙时 409 / 每连接 worker 上限 8、清单 64 文件/32KB、超时 60s/120s/30s 三档、/24 扫描范围、trust-first 不防主动 MITM 等）见 README「边界与已知限制」。
 - **已落地（稳定性，v2.0.0）**：修复待机唤醒 / Wi-Fi 断开恢复后卡「网络未就绪 / 没扫到设备」——watch 看门狗单线程低频轮询 netctl + 全互斥 `initCount=0` 语义修正（发现/扫描/收发/net 各互斥均改为无人先持锁），恢复后 UI 心跳自动续上；另曾用 6s 模拟断网窗口复现，现该调试开关已置 0（net.c `PSVSEND_SIM_DOWN_MS`，需要时 cmake 覆盖）。
 - **已落地（渲染稳定，v2.0.0）**：修复偶发 **GPU render crash**（先兆为界面「三角形空白撕裂」→ 系统判 render gpu crash 重启）。根因：主循环缺 `vita2d_wait_rendering_done()`，每帧 swap 后 GPU 队列无收敛点，渲染/显示队列超前回绕导致撕裂与驱动状态错乱；修复：每帧 swap 后等待渲染完成（ui_main.c）。字体对象另改为启动帧外预载（`font_preload_all`），堵住"渲染中途创建 GPU 纹理"的隐患（非本次根因，作加固保留；d122 起字体改从内存建，预载仍保留）。
 - **已落地（字体，d120-d126，见 §5.5）**：**字形冷启动根治**——定位到 libvita2d 的 `vita2d_load_font_file` 开的是**文件 face**，字体放在 VPK 的 `app0:`（deflate 压缩流）里，FreeType 每取一个**新字形**轮廓都要包内随机读一块并解压，实测 **~40ms/字形**（同字同号对照：文件 face 43.5ms vs 内存 face 0.19ms，差 150~180×；且与字号无关，故"砍字号档位"无效）。改为启动一次性把字体文件读进 RAM（UMA 架构，无需搬显存），字体对象走 `vita2d_load_font_mem`——`warm total` 5315ms → **65ms**（81×），开机到主界面总开销 ≈665ms。此后**删掉开屏画面与 `pages_warm_all()` 全部预热逻辑**（预热已无意义），`ui_run` 直接建齐字号字体对象。**字体换 Noto Sans**：拉丁 `NotoSans-Regular.ttf` + CJK 按界面语言取地区版本 `NotoSansCJKsc/tc/jp-Regular.otf`（简/繁/日，各 15.7MB，都含全部 CJK 字形，差别只在同一码位默认取哪个地区的字形），`FONT_ASC` 由 0.81（Droid 标定）调至 0.88（Noto CJK 实测）；换语言时在每帧 `start_drawing` 之前帧外重建 CJK 字体对象（`vita2d_load_font_mem` 会建显存纹理，落在渲染 pass 中途有 GPU crash 风险），首次切到某地区读盘 ~1.6s 后该地区字体常驻 RAM。字体随仓库入库（SIL OFL 1.1）。
@@ -70,6 +71,8 @@
 | TLS 方案 | **mbedtls**（工具链自带 3.6.5），锁定 TLS1.2 | PSV 系统 SceSsl 对 homebrew 不可用；TLS1.3 的证书校验不走 per-cert 回调，指纹 pin 依赖 1.2 |
 | HTTPS 信任模型 | 对端证书按 announce 指纹 SHA-256 **pin**（VERIFY_OPTIONAL + 自管校验回调），不依赖 CA 链 | LAN 内无公开 PKI；协议本身即以 fingerprint 标识设备 |
 | mTLS 客户端身份 | 内置自签 RSA-2048 设备证书（`identity.c` + `id_cert.inc` / `id_key.inc`），对端强制客户端证书时自动出示 | 2026 官方 Rust 内核接收端对非浏览器发送方强制客户端证书，无证书即 `certificate_required` 握手失败 |
+| 接收方向 TLS | **单端口双栈**：worker 读首字节，`0x16` 走 mbedTLS 服务端握手，其余按明文 HTTP；服务端出示同一张设备身份证书，TLS 锁 1.2、ChaCha20-Poly1305 优先 | 对方按 announce 的 protocol / port / fingerprint 直连，端口不能变；明文兜底是 Web / download API 的协议要求 |
+| 服务端信任模型 | `VERIFY_OPTIONAL` + 空 CA，`srv_verify` 只记录对端证书指纹、不拒绝（trust-first） | LAN 无公开 PKI，先保证"加密防被动嗅探"；白名单 / 验证码后置（§9） |
 | HTTP/1.1 范围 | **子集**：POST、Content-Length、**chunked 解码**、query string；响应后关闭连接 | 目标是"兼容 LocalSend"，非"完备 HTTP"。chunked 必须支持（官方 Dart 客户端可能使用）；**不支持 multipart 编码**（v2 多文件逐 POST 单文件裸流，见 §9）；解析器独立模块、防御式实现（全部读取设上限、不支持格式优雅拒绝 400） |
 | 内存约束 | 按 **256MB** 设计基准（实际预算 365MB 封顶） | 512MB 为**统一内存**（CPU/GPU 共享），系统保留约 147MB，应用可拿最大 365MB（工具箱可调 256/285/333/365） |
 | 文件处理 | **大文件永不整读入内存**，一律流式（收：边收边写盘；发：边读边发） | 内存红线 |
@@ -135,7 +138,8 @@ typedef struct {
 |------|------|
 | UI 主线程 | 渲染 + 消费事件队列刷新界面 |
 | 发现线程 | UDP recvfrom 循环 + 定时发 announce |
-| HTTP 服务器线程 | accept 循环，**每连接一个工作线程**（LocalSend 并行传多文件） |
+| HTTP 服务器线程 | accept 循环，**每连接一个工作线程**（LocalSend 并行传多文件）；工作线程内先做 **TLS / 明文嗅探**（首字节 `0x16`），TLS 连接现场做服务端握手 |
+| 收体写盘线程（recv） | 每个 upload 起一条，与 http worker 分离：生产者只做解密 / 攒块，消费者写盘 + sha256 校验；2×64KB 双缓冲 + `sem_free`/`sem_job` 计数信号量，跨用户核（d177） |
 | 发送线程（xfer） | `prepare-upload` 一条连接等对方决定；接受后起 N 个 worker 线程并发上传（N = config `maxParallel`，上限 6），join 完全部 worker 后**统一写一次终态**（见 §1「实现现状」） |
 | 定时器（可并入发现线程） | 设备超时清理、announce 周期触发 |
 
@@ -165,6 +169,9 @@ void on_session_done(const Session *s);      // 完成 / 失败
 - `prepare-upload` → 生成 sessionId，为每文件分配 fileId + token，返回 `{sessionId, files:[{id, token, fileName, size}]}`；同时向 UI 抛"待确认"事件
 - `upload?sessionId&fileId&token` → 校验会话与 token 匹配 → 流式写盘（先临时名，完成后重命名；同名加序号避免覆盖）
 - 安全底线：只收"prepare 过"的 fileId+token，否则 400；拒绝时回 401/403
+- **单端口双栈**：工作线程先 `sceNetRecv(fd,p,1,0)` 读首字节，`0x16` → mbedTLS 服务端握手（失败即关连接），否则把该字节塞回 `Conn.p` 按明文 HTTP 解析（`conn_read` 先吐缓存，不丢包）。端口候选与 announce 不变，`protocol` 改声明 `https`
+- **服务端身份与信任**：出示 per-device 自签 RSA-2048 设备证书（§3），`VERIFY_OPTIONAL` + 空 CA；`srv_verify` 只把对端证书 SHA-256 记到 `Conn.peer_fp`，不中断握手（trust-first，白名单 / 验证码的判定点就留在这里）。身份解析全局缓存一次 + 启动预热，**握手路径内不写 dlog**（同步写盘几十毫秒，会挤爆官方 register 的 500ms 预算）
+- **吞吐**：收体解密与写盘 / sha256 校验分线程重叠（§4.3），实测 3.60MiB/s（明文约 4MiB/s）
 - 接收文件写入运行时保存目录（默认 `ux0:data/psvsend/downloads/`，UI 可选：config `saveDir` 持久 / 接收 Setup `recv_dir` 仅本次，见 §1「实现现状」）
 
 ### 4.6 HTTP 客户端要点
@@ -343,7 +350,7 @@ src/ui/
 - [x] HTTP 解析兼容清单最终确认：**chunked 已落地**——http.c 对无 Content-Length 的请求按 `Transfer-Encoding: chunked` 走 chunked 解码（upload_stream/chunked_stream），dio/官方客户端流式上传真机验证；大文件 upload 一律不进内存。2026-09-07 确认
 - [x] 接收设置页：文件重命名输入：已落地（2026-09-09，SceIme 系统键盘，见 §1「实现现状」）——接收 Setup 每行可改保存名；设置页主机名改名已落地（同日，见 §1）
 - [x] 接收设置页：本次保存目录选择：已落地（2026-09-09，见 §1「实现现状」）——接收 Setup 目录行可点进 ux0 目录选择器改本次目录（内存 recv_dir），设置页「保存目录」持久改默认（config `saveDir`）；仅 ux0 单分区、无新建目录入口
-- [ ] 接收页"验证"功能（LocalSend 的验证码/校验交互）当前不做：2026-09-09 曾照官方 VerifyPage 实现图案 / 文本比对，真机验证完全无效后**全量回退**——官方客户端**仅对 https 对端**开放验证入口，而接收方向是明文 http（无 TLS server），互操作时收 / 发三个方向的验证按钮全都点不亮，功能无实际用途；待本节「接收方向 TLS 化」落地后再评估
-- [x] 多文件接收中途取消的竞态：已修复（收满优先于取消判断）——正在传的文件若已收满则以「用户取消」收尾并保留完整，未收满才清理其残 `.part`；前 N-1 个完整文件始终保留（细节见 README「边界 / 接收」）
+- [ ] 接收页"验证"功能（LocalSend 的验证码/校验交互）当前不做：2026-09-09 曾照官方 VerifyPage 实现图案 / 文本比对，真机验证完全无效后**全量回退**——官方客户端**仅对 https 对端**开放验证入口，而当时接收方向是明文 http（无 TLS server），互操作时收 / 发三个方向的验证按钮全都点不亮。**前置条件已随 d173~d177 接收方向 TLS 化消除**（对端现在看到的是 https 对端 + 指纹），但官方客户端是否真会点亮入口、互操作是否有额外要求均未实测，是否重启该功能待评估（方案与回退记录见 docs/TODO.md）
+- [x] 多文件接收中途取消的竞态：已修复（收满优先于取消判断）——正在传的文件若已收满则以「用户取消」收尾并保留完整，未收满才清理其残 `.psvsend.tmp`；前 N-1 个完整文件始终保留（细节见 README「边界 / 接收」）
 - [x] GPU render crash（界面撕裂后偶发崩溃）：已修复——根因为主循环缺 `vita2d_wait_rendering_done()`（GPU 队列无逐帧收敛点），2026-09 真机多轮复测通过（细节见 §1「实现现状」渲染稳定条目与 README「当前状态」）
-- [ ] **接收方向 TLS 化（独立里程碑攻坚）**：消除"发送加密、接收明文"的不对称——http.c 服务器当前纯明文（announce 声明 `protocol:http`），发文件走 HTTPS/mTLS 而收文件明文。方案草案：http.c 加 mbedTLS **服务器端**（现有 s_handshake 仅客户端）+ 同端口 TLS/明文自适应嗅探（首字节 0x16 判 TLS）+ announce 声明 https；认证先 trust-first（加密防嗅探），设备指纹白名单后置。风险点：与 2026 官方 Rust 端握手互操作未实测，可能多轮真机调试（同 scan TLS 那轮）；改动需隔离成独立 TAG/提交，失败可回滚明文声明。待排期，2026-09-06 记入。
+- [x] **接收方向 TLS 化**：已落地（2026-10-20 d173~d177，见 §1「实现现状」与 §3/§4.5）——单端口双栈（首字节 `0x16` 判 TLS）+ 服务端出示设备身份证书 + trust-first + ChaCha20-Poly1305 优先；握手 240ms 稳定进官方 register 预算，接收吞吐 2.81 → 3.60MiB/s。**遗留**：服务端不验证对端（不防主动 MITM），设备指纹白名单 / 验证码未做（见下条）

@@ -15,7 +15,7 @@
 - [x] VitaSDK 交叉编译环境 + vita2d 渲染骨架 + VPK 打包（含 LiveArea 素材）
 - [x] LocalSend v2 发送链路：UDP 组播发现 / register / prepare-upload / upload
 - [x] 文件发送（PSV → 手机 / PC，HTTP 明文与 HTTPS 加密均支持）
-- [x] TLS 加密传输（mbedTLS 3.6.5，含 mTLS 客户端身份）
+- [x] TLS 加密传输（mbedTLS 3.6.5，含 mTLS 客户端身份）：发送方向按对端 protocol 走 HTTPS；**接收方向同一端口同时服务 HTTPS 与明文 HTTP**（首字节 `0x16` 判 TLS，d173~d177）
 - [x] 文件接收（手机 / PC → PSV）：prepare-upload 弹确认 → upload 流式写盘，兼容无 Content-Length 的 chunked 上传
 - [x] 主动扫描：Vita 收不了 UDP 组播，改向局域网 /24 各 IP 主动 HTTP 探测补全设备表
 - [x] 网络稳定性：待机唤醒 / Wi-Fi 断开恢复后自动恢复发现（watch 看门狗 + 低频 netctl 轮询，v2.0.0）；断网「活性刺激」改非阻塞发包，Wi-Fi 重连过渡态不再卡住界面与按键（d65）
@@ -115,11 +115,13 @@ cmake --build build
 1. 对方（LocalSend App / 桌面客户端）向我们发送文件时，PSV 自动弹出接收确认页，显示来者、平台、文件清单与总大小
 2. 焦点默认在 **Accept**：确认后对方即可开传；**Setup** 进入接收设置，可逐文件取消勾选（未勾选的跳过，不出现在接受回执里）；**Reject** 拒绝（对方收到 403）
 3. 确认后进入接收进度页，显示逐文件进度与总进度，可随时取消
-4. 收到的文件默认存入 `ux0:data/psvsend/downloads/`（设置页“保存目录”可改默认值；接收 Setup 可临时改本次目录），边收边写（`.part` 临时文件，收完改正式名）；与已有文件同名时自动在扩展名前加 `(k)` 序号，不覆盖。中途断流/校验失败会删除残 `.part`，下次启动也会清扫上次异常遗留的临时文件
+4. 收到的文件默认存入 `ux0:data/psvsend/downloads/`（设置页“保存目录”可改默认值；接收 Setup 可临时改本次目录），边收边写（`.psvsend.tmp` 临时文件，收完改正式名）；与已有文件同名时自动在扩展名前加 `(k)` 序号，不覆盖。中途断流/校验失败会删除残 `.psvsend.tmp`，下次启动也会清扫上次异常遗留的临时文件
 
 ### HTTPS / mTLS 说明
 
-发送端按对方 announce 的 `protocol` 自动选择明文 HTTP 或 HTTPS。2026 版官方 LocalSend（Rust 内核）对无浏览器会话的发送方强制要求**客户端证书**（mTLS），不出示证书直接握手失败（`certificate_required`）。为此 PSVSend 随固件内置一张设备身份证书（自签 RSA-2048，见 `src/net/id_cert.inc` / `src/net/id_key.inc`），HTTPS 连接自动出示；同时按对方 announce 的指纹（证书 SHA-256）锁定服务端证书，不依赖 CA 链。接收端只校验设备证书本身有效，无需信任本客户端。
+发送端按对方 announce 的 `protocol` 自动选择明文 HTTP 或 HTTPS。2026 版官方 LocalSend（Rust 内核）对无浏览器会话的发送方强制要求**客户端证书**（mTLS），不出示证书直接握手失败（`certificate_required`）。为此 PSVSend 随固件内置一张设备身份证书（自签 RSA-2048，见 `src/net/id_cert.inc` / `src/net/id_key.inc`），HTTPS 连接自动出示；同时按对方 announce 的指纹（证书 SHA-256）锁定服务端证书，不依赖 CA 链。
+
+接收端**同一端口同时服务 HTTPS 与明文 HTTP**：连接首个字节是 `0x16`（TLS handshake record）就走 mbedTLS 服务端握手，否则按明文 HTTP 处理（端口候选与从前一致：4567 / 53318 / …）。服务端出示的正是上面那张设备身份证书，announce / scan / prepare 声明的 fingerprint 与它一致，官方客户端据此 pin；服务端对客户端证书取 `VERIFY_OPTIONAL`（不出示也放行）。**当前信任模型是 trust-first**：信任判定只记录对端指纹、不拒绝任何对端——加密防的是被动嗅探，**不防主动 MITM**；指纹白名单 / 验证码见 [docs/design.md](docs/design.md) §9。TLS 锁 1.2，密码套件优先 **ChaCha20-Poly1305**（PSV 的 Cortex-A9 无 AES/SHA 硬件指令，AES-GCM 实测慢约 20%），再回退 AES-128/256-GCM。
 
 ## 边界与已知限制
 
@@ -135,8 +137,10 @@ cmake --build build
 
 ### 接收
 
-- 多文件接收中途取消的竞态已修复（收满优先于取消判断）：正在传的文件若已收满则保留完整、会话以「用户取消」收尾，未收满才清理其残 `.part`；已收完的文件始终保留
-- **接收端只监听明文 HTTP**（候选端口 4567/53318/…，announce 声明 `protocol:http`）；HTTPS 仅用于 PSV 作为发送方时。对方会按 announce 自动走明文
+- 多文件接收中途取消的竞态已修复（收满优先于取消判断）：正在传的文件若已收满则保留完整、会话以「用户取消」收尾，未收满才清理其残 `.psvsend.tmp`；已收完的文件始终保留
+- **接收端同一端口同时服务 TLS 与明文 HTTP**（首字节 `0x16` 判 TLS，端口候选 4567 / 53318 / …，announce / scan / prepare 统一声明 `protocol:https`）：2026 官方客户端会按 announce 走 HTTPS，纯明文端仍可互操作（明文兜底是 Web / download API 的协议要求）
+- **TLS 接收实测 3.60MiB/s**（148.6MB / 39.4s；明文约 4MiB/s）：收体解密与写盘、sha256 校验分线程重叠（2×64KB 双缓冲），瓶颈已落到 ux0 顺序写（~9.4MB/s）与纯 C SHA-256。TLS 锁 1.2、密码套件优先 ChaCha20-Poly1305
+- **信任是 trust-first**：服务端 `VERIFY_OPTIONAL` + 空 CA，只记录对端证书指纹、不拒绝任何对端——加密防被动嗅探，**不防主动 MITM**；指纹白名单 / 验证码待做（设计文档 §9）
 - **同一时刻只处理一个接收会话**：正在收/已结束未清场时，**另一台设备**的 prepare-upload 返回 409；**PSV 正在发送文件时同样 409**（发送中不收新文件），避免请求被晾到超时。**同一会话内的多个文件由发送方并发 upload**（官方客户端即如此），接收侧按文件独立流式收体、互不阻塞——后到的文件不再被 409 拒绝；会话按"所有文件都到终态"收尾（d68 修复，此前 v2.1.0 起多文件同会话传输会失败）
 - **清单上限**：单会话 ≤64 个文件（超出部分被忽略，回执只列前 64 个）；清单 JSON 体 ≤32KB；文件名 ≤192 字符截断
 - **超时三档**：prepare 等界面决定 **60s**（超时回 403）；接受后/文件间空闲 **120s**（判定 TIMEOUT、清理临时文件）；收体中 socket 连续 **30s** 无数据判为断流
