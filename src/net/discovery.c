@@ -19,6 +19,7 @@
 #include "net/http.h"
 #include "net/device.h"
 #include "net/discovery.h"
+#include "net/identity.h"
 #include "core/dlog.h"
 
 #define DISC_ADDR    "224.0.0.167"
@@ -118,8 +119,9 @@ void discovery_peer_registered(const char *body, const char *src_ip)
     if (!json_get_str(body, "alias", dev.alias, sizeof dev.alias)) return;
     json_get_str(body, "fingerprint", dev.fingerprint, sizeof dev.fingerprint);
     if (dev.fingerprint[0]) {
-        char mine[sizeof g_cfg.fingerprint];
-        config_get_fingerprint(mine, sizeof mine);
+        char mine[65];
+        if (identity_fingerprint(mine) != 0)
+            config_get_fingerprint(mine, sizeof mine);
         if (mine[0] && strcmp(dev.fingerprint, mine) == 0)
             return;                            /* 自己 */
     }
@@ -142,9 +144,10 @@ void discovery_peer_registered(const char *body, const char *src_ip)
 /* 公开：扫描线程发现设备后入表（带自排除：指纹与自己的设备忽略） */
 void discovery_upsert_peer(const Device *dev)
 {
-    char mine[sizeof g_cfg.fingerprint];
+    char mine[65];
     if (!dev || !dev->alias[0]) return;
-    config_get_fingerprint(mine, sizeof mine);
+    if (identity_fingerprint(mine) != 0)
+        config_get_fingerprint(mine, sizeof mine);
     if (mine[0] && dev->fingerprint[0] &&
         strcmp(dev->fingerprint, mine) == 0)
         return;                                /* 自己 */
@@ -164,12 +167,14 @@ static bool ipv4_from_str(const char *str, unsigned int *netorder)
 
 static void announce_payload(char *out, int n)
 {
-    char al[sizeof g_cfg.alias], fp[sizeof g_cfg.fingerprint];
+    char al[sizeof g_cfg.alias], fp[65];
     char ae[2 * sizeof g_cfg.alias];
-    char fe[2 * sizeof g_cfg.fingerprint];
+    char fe[2 * 65];
     int port = http_port();
     config_get_alias(al, sizeof al);         /* 锁内取快照：UI 可能正在改名 */
-    config_get_fingerprint(fp, sizeof fp);
+    /* 公告指纹用 per-device 证书哈希；生成期间发现模块尚未启动，回退仅防御 */
+    if (identity_fingerprint(fp) != 0)
+        config_get_fingerprint(fp, sizeof fp);
     json_escape(al, ae, sizeof ae);
     json_escape(fp, fe, sizeof fe);
     snprintf(out, n,

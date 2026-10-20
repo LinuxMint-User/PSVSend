@@ -108,6 +108,12 @@ static void watch_once(void)
             }
         }
 
+        /* 首启身份证书仍在后台生成：暂缓 http / 发现启动。否则会先用旧指纹
+         * 公告一轮，对端设备表按 fingerprint 去重，会短暂出现两条同 IP 记录。
+         * 生成完成（实测 2~9s）后下一个 500ms 巡检自然拉起。 */
+        if (identity_pending())
+            return;
+
         /* http 探活：accept 线程因监听 socket 持续报错自尽/从未起来 → 重建 */
         if (http_port() > 0 && (++probe % 4) == 0 && !http_alive()) {
             dlog("watch: http dead (was :%d) -> restart", http_port());
@@ -245,13 +251,16 @@ void api_start(void)
     config_init();                       /* 先建目录/读配置（dlog 目录依赖它） */
     dlog_init();
     dlog("== psvsend boot [TAG:" PSVSEND_BUILD_TAG "] ==");
+
+    /* per-device 身份：有盘上证书就直接加载；没有则后台生成（首启 2~9s）。
+     * 生成期间 watch_once 暂缓 http/发现，就绪后自动拉起。 */
+    identity_init();
     {
-        /* 版本标记 + 设备身份指纹：确认刷入的固件含 mTLS 客户端证书 */
         char f[65];
         if (identity_fingerprint(f) == 0)
-            dlog("api: build mtls, device id fp=%s", f);
+            dlog("api: identity fp=%s", f);
         else
-            dlog("api: build mtls, identity parse FAILED");
+            dlog("api: identity generating (first run)...");
     }
 
     http_set_register_cb(discovery_peer_registered);   /* 对方 register → 设备表 */
@@ -272,6 +281,11 @@ int api_device_snapshot(Device *out, int max)
 bool api_network_ready(void)
 {
     return discovery_state() > 0;
+}
+
+bool api_identity_pending(void)
+{
+    return identity_pending();
 }
 
 int api_discovery_state(void)
@@ -302,6 +316,9 @@ const char *api_local_ip(void)
 
 void api_scan_trigger(void)
 {
+    /* 首启身份证书生成中：此时扫描会在 register 里带旧指纹，先拦下 */
+    if (identity_pending())
+        return;
     scan_trigger();
 }
 

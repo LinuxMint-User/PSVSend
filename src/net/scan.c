@@ -389,12 +389,14 @@ static void s_close(SConn *c)
 /* 拼本机 member info（register 请求体 + 我们入对方表的依据） */
 static void self_info_json(char *out, int outsz)
 {
-    char al[sizeof g_cfg.alias], fp[sizeof g_cfg.fingerprint];
+    char al[sizeof g_cfg.alias], fp[65];
     char ae[2 * sizeof g_cfg.alias];
-    char fe[2 * sizeof g_cfg.fingerprint];
+    char fe[2 * 65];
     int port = http_port();
     config_get_alias(al, sizeof al);         /* 锁内取快照：UI 可能正在改名 */
-    config_get_fingerprint(fp, sizeof fp);
+    /* per-device 证书指纹；身份仍在生成时回退旧随机串（扫描入口已被 api 拦下） */
+    if (identity_fingerprint(fp) != 0)
+        config_get_fingerprint(fp, sizeof fp);
     json_escape(al, ae, sizeof ae);
     json_escape(fp, fe, sizeof fe);
     snprintf(out, outsz,
@@ -420,8 +422,9 @@ static int parse_member(const char *body, int tls, const char *ip, Device *out,
             snprintf(out->fingerprint, sizeof out->fingerprint, "%s", leaf_fp);
     }
     if (out->fingerprint[0]) {
-        char mine[sizeof g_cfg.fingerprint];
-        config_get_fingerprint(mine, sizeof mine);
+        char mine[65];
+        if (identity_fingerprint(mine) != 0)
+            config_get_fingerprint(mine, sizeof mine);
         if (strcmp(out->fingerprint, mine) == 0)
             return 0;                        /* 自己 */
     }

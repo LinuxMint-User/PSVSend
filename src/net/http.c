@@ -16,6 +16,7 @@
 #include "core/config.h"
 #include "core/json_util.h"
 #include "net/http.h"
+#include "net/identity.h"
 #include "core/dlog.h"
 
 #define HTTP_RECV_TIMEOUT_S 3
@@ -91,11 +92,13 @@ static bool recv_abort_q(void)
 
 static void member_info_json(char *out, int outsz)
 {
-    char al[sizeof g_cfg.alias], fp[sizeof g_cfg.fingerprint];
+    char al[sizeof g_cfg.alias], fp[65];
     char ae[2 * sizeof g_cfg.alias];
-    char fe[2 * sizeof g_cfg.fingerprint];
+    char fe[2 * 65];
     config_get_alias(al, sizeof al);         /* 锁内取快照：UI 可能正在改名 */
-    config_get_fingerprint(fp, sizeof fp);
+    /* per-device 证书指纹；生成期间 http 尚未启动，这里只做防御性回退 */
+    if (identity_fingerprint(fp) != 0)
+        config_get_fingerprint(fp, sizeof fp);
     json_escape(al, ae, sizeof ae);
     json_escape(fp, fe, sizeof fe);
     snprintf(out, outsz,

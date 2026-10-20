@@ -26,6 +26,8 @@ void api_poke(void);
 int api_device_snapshot(Device *out, int max);
 /* 后端网络是否已就绪并跑着发现线程 */
 bool api_network_ready(void);
+/* 首启 per-device 身份证书是否仍在后台生成（期间 http/发现暂缓启动） */
+bool api_identity_pending(void);
 /* 发现是否因初始化失败不可用（1=可用 0=未起 <0=失败码） */
 int  api_discovery_state(void);
 /* 失败定位（"步骤 错误码"，如 "join 224.0.0.167 0x8041010D"；未失败返回 ""） */

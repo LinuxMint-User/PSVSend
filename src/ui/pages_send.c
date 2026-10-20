@@ -138,6 +138,14 @@ static void dev_strip(void)
     uint64_t now = (uint64_t)sceKernelGetSystemTimeWide();
     int i;
 
+    /* 首启：后台正在生成 per-device 证书（2~9s），http/发现暂缓启动。
+     * 这条优先于其它提示，就绪后自动消失。 */
+    if (api_identity_pending()) {
+        w_text(28, STRIP_Y, 0.9f, theme->text_dim, "%s",
+               tr("Generating device identity (first run)..."));
+        return;
+    }
+
     if (dev_hint_us && now < dev_hint_us) {
         w_text(28, STRIP_Y, 0.9f, theme->warn, "%s", tr("Select files first"));
         return;
@@ -392,7 +400,8 @@ static void try_send(int dev_idx)
  * "再按一下顺延下一轮"那套次级语义更好懂，那是给按键的。 */
 static void hdr_buttons(void)
 {
-    w_hdr_button(HDR_SLOT_L, WID_HDR_SCAN, HDRBTN_SCAN, api_scan_active());
+    w_hdr_button(HDR_SLOT_L, WID_HDR_SCAN, HDRBTN_SCAN,
+                 api_scan_active() || api_identity_pending());
     w_hdr_button(HDR_SLOT_R, WID_HDR_SETTINGS, HDRBTN_SETTINGS, false);
 }
 
@@ -439,6 +448,7 @@ void page_devices_render(void)
     /* 三角键语义随焦点栏变化：设备栏=短按扫描网段；文件栏=按住蓄满清空已选
      * （蓄力环画在该段图标周围；无已选则灰掉、不画环） */
     if (g_app.pane_focus == 0) {
+        segs[ns].dim = api_identity_pending();   /* 首启证书生成中：扫描暂不可用 */
         segs[ns++].text = tr("Scan");
     } else {
         segs[ns].dim = g_app.picked_count <= 0;

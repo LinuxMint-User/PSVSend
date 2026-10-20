@@ -32,11 +32,12 @@
  * 装完直接看"关于"就能核对刷入的是不是对新固件，不必翻日志。
  * 只用于显示/标识——不要拼进 PSVSEND_APP_VERSION：app/update.c 会解析远端
  * config.h 里的该宏做版本比较，混入构建号会让比较失准。 */
-#define PSVSEND_BUILD_TAG "d170"
+#define PSVSEND_BUILD_TAG "d172"
 
 typedef struct {
     char alias[64];          /* 设备名，广播给其他 LocalSend 设备 */
-    char fingerprint[64];    /* 随机身份串：防自发现；首次生成后持久化 */
+    char fingerprint[64];    /* 旧版随机身份串：仅在身份证书生成失败时兜底，
+                              * 正常公告/自发现比对改用证书 DER SHA-256 */
     int  port;               /* HTTP 服务端口（默认 53317，与协议一致） */
     int  theme_id;           /* 色系：0=Yaru 1=OLED 2=Custom（自定义） */
     int  light_mode;         /* 明暗（与色系正交）：0=深色(默认) 1=浅色；OLED 固定深色 */
