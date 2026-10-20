@@ -402,7 +402,7 @@ static void self_info_json(char *out, int outsz)
     snprintf(out, outsz,
              "{\"alias\":\"%s\",\"version\":\"2.0\","
              "\"deviceModel\":\"PlayStation Vita\",\"deviceType\":\"mobile\","
-             "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"http\","
+             "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"https\","
              "\"download\":true}",
              ae, fe, port > 0 ? port : SCAN_PORT);
 }

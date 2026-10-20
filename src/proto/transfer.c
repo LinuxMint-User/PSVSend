@@ -742,19 +742,21 @@ static int jcat(char *b, int cap, int o, const char *fmt, ...)
 static char *build_prepare_json(void)
 {
     int cap = TX_SOCK_BUF + XFER_MAX_FILES * 420;
-    char al[sizeof g_cfg.alias], fp[sizeof g_cfg.fingerprint];
-    char ae[2 * sizeof g_cfg.alias], fe[2 * sizeof g_cfg.fingerprint];
+    char al[sizeof g_cfg.alias], fp[65];
+    char ae[2 * sizeof g_cfg.alias], fe[2 * 65];
     char *b = (char *)malloc((size_t)cap);
     int o, i;
     if (!b) return NULL;
     config_get_alias(al, sizeof al);         /* 锁内取快照：UI 可能正在改名 */
-    config_get_fingerprint(fp, sizeof fp);
+    /* per-device 证书指纹（与 announce / member info 同一口径） */
+    if (identity_fingerprint(fp) != 0)
+        config_get_fingerprint(fp, sizeof fp);
     json_escape(al, ae, sizeof ae);
     json_escape(fp, fe, sizeof fe);
     o = jcat(b, cap, 0,
              "{\"info\":{\"alias\":\"%s\",\"version\":\"2.0\","
              "\"deviceModel\":\"PlayStation Vita\",\"deviceType\":\"mobile\","
-             "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"http\","
+             "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"https\","
              "\"download\":false},\"files\":{",
              ae, fe, http_port());
     for (i = 0; o >= 0 && i < g_j.count; i++) {

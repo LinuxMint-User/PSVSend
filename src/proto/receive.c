@@ -764,6 +764,11 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     mbedtls_sha256_context hctx;
     unsigned char digest[32];
     unsigned char buf[RECV_CHUNK];   /* 本 upload 私有：同会话多文件并发时不能共用静态缓冲 */
+    int fill = 0;                    /* buf 里已攒未写盘的字节（凑满 64KB 再写，见收体循环） */
+    uint64_t t0, t_log;              /* 收体耗时/进度打点（2s 一条，用于定位掉速与截断） */
+    uint64_t t_read = 0, t_write = 0, t_mark;  /* 读（含 TLS 解密）/写盘各占多少时间：
+                                              * 交付后据此判断吞吐瓶颈在 CPU 还是 ux0: */
+    SceOff log_got = 0;
 
     if (!query || !fn || !ctx) return 400;
     query_get(query, "sessionId", sid, sizeof sid);
@@ -832,6 +837,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         return 500;
     }
 
+    t0 = t_log = now_us();
     for (;;) {
         int n, wr;
         if (f->got >= f->size) break;  /* 先确认收满：完整数据绝不做取消清理 */
@@ -851,13 +857,24 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         }
         if (f->got >= f->size) break;
         {
-            SceOff rem = f->size - f->got;
-            n = fn(ctx, buf, (int)(rem < RECV_CHUNK ? rem : RECV_CHUNK));
+            /* 攒够 64KB 再写盘：TLS 一次只交付一个记录（≤16KB），按 16KB 逐次
+             * 写 ux0: 实测只有 9.4MB/s（148MB 花 15.8s）；凑满缓冲后写 64KB
+             * 对齐块，写调用少 3/4，也避开簇边界上的读-改-写。 */
+            SceOff rem = f->size - (f->got + fill);
+            int room = RECV_CHUNK - fill;
+            t_mark = now_us();
+            n = fn(ctx, buf + fill, (int)(rem < room ? rem : room));
+            t_read += now_us() - t_mark;
         }
         if (n <= 0) {                        /* 断流/空闲超时/socket 错/用户中止 */
             sceIoClose(fd); fd = -1;
             lock();
             f->busy = false;
+            /* 截断取证：收了多久、到多少字节停的。fn 的负返回值区分不了
+             * "对端关/空闲超时/读错"，http 层已有对应 dlog，这里给时间线。 */
+            dlog("recv: upload fail got %lld/%lld B after %llu ms (fn=%d)",
+                 (long long)(f->got + fill), (long long)f->size,
+                 (unsigned long long)((now_us() - t0) / 1000), n);
             if (g_abort) {                   /* http 层看到中止标志提前退出 → 取消 */
                 cleanup_parts();
                 if (!sess_is_terminal(g_sess.state))     /* 别覆盖已判定的终态原因 */
@@ -869,9 +886,14 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             if (check_sha) mbedtls_sha256_free(&hctx);
             return 500;
         }
-        if (check_sha) mbedtls_sha256_update(&hctx, buf, (unsigned)n);
-        wr = sceIoWrite(fd, buf, (unsigned)n);
-        if (wr != n) {                       /* 磁盘满 / IO 错误 */
+        if (check_sha) mbedtls_sha256_update(&hctx, buf + fill, (unsigned)n);
+        fill += n;
+        if (fill < RECV_CHUNK && f->got + fill < f->size)
+            continue;                        /* 没攒满、也没收完：接着收 */
+        t_mark = now_us();
+        wr = sceIoWrite(fd, buf, (unsigned)fill);
+        t_write += now_us() - t_mark;
+        if (wr != fill) {                    /* 磁盘满 / IO 错误 */
             sceIoClose(fd); fd = -1;
             lock();
             f->busy = false;
@@ -881,9 +903,19 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             return 500;
         }
         lock();
-        f->got += n;
-        g_sess.got_total += n;
+        f->got += fill;
+        g_sess.got_total += fill;
+        fill = 0;
         unlock();
+        if (now_us() - t_log >= 2000000ull) {   /* 2s 一条：速率 + 是否还在推进 */
+            uint64_t tn = now_us();
+            dlog("recv: progress %lld/%lld B  %.2f MiB/s",
+                 (long long)f->got, (long long)f->size,
+                 (double)(f->got - log_got) / 1048576.0
+                     / ((double)(tn - t_log) / 1000000.0));
+            t_log = tn;
+            log_got = f->got;
+        }
     }
 
     if (check_sha) {
@@ -904,6 +936,15 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         sess_fail_locked("文件落盘失败");
         unlock();
         return 500;
+    }
+    {
+        uint64_t total = now_us() - t0;
+        dlog("recv: file done %lld B in %llu ms (%.2f MiB/s) read=%llu ms write=%llu ms",
+             (long long)f->got, (unsigned long long)(total / 1000),
+             total ? (double)f->got / 1048576.0
+                     / ((double)total / 1000000.0) : 0.0,
+             (unsigned long long)(t_read / 1000),
+             (unsigned long long)(t_write / 1000));
     }
     lock();
     f->st = 1;

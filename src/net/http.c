@@ -5,14 +5,29 @@
  * 转给 receive 模块"，其余请求头+体都很小读进内存即可。http_stop 关监听让
  * accept 退出后，会对仍存活的 worker 做有预算的 join，等不到就换代弃管。
  * Vita 的 SceNet socket 收/发在暂无数据时会立刻返回 EWOULDBLOCK(0x80410123)，
- * 不能当错误处理，必须轮询等数据/等窗口。 */
+ * 不能当错误处理，必须轮询等数据/等窗口。
+ *
+ * 单端口双栈：同一监听端口同时服务 TLS 与明文 HTTP。worker 先嗅探首字节
+ * （0x16 = TLS handshake record）——是 TLS 就用本机身份证书现场做服务端握手，
+ * 之后所有收发走 mbedTLS；否则按明文 HTTP 处理。嗅探到的首字节不能丢，
+ * 存在 Conn.p 里由 TLS recv 回调/conn_read 先消费。
+ * 保留明文是为了兼容旧客户端与简单调试；官方 2026 客户端走 TLS。 */
+#define MBEDTLS_ALLOW_PRIVATE_ACCESS
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
 #include <psp2/net/net.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/kernel/threadmgr/thread.h>
 #include <psp2/kernel/threadmgr/mutex.h>
 #include <sys/time.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/ssl_ciphersuites.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/sha256.h>
 #include "core/config.h"
 #include "core/json_util.h"
 #include "net/http.h"
@@ -25,7 +40,15 @@
 #define HTTP_MAX_PREPARE    32768   /* prepare-upload 体/回执上限（清单 JSON，64 文件会话） */
 #define UPLOAD_IDLE_US      (30 * 1000000LL)  /* 收体时单块读的空闲上限 */
 #define NET_AGAIN(r) ((r) == 0x80410123)
-#define NET_RETRY_DELAY_US 20000    /* 20ms 轮询间隔 */
+#define NET_RETRY_DELAY_US 20000    /* 20ms：仅用于"长时间空闲等一个事件"的场合 */
+/* 数据面/握手的轮询间隔。Vita recv 无数据立刻返回 EWOULDBLOCK，睡多久就等于
+ * 每个往返/每个 socket 缓冲周期多花多久：
+ *  - 握手有 4~6 个往返，20ms 一睡实测把服务端握手拖到 ~354ms，超过官方客户端
+ *    discovery 的 500ms 预算 → register 被对端放弃，客户端最终降级成 http 通道；
+ *  - 收体时每个周期只搬走"这 20ms 攒下的数据"（socket 缓冲就那么大），吞吐被
+ *    压到 ~2MiB/s（明文与 TLS 都中招）。
+ * 1ms 的开销只是少量唤醒，换来的是"有数据就立刻搬"。 */
+#define NET_POLL_US         1000
 #define HTTP_MAX_CONN       8       /* 并发连接 worker 上限（满员立即关新连接） */
 #define HTTP_CONN_STACK     0x40000 /* 每连接 worker 栈：与旧 accept 线程同规格
                                      * （handle_conn 内 buf+prepare 体/回执 ~100KB） */
@@ -104,7 +127,7 @@ static void member_info_json(char *out, int outsz)
     snprintf(out, outsz,
              "{\"alias\":\"%s\",\"version\":\"2.0\","
              "\"deviceModel\":\"PlayStation Vita\",\"deviceType\":\"mobile\","
-             "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"http\","
+             "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"https\","
              "\"download\":true}",
              ae, fe, g_port);
 }
@@ -261,31 +284,304 @@ int http_chunked_decode(char *body, int len)
 }
 
 /* ---------- 连接读写抽象 ----------
- * 连接现在就是裸 fd；收发都经 conn_read/conn_write（定义见下）。将来 TLS 化
- * 时把 mbedTLS 上下文挂进 Conn、在这两个函数里分派即可，调用点不必再改。 */
+ * 连接现在可能是明文 fd，也可能是 TLS（服务端握手）。收发统一经
+ * conn_read/conn_write，由 cn->tls 分派，调用点不必关心底下是哪种。 */
 typedef struct {
     int fd;
     int gen;        /* 所属服务器代次：换代后轮询尽早收手（见 gen_stale） */
+    int tls;        /* 1=TLS 握手完成，收发走 mbedTLS */
+    int tls_up;     /* mbedTLS 上下文已初始化（收尾要释放，含握手失败） */
+    unsigned char p[16];   /* 嗅探阶段预读的字节（TLS recv 回调先消费） */
+    int p_n, p_pos;
+    mbedtls_ssl_context      ssl;
+    mbedtls_ssl_config       conf;
+    mbedtls_entropy_context  ent;
+    mbedtls_ctr_drbg_context drbg;
+    char                     peer_fp[65];  /* 对端叶证书 SHA-256（握手回调里填，
+                                            * 不在握手关键路径上打日志——同步写
+                                            * ux0: 一次要几十毫秒，会把官方客户端
+                                            * register 的 500ms 预算吃掉） */
+    mbedtls_x509_crt         ca;    /* 占位空 CA 表：mbedTLS 要求 ca_chain 非空，
+                                     * 客户端证书信任判定交给 srv_verify（trust-first） */
 } Conn;
+
+/* 换代感知：http_stop/restart 后旧 worker 的轮询（头/体读取）应尽快收手，
+ * 让 http_stop 的有预算 join 能等到它，而不是干耗到 recv 超时。 */
+static inline int gen_stale(int my_gen) { return g_gen != my_gen; }
+
+/* ---------- 服务端 TLS ---------- */
+
+/* Vita 熵源：时间 + 栈/全局地址 + 计数器混洗（splitmix64，与客户端同一口径）。 */
+static unsigned long g_srv_seed;
+static int srv_entropy_poll(void *arg, unsigned char *out, size_t len,
+                            size_t *olen)
+{
+    uint64_t x = (uint64_t)sceKernelGetSystemTimeWide()
+               ^ ((uint64_t)(uintptr_t)&g_srv_seed << 17)
+               ^ ((uint64_t)(g_srv_seed++) * 0x9E3779B97F4A7C15ull);
+    size_t i;
+    (void)arg;
+    for (i = 0; i < len; i += 8) {
+        uint64_t z = x + 0x9E3779B97F4A7C15ull;
+        int k;
+        x = z;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= z >> 31;
+        for (k = 0; k < 8 && i + k < len; k++)
+            out[i + k] = (unsigned char)(z >> (8 * k));
+    }
+    *olen = len;
+    return 0;
+}
+
+/* 客户端证书校验回调（服务端 VERIFY_OPTIONAL）：现在不做信任判定
+ * （trust-first 与明文时代一致），只把叶证书指纹记进 Conn->peer_fp 备查——
+ * 将来接入白名单/验证码时，判定点就落在这里。
+ * 注意：这里**不能**打 dlog——dlog 是同步写 ux0:，一次几十毫秒，正好插在
+ * 握手中间，会直接把官方客户端 register 的 500ms 预算吃掉。 */
+static int srv_verify(void *arg, mbedtls_x509_crt *crt, int depth,
+                      uint32_t *flags)
+{
+    Conn *c = (Conn *)arg;
+    if (depth == 0 && crt && crt->raw.p && crt->raw.len && c) {
+        unsigned char dig[32];
+        int i;
+        if (mbedtls_sha256(crt->raw.p, crt->raw.len, dig, 0) == 0) {
+            for (i = 0; i < 32; i++) {
+                c->peer_fp[i * 2]     = "0123456789ABCDEF"[dig[i] >> 4];
+                c->peer_fp[i * 2 + 1] = "0123456789ABCDEF"[dig[i] & 0xF];
+            }
+            c->peer_fp[64] = 0;
+        }
+    }
+    *flags = 0;               /* 自签/无 CA 链，忽略其它校验位 */
+    return 0;
+}
+
+/* mbedTLS <-> Vita socket（服务端方向）。先消费嗅探期预读的字节。 */
+static int srv_tls_send(void *ctx, const unsigned char *buf, size_t len)
+{
+    Conn *c = (Conn *)ctx;
+    int r = sceNetSend(c->fd, buf, (unsigned)len, 0);
+    if (r > 0) return r;
+    if (r == 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    if (NET_AGAIN(r)) return MBEDTLS_ERR_SSL_WANT_WRITE;
+    return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+}
+
+static int srv_tls_recv(void *ctx, unsigned char *buf, size_t len)
+{
+    Conn *c = (Conn *)ctx;
+    int r;
+    if (c->p_pos < c->p_n) {                  /* 嗅探时读走的那个字节 */
+        int k = c->p_n - c->p_pos;
+        if ((size_t)k > len) k = (int)len;
+        memcpy(buf, c->p + c->p_pos, (size_t)k);
+        c->p_pos += k;
+        return k;
+    }
+    r = sceNetRecv(c->fd, buf, (unsigned)len, 0);
+    if (r > 0) return r;
+    if (r == 0) return MBEDTLS_ERR_SSL_CONN_EOF;
+    if (NET_AGAIN(r)) return MBEDTLS_ERR_SSL_WANT_READ;
+    /* 对端 RST 等真错误：原样打进日志（否则 mbedTLS 会把它统一报成
+     * INTERNAL_ERROR，日志里只剩 -0x6C00，看不出到底是谁断的）。
+     * 之后按"连接已结束"返回 CONN_EOF，让上层走正常收尾而不是当成协议错误。 */
+    dlog("http: tls bio recv 0x%08X", (unsigned)r);
+    return MBEDTLS_ERR_SSL_CONN_EOF;
+}
+
+/* 本机身份证书/私钥：进程内只解析一次。
+ * 旧实现每次握手都 identity_cert_parse + identity_key_parse（两次 ux0: 读盘 +
+ * PEM/DER 解析），在 333MHz 的 Vita 上是几十到上百毫秒，正好撞在官方客户端
+ * register 的 500ms 预算里。解析结果常驻即可：mbedtls_ssl_conf_own_cert 只保存
+ * 指针，握手期只读（mbedtls_pk_sign 形参是 const），多连接并发共用安全。 */
+static mbedtls_x509_crt   g_own;
+static mbedtls_pk_context g_ownpk;
+static int    g_own_ready = 0;
+static SceUID g_own_mtx = -1;
+
+static int own_identity(void)
+{
+    int rc = 0;
+    if (g_own_ready) return 0;
+    if (g_own_mtx < 0) g_own_mtx = sceKernelCreateMutex("psvsend_tlsown", 0, 0, NULL);
+    if (g_own_mtx >= 0) sceKernelLockMutex(g_own_mtx, 1, NULL);
+    if (!g_own_ready) {
+        mbedtls_x509_crt_init(&g_own);
+        mbedtls_pk_init(&g_ownpk);
+        if (identity_cert_parse(&g_own) != 0 ||
+            identity_key_parse(&g_ownpk) != 0) {
+            /* 身份可能还在后台生成：清掉半成品，下次握手再试 */
+            mbedtls_x509_crt_free(&g_own);
+            mbedtls_pk_free(&g_ownpk);
+            rc = -1;
+        } else {
+            g_own_ready = 1;
+        }
+    }
+    if (g_own_mtx >= 0) sceKernelUnlockMutex(g_own_mtx, 1);
+    return rc;
+}
+
+/* 服务端 TLS 握手（EWOULDBLOCK 轮询 + 总截止）。0=成功 <0=失败。
+ * 身份证书取 per-device identity（首启生成期间 http 尚未启动）。 */
+static int srv_tls_handshake(Conn *c)
+{
+    SceLong64 dl = sceKernelGetSystemTimeWide() + 5 * 1000000LL;
+    int r;
+
+    mbedtls_ssl_init(&c->ssl);
+    mbedtls_ssl_config_init(&c->conf);
+    mbedtls_entropy_init(&c->ent);
+    mbedtls_ctr_drbg_init(&c->drbg);
+    mbedtls_x509_crt_init(&c->ca);
+    c->tls_up = 1;
+
+    if (mbedtls_entropy_add_source(&c->ent, srv_entropy_poll, NULL, 48,
+                                   MBEDTLS_ENTROPY_SOURCE_STRONG) != 0)
+        return -1;
+    if (mbedtls_ctr_drbg_seed(&c->drbg, mbedtls_entropy_func, &c->ent,
+                              (const unsigned char *)"psvsend-http", 12) != 0) {
+        dlog("http: drbg seed fail");
+        return -1;
+    }
+    r = mbedtls_ssl_config_defaults(&c->conf, MBEDTLS_SSL_IS_SERVER,
+                                    MBEDTLS_SSL_TRANSPORT_STREAM,
+                                    MBEDTLS_SSL_PRESET_DEFAULT);
+    if (r != 0) {
+        dlog("http: ssl defaults err -0x%04X", (unsigned)(-r));
+        return -1;
+    }
+    /* 与客户端同一口径锁 TLS1.2：3.x 的 TLS1.3 证书校验不走 per-cert 回调，
+     * 1.2 的语义明确；LocalSend 客户端也支持 1.2。 */
+    mbedtls_ssl_conf_min_version(&c->conf, MBEDTLS_SSL_MAJOR_VERSION_3,
+                                 MBEDTLS_SSL_MINOR_VERSION_3);
+    mbedtls_ssl_conf_max_version(&c->conf, MBEDTLS_SSL_MAJOR_VERSION_3,
+                                 MBEDTLS_SSL_MINOR_VERSION_3);
+    /* 数据面优先 ChaCha20-Poly1305。Vita 的 Cortex-A9 没有 AES/SHA 加速指令，
+     * mbedTLS 的 AES-GCM 与 SHA-384 全靠查表软件实现（实测收体只有 ~1MiB/s）；
+     * ChaCha20 只有加法/异或/移位，同频下快得多。官方客户端（rustls）两种都
+     * 支持；万一对端只给 AES 组，这里保留了 AES-GCM 兜底，不会谈崩。
+     * 顺序由服务端决定（mbedTLS 默认按自己列表取交集）。 */
+    {
+        static const int suites[] = {
+            MBEDTLS_TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            MBEDTLS_TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            0
+        };
+        mbedtls_ssl_conf_ciphersuites(&c->conf, suites);
+    }
+    /* 请求客户端证书但不强制：官方客户端会出示（mTLS），旧客户端没有也能连。
+     * 信任判定（白名单/验证码）以后加在 srv_verify 里。 */
+    mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+    mbedtls_ssl_conf_ca_chain(&c->conf, &c->ca, NULL);
+    mbedtls_ssl_conf_verify(&c->conf, srv_verify, c);
+    mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->drbg);
+
+    if (own_identity() != 0) {
+        dlog("http: identity cert/key parse fail");
+        return -1;
+    }
+    r = mbedtls_ssl_conf_own_cert(&c->conf, &g_own, &g_ownpk);
+    if (r != 0) {
+        dlog("http: own_cert err -0x%04X", (unsigned)(-r));
+        return -1;
+    }
+    if (mbedtls_ssl_setup(&c->ssl, &c->conf) != 0) {
+        dlog("http: ssl setup fail");
+        return -1;
+    }
+    mbedtls_ssl_set_bio(&c->ssl, c, srv_tls_send, srv_tls_recv, NULL);
+
+    for (;;) {
+        if (gen_stale(c->gen)) return -1;
+        if (sceKernelGetSystemTimeWide() >= dl) {
+            dlog("http: tls handshake timeout");
+            return -1;
+        }
+        r = mbedtls_ssl_handshake(&c->ssl);
+        if (r == 0) return 0;
+        if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            sceKernelDelayThread(NET_POLL_US);   /* 握手每个往返都要快，见 NET_POLL_US */
+            continue;
+        }
+        dlog("http: tls handshake err -0x%04X", (unsigned)(-r));
+        return -1;
+    }
+}
+
+/* 嗅探首字节：返回 1=TLS、0=明文、<0=无数据/出错。读到的字节留在 Conn.p，
+ * 由后续读取先消费（丢掉它 TLS 握手会缺第一字节）。 */
+static int conn_detect(Conn *c)
+{
+    SceLong64 dl = sceKernelGetSystemTimeWide()
+                 + (SceLong64)HTTP_RECV_TIMEOUT_S * 1000000LL;
+    for (;;) {
+        int r;
+        if (gen_stale(c->gen)) return -1;
+        r = sceNetRecv(c->fd, c->p, 1, 0);
+        if (r == 1) {
+            c->p_n = 1;
+            c->p_pos = 0;
+            return c->p[0] == 0x16;           /* TLS handshake record */
+        }
+        if (r == 0) return -1;                 /* 对端连上就关 */
+        if (!NET_AGAIN(r)) {
+            dlog("http: sniff err 0x%08X", (unsigned)r);
+            return -1;
+        }
+        if (sceKernelGetSystemTimeWide() >= dl) return -1;
+        sceKernelDelayThread(NET_POLL_US);
+    }
+}
+
+/* 关连接：尽量发 close_notify，释放 mbedTLS 上下文，最后关 fd。
+ * 失败路径上（握手没完成）也安全：init/free 成对即可。 */
+static void conn_close(Conn *c)
+{
+    if (c->tls_up) {
+        if (c->tls) {
+            int i;
+            for (i = 0; i < 10; i++) {
+                int r = mbedtls_ssl_close_notify(&c->ssl);
+                if (r == 0 ||
+                    (r != MBEDTLS_ERR_SSL_WANT_READ &&
+                     r != MBEDTLS_ERR_SSL_WANT_WRITE))
+                    break;
+                sceKernelDelayThread(NET_POLL_US);
+            }
+        }
+        mbedtls_ssl_free(&c->ssl);
+        mbedtls_ssl_config_free(&c->conf);
+        mbedtls_x509_crt_free(&c->ca);
+        mbedtls_ctr_drbg_free(&c->drbg);
+        mbedtls_entropy_free(&c->ent);
+        c->tls_up = 0;
+    }
+    if (c->fd >= 0) sceNetSocketClose(c->fd);
+    c->fd = -1;
+}
 
 /* ---------- upload 大文件的流式读回调（receive 模块轮询调用） ---------- */
 typedef struct {
-    Conn conn;          /* 连接：读经 conn_read（换代/中止由它统一感知） */
+    Conn *conn;         /* 连接：读经 conn_read（换代/中止/TLS 由它统一感知） */
     const char *left;   /* 缓冲里已读但未消费的 body */
     int  llen;
     int  chunked;       /* Transfer-Encoding: chunked（dio 无 CL 流式上传） */
     int  ph;            /* chunked: 0=chunk 大小行 1=chunk 数据 2=终块 trailer */
     int  n_tr;          /* chunked: 终块后已吃的 trailer 行数（上限保护，见下） */
     SceLong64 c_rem;    /* chunked: 当前 chunk 剩余数据字节 */
-    unsigned char sbuf[4096];  /* chunked 解码输入暂存 */
+    unsigned char sbuf[16384]; /* chunked 解码输入暂存：一次尽量吃满一个 TLS 记录
+                                * （16KB），比 4KB 少四分之一的读取/解密往返 */
     int  s_n, s_pos;
 } UploadCtx;
 
-/* 换代感知：http_stop/restart 后旧 worker 的轮询（头/体读取）应尽快收手，
- * 让 http_stop 的有预算 join 能等到它，而不是干耗到 recv 超时。 */
-static inline int gen_stale(int my_gen) { return g_gen != my_gen; }
-
-/* ---------- 连接读写与响应工具（Conn 定义见上） ---------- */
+/* ---------- 连接读写与响应工具 ---------- */
 
 /* 全发 len 字节：20ms 轮询重试窗口，2s 内发不完即失败。0=成功 -1=失败 */
 static int conn_write(Conn *c, const char *data, int len)
@@ -293,11 +589,24 @@ static int conn_write(Conn *c, const char *data, int len)
     int off = 0;
     SceLong64 dl = sceKernelGetSystemTimeWide() + 2000000LL; /* 2s */
     while (off < len) {
-        int r = sceNetSend(c->fd, data + off, (unsigned)(len - off), 0);
+        int r;
+        if (c->tls) {
+            r = mbedtls_ssl_write(&c->ssl, (const unsigned char *)data + off,
+                                  (size_t)(len - off));
+            if (r > 0) { off += r; continue; }
+            if (r == MBEDTLS_ERR_SSL_WANT_READ ||
+                r == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                if (sceKernelGetSystemTimeWide() >= dl) return -1;
+                sceKernelDelayThread(NET_POLL_US);
+                continue;
+            }
+            return -1;
+        }
+        r = sceNetSend(c->fd, data + off, (unsigned)(len - off), 0);
         if (r > 0) { off += r; continue; }
         if (r == 0 || sceKernelGetSystemTimeWide() >= dl) return -1;
         if (!NET_AGAIN(r)) return -1;
-        sceKernelDelayThread(NET_RETRY_DELAY_US); /* 发窗口没空，等会儿再试 */
+        sceKernelDelayThread(NET_POLL_US);   /* 发窗口没空，等会儿再试 */
     }
     return 0;
 }
@@ -310,16 +619,43 @@ static int conn_write(Conn *c, const char *data, int len)
 static int conn_read(Conn *c, void *buf, int max, SceLong64 deadline,
                      unsigned flags)
 {
+    int spins = 0;      /* 连续"暂无数据"次数：真机实测每个 TLS 记录后面常紧跟
+                         * 一次 EWOULDBLOCK，若每次都睡 1ms 就等于给每个 16KB
+                         * 记录摊 1ms（148MB 收体多花约 9s）。先让出 CPU 空转几
+                         * 轮（数据通常几微秒内到），仍没有才退回 1ms 长睡。 */
     for (;;) {
         int r;
         if (gen_stale(c->gen)) return -1;                   /* 换代：收手 */
         if ((flags & CONN_F_ABORTABLE) && recv_abort_q()) return -1;
+        if (c->p_pos < c->p_n) {                            /* 嗅探时预读的字节 */
+            int k = c->p_n - c->p_pos;
+            if (k > max) k = max;
+            memcpy(buf, c->p + c->p_pos, (size_t)k);
+            c->p_pos += k;
+            return k;
+        }
+        if (c->tls) {
+            r = mbedtls_ssl_read(&c->ssl, buf, (size_t)max);
+            if (r > 0) return r;
+            if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
+            if (r == MBEDTLS_ERR_SSL_WANT_READ ||
+                r == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                if (sceKernelGetSystemTimeWide() >= deadline) return -2;
+                if (++spins <= 8) sceKernelDelayThread(0);
+                else sceKernelDelayThread(NET_POLL_US);
+                continue;
+            }
+            if (r == MBEDTLS_ERR_SSL_CONN_EOF) return 0;
+            dlog("http: tls read err -0x%04X", (unsigned)(-r));
+            return -1;
+        }
         r = sceNetRecv(c->fd, buf, (unsigned)max, 0);
         if (r > 0) return r;
         if (r == 0) return 0;
         if (!NET_AGAIN(r)) { dlog("http: recv err 0x%08X", (unsigned)r); return -1; }
         if (sceKernelGetSystemTimeWide() >= deadline) return -2;
-        sceKernelDelayThread(NET_RETRY_DELAY_US);
+        if (++spins <= 8) sceKernelDelayThread(0);
+        else sceKernelDelayThread(NET_POLL_US);
     }
 }
 
@@ -361,7 +697,7 @@ static int u_refill(UploadCtx *u)
         u->s_n = k;
         return 1;
     }
-    r = conn_read(&u->conn, u->sbuf, (int)sizeof u->sbuf,
+    r = conn_read(u->conn, u->sbuf, (int)sizeof u->sbuf,
                   sceKernelGetSystemTimeWide() + UPLOAD_IDLE_US,
                   CONN_F_ABORTABLE);
     if (r > 0) { u->s_n = r; return 1; }
@@ -435,7 +771,11 @@ static int chunked_stream(void *ctx, unsigned char *out, int max)
             }
             on += need;
             if (u->c_rem == 0) u->ph = 2;        /* 块完：下一轮先吃块尾 */
-            return on;
+            /* 不在这里返回：对端每个 chunk 往往只有几 KB~16KB，逐块返回会让
+             * receive 每收一小块就 sceIoWrite 一次，ux0: 的小块写吞吐只有
+             * ~2MiB/s（明文 4MiB/s 腰斩的主因）。继续拼下一个 chunk，直到
+             * out 攒满（调用者给 64KB）再返回，写盘次数降到 1/4~1/16。 */
+            if (on >= max) return on;
         } else if (u->ph == 2) {                 /* 数据块后的块尾 "\r\n" */
             char line[16];
             int r = u_readline(u, line, sizeof line);
@@ -464,7 +804,7 @@ static int upload_stream(void *ctx, unsigned char *buf, int max)
         u->llen -= k;
         return k;
     }
-    r = conn_read(&u->conn, buf, max,
+    r = conn_read(u->conn, buf, max,
                   sceKernelGetSystemTimeWide() + UPLOAD_IDLE_US,
                   CONN_F_ABORTABLE);
     if (r > 0) return r;
@@ -551,7 +891,7 @@ static void h_prepare(HttpReq *r)
     }
     {
         int code = g_recv->prepare(body, r->ip, resp, (int)sizeof resp);
-        dlog("http: prepare -> %d", code);
+        dlog("http: prepare -> %d (tls=%d)", code, r->cn->tls);
         http_respond(r->cn, code, reason_of(code), resp);
     }
 }
@@ -574,7 +914,7 @@ static void h_upload(HttpReq *r)
         dlog("http: upload hdr: %s |cl=%lld", dbg, (long long)r->cl64);
     }
     memset(&uctx, 0, sizeof uctx);       /* 含 chunked 解码状态 */
-    uctx.conn = *r->cn;                  /* fd + 所属代次 */
+    uctx.conn = r->cn;                   /* 连接句柄（TLS/代次由 conn_read 统一感知） */
     uctx.left = r->left;
     uctx.llen = r->llen;
     if (r->cl64 <= 0) {                  /* 无 CL：dio 流式上传 → chunked */
@@ -587,9 +927,10 @@ static void h_upload(HttpReq *r)
         return;
     }
     if (uctx.chunked) {
-        dlog("http: upload chunked (no content-length)");
+        dlog("http: upload chunked (no content-length) tls=%d", r->cn->tls);
         code = g_recv->upload(r->query, r->ip, -1, upload_stream, &uctx);
     } else {
+        dlog("http: upload bytes cl=%lld tls=%d", (long long)r->cl64, r->cn->tls);
         code = g_recv->upload(r->query, r->ip, r->cl64, upload_stream, &uctx);
     }
     dlog("http: upload -> %d", code);
@@ -794,12 +1135,40 @@ static int conn_worker(SceSize args, void *argp)
         return 0;
     }
     {
-        Conn cn;                     /* 本连接的读写句柄（TLS 化时在此挂上下文） */
+        Conn cn;                     /* 本连接的读写句柄（明文 fd 或 TLS 上下文） */
+        int ok = 0;
+        int t;
+        SceLong64 t_hs;              /* 握手起点：官方客户端 register 总预算只有 500ms，
+                                      * 这行耗时是发现成败的直接指标 */
+        memset(&cn, 0, sizeof cn);
         cn.fd = c;
         cn.gen = my_gen;
         dlog("http: worker %d serves conn from %s (gen %d)",
              (int)me, ip, my_gen);
-        handle_conn(&cn, ip, my_gen);
+        /* 单端口双栈：首字节 0x16=TLS。嗅探失败（对端连上不发数据）就直接
+         * 关；TLS 握手失败也不进去——流已经是乱的了。 */
+        t_hs = sceKernelGetSystemTimeWide();
+        t = conn_detect(&cn);
+        if (t < 0) {
+            dlog("http: conn from %s no request byte", ip);
+        } else if (t == 0) {
+            ok = 1;
+        } else if (srv_tls_handshake(&cn) != 0) {
+            dlog("http: tls handshake failed from %s", ip);
+        } else {
+            const char *cs;
+            cn.tls = 1;
+            cs = mbedtls_ssl_get_ciphersuite(&cn.ssl);
+            /* 协商结果 + 对端叶证书指纹 + 握手耗时（基线：预算 500ms，
+             * 握手超过 ~350ms 就会把 register 挤掉，客户端随即降级/放弃） */
+            dlog("http: tls up from %s in %d ms (%s) peer=%s", ip,
+                 (int)((sceKernelGetSystemTimeWide() - t_hs) / 1000),
+                 cs ? cs : "?",
+                 cn.peer_fp[0] ? cn.peer_fp : "-");
+            ok = 1;
+        }
+        if (ok) handle_conn(&cn, ip, my_gen);
+        conn_close(&cn);             /* close_notify + 释放上下文 + 关 fd */
     }
 
     conn_lock();
@@ -812,7 +1181,6 @@ static int conn_worker(SceSize args, void *argp)
         }
     }
     conn_unlock();
-    sceNetSocketClose(c);            /* 换代也照关：见上方头注（不关 = 泄漏 fd） */
     dlog("http: worker %d done", (int)me);
     sceKernelExitDeleteThread(0);
     return 0;
@@ -848,8 +1216,11 @@ static int spawn_conn(int c, const char *ip)
     memcpy(g_conns[i].ip, ip, 16);
     conn_unlock();
 
+    /* 允许跑在所有用户核上：TLS 的 RSA/ECDHE 与收体解密都是纯 CPU 活，
+     * 钉在一个核上会和 UI 渲染互抢（真机表现为握手 400ms+、吞吐腰斩）。 */
     t = sceKernelCreateThread("psvsend_httpc", conn_worker, 0x40,
-                              HTTP_CONN_STACK, 0, 0, NULL);
+                              HTTP_CONN_STACK, 0, SCE_KERNEL_CPU_MASK_USER_ALL,
+                              NULL);
     if (t < 0) {
         dlog("http: worker create fail 0x%08X from %s", (unsigned)t, ip);
         conn_lock();
@@ -889,7 +1260,10 @@ static int http_thr(SceSize args, void *argp)
         if (c < 0) {
             if (!g_run || g_gen != my_gen) break;      /* 停机/换代：收手 */
             if (c == 0x80410123) {                     /* 空闲空转（非阻塞 accept） */
-                sceKernelDelayThread(50000);
+                /* 2ms：官方客户端 register 的总预算只有 500ms
+                 * （DEFAULT_DISCOVERY_TIMEOUT），这里每多睡 50ms 就直接从
+                 * 握手预算里扣。空转唤醒的开销可以忽略。 */
+                sceKernelDelayThread(2000);
                 continue;
             }
             errs++;
@@ -1016,6 +1390,13 @@ int http_start(void)
             }
         }
     }
+    /* 预热身份解析（证书 DER + RSA 私钥）：mbedtls_pk_parse_key 要先解 DER 再
+     * 补算 RSA 的 CRT 参数，在 333MHz 上要几十到上百毫秒。官方客户端的第一次
+     * 探测往往就在开机后几秒内，这段成本若留在握手关键路径上会直接吃掉
+     * register 的 500ms 预算（对端放弃 → 设备从列表消失）。首启身份还在后台
+     * 生成时跳过，让握手自己按 identity_wait_ready 等。 */
+    if (!identity_pending() && own_identity() != 0)
+        dlog("http: identity warm failed (retry on first handshake)");
     dlog("http: up on port %d", g_port);
     return g_port;
 }

@@ -180,7 +180,7 @@ static void announce_payload(char *out, int n)
     snprintf(out, n,
              "{\"alias\":\"%s\",\"version\":\"2.0\","
              "\"deviceModel\":\"PlayStation Vita\",\"deviceType\":\"mobile\","
-             "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"http\","
+             "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"https\","
              "\"download\":true,\"announce\":true}",
              ae, fe, port > 0 ? port : DISC_PORT);
 }

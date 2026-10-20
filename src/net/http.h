@@ -1,6 +1,8 @@
-/* 迷你 HTTP 服务器（discovery/收发共用，见 http.c）。
+/* 迷你 HTTP/HTTPS 服务器（discovery/收发共用，见 http.c）。
+ * 同一端口同时服务 TLS（出示本机 per-device 身份证书，兼容官方 2026 mTLS
+ * 客户端）与明文 HTTP（旧客户端/调试）：worker 按首字节 0x16 自动识别。
  * 真机事实：Vita 系统保留 53317 端口（TCP/UDP 都 EACCES），组播也收不了，
- * 所以本模块在【可绑定】的候选端口上提供 LocalSend v2 HTTP 端点：
+ * 所以本模块在【可绑定】的候选端口上提供 LocalSend v2 端点：
  *   POST /api/localsend/v2/register     —— 别人听到我们的 announce 后会 POST
  *                                           自己信息过来；我们把 body 交给注册
  *                                           回调（discovery 记入设备表），并回
