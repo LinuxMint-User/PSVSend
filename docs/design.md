@@ -9,8 +9,8 @@
 
 ### 实现现状（2026-09）
 
-- **已落地（发送方向）**：UDP 组播发现 / register 入表 → UI 选设备、浏览 ux0 选文件 → `transfer.c` 按对方 announce 的 protocol 走 HTTP 明文或 HTTPS（mbedTLS 3.6.5、锁定 TLS1.2）执行 `prepare-upload` / `upload`，带进度回写与本地取消。HTTPS 连接自动出示内嵌设备身份证书（mTLS，应对 2026 官方 Rust 内核接收端强制客户端证书），并按对方指纹锁定其证书（详见 §3 决策表）。**发送体读/发双缓冲流水**（d182，见 §4.3/§4.5）：读盘与加密发送各占一条线程，实测 3.53 → **4.66MiB/s**，已到裸 TCP 上行标定上限。
-- **已落地（接收方向）**：对方 prepare-upload → 自动弹接收确认页（Accept / Setup 逐文件勾选 / Reject）→ upload 由 http.c 提供流读回调、receive.c 边收边写 `ux0:data/psvsend/downloads/`（先 `.psvsend.tmp` 收完改名，sha256 可选校验，断流/校验失败删残留，开机清扫遗留）。兼容对方无 Content-Length 的 **chunked 流式上传**（http.c 内嵌解码状态机）；同一会话内多文件由对方**并发**发起 upload，接收侧按文件独立流式收体（每文件各自 busy 状态，互不阻塞；d68 修复了 v2.1.0 起后到文件被 409 拒绝的缺陷）。取消/放弃/空闲超时等状态经快照接口给 UI 展示结束原因。announce 已声明 `download:true`。
+- **已落地（发送方向）**：UDP 组播发现 / register 入表 → UI 选设备、浏览 ux0 选文件 → `transfer.c` 按对方 announce 的 protocol 走 HTTP 明文或 HTTPS（mbedTLS 3.6.5、锁定 TLS1.2）执行 `prepare-upload` / `upload`，带进度回写与本地取消。HTTPS 连接自动出示内嵌设备身份证书（mTLS，应对 2026 官方 Rust 内核接收端强制客户端证书），并按对方指纹锁定其证书（详见 §3 决策表）。**发送体读/发双缓冲流水**（d182，见 §4.3/§4.5）：读盘与加密发送各占一条线程，实测 3.53 → **4.66MiB/s**，已到裸 TCP 上行标定上限。**发送前 sha256 校验**（d185）：设置项 `sendSha` 默认开，预扫后把每文件 sha256 写进 `prepare-upload`；预扫同样是读+哈希双线程流水（实测 8.41MiB/s，串行只有 4.65），进度显示在发送等待页（按文件个数均分的分段进度条 + 当前文件 x/N）。
+- **已落地（接收方向）**：对方 prepare-upload → 自动弹接收确认页（Accept / Setup 逐文件勾选 / Reject）→ upload 由 http.c 提供流读回调、receive.c 边收边写 `ux0:data/psvsend/downloads/`（先 `.psvsend.tmp` 收完改名，sha256 校验，断流/校验失败删残留，开机清扫遗留）。sha256 校验由设置项 `recvSha` 控制（d186，默认开）：开启时与写盘/解密三级并行、实测零墙钟成本；关闭后不比对也不起校验线程（用途是对端哈希实现有误时不被 422 拒收）。兼容对方无 Content-Length 的 **chunked 流式上传**（http.c 内嵌解码状态机）；同一会话内多文件由对方**并发**发起 upload，接收侧按文件独立流式收体（每文件各自 busy 状态，互不阻塞；d68 修复了 v2.1.0 起后到文件被 409 拒绝的缺陷）。取消/放弃/空闲超时等状态经快照接口给 UI 展示结束原因。announce 已声明 `download:true`。
 - **已落地（接收方向 TLS 化，d173~d180）**：http.c 服务器改为**单端口双栈**——worker 先 `sceNetRecv(fd,p,1,0)` 嗅探首字节，`0x16`（TLS handshake record）走 mbedTLS 服务端握手，否则按明文 HTTP 解析（嗅探字节缓存在 `Conn.p`，不丢包）。服务端出示同一张设备身份证书，announce / self_info / prepare 三处统一声明 `protocol:https` + 该证书指纹；TLS 锁 1.2，密码套件优先 **ChaCha20-Poly1305**（Cortex-A9 无 AES/SHA 硬件指令，AES-GCM 实测慢约 20%），再回退 AES-128/256-GCM。信任 **trust-first**：`VERIFY_OPTIONAL` + 空 CA 占位，`srv_verify` 只记对端指纹、`*flags = 0`（不拒绝），**不防主动 MITM**，白名单 / 验证码后置（§9）。**握手去关键路径**（d175）：设备身份（解析证书 + RSA CRT）改为全局解析一次并在启动预热，握手内不写 dlog（dlog 是同步写 ux0，每次几十毫秒）——握手 447~521ms → **230~250ms**，稳定进官方 register 请求的 500ms 总预算，官方客户端重新能主动发现 / 扫描到 PSV。**数据面分线程**（d177，见 §4.3）：收体解密与写盘 / sha256 校验重叠，实测 2.81 → **3.60MiB/s**。**三级流水**（d180）：解密 / sha256 / 写盘各占一条线程、3×64KB 轮转缓冲，sha 与写盘处理不同块真正重叠，实测 **5.21MiB/s**（148.6MB / 27.2s），瓶颈已转移到 socket 收 + TLS 解密本身（等价 ~5.58MiB/s），ux0 写与 SHA-256 都不再是上限。
 - **已落地（发现补充）**：Vita 收不了 UDP 组播、也绑不了 53317，设备表主要靠对方主动 register 与 `scan.c` 主动扫描（向 /24 各 IP 的 53317 POST register 拿 member info）。扫描按 **TLS→明文顺序**探测并携带设备身份证书（2026 官方 Rust 内核接收端强制 mTLS 客户端证书），明文兜底兼容纯 HTTP 端；**优先探测历史在线设备**（config `knownIps` 持久化、LRU、上限 24，入表即记录），常用设备实测轮次开始 ~0.7s 内出现。曾修复两处致手动扫描失效的 bug：`s_read_resp` 未把响应 body 移到缓冲区头部（JSON 解析永远失败、found 恒 0）；TLS 探测静默失败。UI 三角键手动触发。
 - 实现边界的完整清单（忙时 409 / 每连接 worker 上限 8、清单 64 文件/32KB、超时 60s/120s/30s 三档、/24 扫描范围、trust-first 不防主动 MITM 等）见 README「边界与已知限制」。
@@ -141,6 +141,7 @@ typedef struct {
 | HTTP 服务器线程 | accept 循环，**每连接一个工作线程**（LocalSend 并行传多文件）；工作线程内先做 **TLS / 明文嗅探**（首字节 `0x16`），TLS 连接现场做服务端握手 |
 | 收体流水线线程（recv） | 每个 upload 起两条（有 sha256 时）或一条：生产者只做解密 / 攒块，**sha 线程**只算校验和，**写盘线程**只 `sceIoWrite`；3×64KB 轮转缓冲 + `sem_free`/`sem_sha`/`sem_job` 计数信号量，块逐级传递、sha 与写盘处理不同块（d180，三级流水） |
 | 发送线程（xfer） | `prepare-upload` 一条连接等对方决定；接受后起 N 个 worker 线程并发上传（N = config `maxParallel`，上限 6），join 完全部 worker 后**统一写一次终态**（见 §1「实现现状」）。每个文件另起一条**读盘线程**，worker 本线程只做 `mbedtls_ssl_write`：2×32KB 轮转缓冲 + `sem_free`/`sem_full` 计数信号量，读满声明 size（或读失败）投 `len=0` 终止块（d182，读/发双缓冲流水） |
+| 预扫线程（xfer，d185） | `prepare-upload` 之前按文件顺序算 sha256（设置项 `sendSha` 默认开）：一条读盘线程 + xfer 线程自身做 `mbedtls_sha256_update`，缓冲结构与发送侧同一套（2×32KB 轮转）。每条线程各自跑满（读 9.7 / 哈希 8.8MiB/s），合流实测 8.41MiB/s |
 | 定时器（可并入发现线程） | 设备超时清理、announce 周期触发 |
 
 共享数据（设备表、会话表）统一 mutex 保护。
@@ -179,6 +180,7 @@ void on_session_done(const Session *s);      // 完成 / 失败
 - 流程：register（可选）→ `prepare-upload` 拿 session（只有这一条连接）→ N 个 worker 并发 `POST upload`（协议 §4.2 明示 `This route can be called in parallel.`）→ cancel 清理
 - 按**接收端 announce 的 protocol / port 字段**决定 http/https 与端口——明文即可互通
 - 上传：32KB 分块，**读盘与加密发送各一条线程**（2×32KB 轮转 + 信号量，d182）；发送窗口没空时先让出 CPU 8 轮、再退避 1ms（原文 20ms，约四成块会撞一次）。**每个文件一条连接**，故每文件各做一次 TLS 握手（N 并在途，握手也并行）
+- **发送前校验**（d185）：设置项 `sendSha` 默认开时，`prepare-upload` 之前先按文件顺序预扫 sha256（读+哈希双线程，8.41MiB/s ≈ 12s/100MB），结果逐文件写入请求的 `sha256` 字段；关闭则字段为 `null`，与旧版行为一致。预扫进度显示在发送等待页（按文件数均分的分段进度条 + x/N），可按 ○ 取消（此时 prepare 尚未发出）
 - 失败分级：HTTP 4xx/5xx / 无 token / 读文件失败 = 单文件失败（其余继续）；连不上 / 握手失败 / 断流 / 等不到回执 = 连接级失败 → **全局中止**（详见 §1「实现现状」）
 
 ### 4.7 实现顺序与验证
@@ -354,4 +356,5 @@ src/ui/
 - [x] 多文件接收中途取消的竞态：已修复（收满优先于取消判断）——正在传的文件若已收满则以「用户取消」收尾并保留完整，未收满才清理其残 `.psvsend.tmp`；前 N-1 个完整文件始终保留（细节见 README「边界 / 接收」）
 - [x] GPU render crash（界面撕裂后偶发崩溃）：已修复——根因为主循环缺 `vita2d_wait_rendering_done()`（GPU 队列无逐帧收敛点），2026-09 真机多轮复测通过（细节见 §1「实现现状」渲染稳定条目与 README「当前状态」）
 - [x] **发送方向吞吐**：已落地（2026-10-20 d182，见 §4.3/§4.5/§4.6）——读盘与加密发送拆两条线程（2×32KB 轮转 + `sem_free`/`sem_full`），`WANT_WRITE` 退避从每次睡 20ms 改为"先让出 CPU 8 轮、再 1ms"（对齐接收侧 `conn_read`）；每文件日志补 `read/send/wait` 分段计时。实测 148.6MB：3.53 → **4.66MiB/s**（整段 31.2s vs 旧 40.2s；发送体 28.8s = 4.92MiB/s），已达 d181 裸 TCP 上行标定上限（4.72~4.85MiB/s），无进一步空间
+- [x] **sha256 校验（发送 / 接收）**：已落地（2026-10-20 d185/d186，见 §1/§4.3/§4.6）——与官方 `createChecksums` / `verifyChecksums` 对齐，两项默认开。**发送**：`prepare-upload` 前预扫，读+哈希双线程流水 8.41MiB/s（串行 4.65），约 12s/100MB，等待页有分段进度条与 x/N。**接收**：校验线程与解密/写盘三级并行，实测零墙钟成本（d180 `sha=17.9s` 全藏在 28.1s 传输窗口内），不匹配回 422 且不落正式文件；关闭开关则不起线程、不比对（对端哈希实现有误时的逃生舱）
 - [x] **接收方向 TLS 化**：已落地（2026-10-20 d173~d180，见 §1「实现现状」与 §3/§4.5）——单端口双栈（首字节 `0x16` 判 TLS）+ 服务端出示设备身份证书 + trust-first + ChaCha20-Poly1305 优先；握手 240ms 稳定进官方 register 预算，接收吞吐 2.81 → 3.60（d177）→ **5.21MiB/s**（d180 三级流水）。**遗留**：服务端不验证对端（不防主动 MITM），设备指纹白名单 / 验证码未做（见下条）
