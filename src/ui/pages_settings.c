@@ -28,6 +28,7 @@ enum {
     SET_ITEM_KEY,          /* 操作：确认键布局 */
     SET_ITEM_PANE,         /* 操作：主页两栏布局（设备在左 / 文件在左） */
     SET_ITEM_PARALLEL,     /* 操作：并发上传数（发送侧同时上传的文件数 1-6） */
+    SET_ITEM_SEND_SHA,     /* 操作：发送前计算 sha256（关掉即与旧版一致） */
     SET_ITEM_HOSTNAME,     /* 设备：主机名（改名走系统键盘） */
     SET_ITEM_SAVEDIR,      /* 存储：默认保存目录（动作行：进目录选择器并落盘） */
     SET_ITEM_CHECK,        /* 更新：检查更新（动作行：按任意键/点任意半即查） */
@@ -48,6 +49,7 @@ enum {
     SET_SLOT_KEY,
     SET_SLOT_PANE,
     SET_SLOT_PARALLEL,
+    SET_SLOT_SEND_SHA,     /* 操作：发送前计算 sha256 */
     SET_SLOT_HDR_ST,       /* 分组：存储 */
     SET_SLOT_SAVEDIR,
     SET_SLOT_HDR_UPD,      /* 分组：更新 */
@@ -114,6 +116,7 @@ static int slot_item(int slot)
     case SET_SLOT_KEY:   return SET_ITEM_KEY;
     case SET_SLOT_PANE:  return SET_ITEM_PANE;
     case SET_SLOT_PARALLEL: return SET_ITEM_PARALLEL;
+    case SET_SLOT_SEND_SHA: return SET_ITEM_SEND_SHA;
     case SET_SLOT_SAVEDIR: return SET_ITEM_SAVEDIR;
     case SET_SLOT_CHECK: return SET_ITEM_CHECK;
     case SET_SLOT_AUTO:  return SET_ITEM_AUTO;
@@ -133,6 +136,7 @@ static int item_slot(int item)
     case SET_ITEM_KEY:      return SET_SLOT_KEY;
     case SET_ITEM_PANE:     return SET_SLOT_PANE;
     case SET_ITEM_PARALLEL: return SET_SLOT_PARALLEL;
+    case SET_ITEM_SEND_SHA: return SET_SLOT_SEND_SHA;
     case SET_ITEM_CHECK:    return SET_SLOT_CHECK;
     case SET_ITEM_AUTO:     return SET_SLOT_AUTO;
     }
@@ -220,6 +224,7 @@ static int set_opt_count(int item)
     case SET_ITEM_KEY:      return 2;
     case SET_ITEM_PANE:     return 2;
     case SET_ITEM_PARALLEL: return PARALLEL_MAX - PARALLEL_MIN + 1;
+    case SET_ITEM_SEND_SHA: return 2;
     case SET_ITEM_AUTO:     return 4;
     }
     return 0;
@@ -249,6 +254,9 @@ static void set_opt_name(int item, int idx, char *buf, int n)
     case SET_ITEM_PARALLEL:
         snprintf(buf, n, "%d", PARALLEL_MIN + idx);
         break;
+    case SET_ITEM_SEND_SHA:
+        snprintf(buf, n, "%s", tr(idx ? "On" : "Off"));
+        break;
     case SET_ITEM_AUTO:
         snprintf(buf, n, "%s", tr(set_upd_mode[idx]));
         break;
@@ -268,6 +276,7 @@ static int set_opt_cur(int item)
     case SET_ITEM_KEY:      return g_app.confirm_layout ? 1 : 0;
     case SET_ITEM_PANE:     return g_app.pane_swap ? 1 : 0;
     case SET_ITEM_PARALLEL: return g_cfg.max_parallel - PARALLEL_MIN;
+    case SET_ITEM_SEND_SHA: return g_cfg.send_sha ? 1 : 0;
     case SET_ITEM_AUTO:     return g_cfg.upd_auto;
     }
     return 0;
@@ -309,6 +318,11 @@ static void set_opt_apply(int item, int idx)
         /* 1 = 逐文件串行；只影响"下一次"发送——正在跑的那次传输已在启动时定好
          * worker 数（xfer_thr 读的是一份值）。 */
         config_set_max_parallel(PARALLEL_MIN + idx);
+        break;
+    case SET_ITEM_SEND_SHA:
+        /* 只影响"下一次"发送（发送线程启动时读一次） */
+        g_cfg.send_sha = idx;
+        config_save();
         break;
     case SET_ITEM_AUTO:
         config_set_upd_auto(idx);
@@ -385,6 +399,7 @@ static const char *set_item_title(int item)
     case SET_ITEM_KEY:      return tr("Confirm key");
     case SET_ITEM_PANE:     return tr("Layout");
     case SET_ITEM_PARALLEL: return tr("Parallel uploads");
+    case SET_ITEM_SEND_SHA: return tr("Send checksum");
     case SET_ITEM_AUTO:     return tr("Auto check");
     }
     return "";
@@ -471,7 +486,7 @@ static void set_row_activate(int item)
 void page_settings_render(void)
 {
     char theme_v[64], light_v[32], layout_v[96], lang_v[32], pane_v[32];
-    char par_v[32];
+    char par_v[32], sha_v[16];
     char upd_v[64];
     int upd_st = update_state();
     int slot, shrink;
@@ -496,6 +511,7 @@ void page_settings_render(void)
     snprintf(pane_v, sizeof pane_v, "%s",
              g_app.pane_swap ? tr("Files left") : tr("Devices left"));
     snprintf(par_v, sizeof par_v, "%d", g_cfg.max_parallel);
+    snprintf(sha_v, sizeof sha_v, "%s", tr(g_cfg.send_sha ? "On" : "Off"));
     upd_v[0] = 0;
     switch (upd_st) {
     case UPD_WORKING:
@@ -614,6 +630,26 @@ void page_settings_render(void)
             /* 并发上传数：只看数字即可（1 = 一次传一个文件） */
             w_row(r, tr("Parallel uploads"), par_v, item == g_app.set_sel);
             break;
+        case SET_ITEM_SEND_SHA: {
+            /* 两行：主行标签 + 开关值，副行只提示"会多花时间"（具体数值留给
+             * 进度页去展示，设置行里写死秒数既啰嗦又与实际文件大小脱节）。
+             * 右值按整行高度垂直居中，不跟主行文字顶对齐（否则偏上）。 */
+            RowGeom g;
+            int tw = 0, th = 0;
+            uint32_t card = item == g_app.set_sel ? theme->accent : theme->card;
+            uint32_t tc = item == g_app.set_sel ? theme->accent_text : theme->text;
+            uint32_t dc = item == g_app.set_sel ? theme->accent_text : theme->text_dim;
+            w_rect(r, card);
+            row_geom(r, ROW_2LINE, 96 + ROW_GAP, &g);
+            w_text_clip(g.x_text, g.y_main, g.main_sc, tc, tr("Send checksum"),
+                        g.w_text);
+            w_text_w(g.sub_sc, sha_v, &tw, &th);
+            (void)tw;                    /* 右对齐由 w_text_right 自己量宽，只要 th */
+            w_text_right(g.x_right, r.y + (r.h - th) / 2, g.sub_sc, tc, "%s", sha_v);
+            w_text_clip(g.x_text, g.y_sub, g.sub_sc, dc,
+                        tr("Checksumming takes extra time"), g.w_text);
+            break;
+        }
         case SET_ITEM_CHECK:
             /* 动作行：右侧显示检查状态；发现新版时用 accent 强调 */
             if (upd_st == UPD_NEW)

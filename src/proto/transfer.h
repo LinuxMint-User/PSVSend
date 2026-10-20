@@ -38,6 +38,11 @@ typedef struct {
     int     pin_need;       /* 0=无 1=对方要求 PIN（UI 弹键盘）2=上次 PIN 不对 */
     SceOff  total;          /* 总字节 */
     SceOff  total_sent;     /* 已发字节 */
+    bool    hashing;        /* 发送前的 sha256 预扫阶段（进度条按 hash_done 走） */
+    int     hash_cur;       /* 正在算校验的文件下标（-1=无） */
+    SceOff  hash_done;      /* 预扫已读字节（整批） */
+    SceOff  hash_cur_done;  /* 当前文件已扫字节（分段进度条用） */
+    SceOff  hash_total;     /* 预扫总字节（= total） */
     uint64_t start_us;      /* 启动时刻（sceKernelGetSystemTimeWide） */
     char    msg[96];        /* 状态行：等待接受/上传中/已完成/失败原因 */
     char    err[160];       /* 失败详情（无失败为空串） */

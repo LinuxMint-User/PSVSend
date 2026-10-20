@@ -82,6 +82,7 @@ typedef struct {
     int        count;
     char       session[64];          /* prepare 应答的会话 ID */
     char       tokens[XFER_MAX_FILES][64];
+    char       sha[XFER_MAX_FILES][65]; /* 预扫得到的 sha256（hex，空=不带） */
 } Job;
 
 static Job    g_j;
@@ -765,7 +766,9 @@ static int jcat(char *b, int cap, int o, const char *fmt, ...)
  * 任何一段装不下就返回 NULL：宁可不发，也不发一个截断的 JSON 出去。 */
 static char *build_prepare_json(void)
 {
-    int cap = TX_SOCK_BUF + XFER_MAX_FILES * 420;
+    /* 单文件上限按最坏情况给足：128 字节文件名（转义后 2×）+ sha256(64) + 固定字段。
+     * 早期 420 在带 sha256 后会把长名文件挤出上限，导致整份 JSON 拒发。 */
+    int cap = TX_SOCK_BUF + XFER_MAX_FILES * 560;
     char al[sizeof g_cfg.alias], fp[65];
     char ae[2 * sizeof g_cfg.alias], fe[2 * 65];
     char *b = (char *)malloc((size_t)cap);
@@ -785,11 +788,17 @@ static char *build_prepare_json(void)
              ae, fe, http_port());
     for (i = 0; o >= 0 && i < g_j.count; i++) {
         char esc[2 * 128 + 8];
+        char sh[80];
         json_escape(g_j.files[i].name, esc, sizeof esc);
+        /* sha256 是协议里的可空字段：算了才带（设置页开关，默认开）。
+         * 带与不带的差别只是接收端是否校验，不影响传输本身。 */
+        sh[0] = 0;
+        if (g_j.sha[i][0])
+            snprintf(sh, sizeof sh, ",\"sha256\":\"%s\"", g_j.sha[i]);
         o = jcat(b, cap, o,
                  "%s\"f%d\":{\"id\":\"f%d\",\"fileName\":\"%s\","
-                 "\"size\":%lld,\"fileType\":\"application/octet-stream\"}",
-                 i ? "," : "", i, i, esc, (long long)g_j.files[i].size);
+                 "\"size\":%lld,\"fileType\":\"application/octet-stream\"%s}",
+                 i ? "," : "", i, i, esc, (long long)g_j.files[i].size, sh);
     }
     o = jcat(b, cap, o, "}}");
     if (o < 0) {                             /* 装不下：别发截断的 JSON */
@@ -874,6 +883,141 @@ static void tx_pipe_stop(TxPipe *p, int started)
     p->buf = NULL;
 }
 
+/* 起"读线程 + 本线程消费"的双缓冲流水。
+ * 返回 0=已起（消费方按 sem_full 取块）、1=零字节（无需流水线）、<0=建不起来。
+ * 消费方负责调 tx_pipe_stop（started=0 时也能安全清理）。 */
+static int tx_pipe_start(TxPipe *p, SceUID fd, SceOff size)
+{
+    int started = 0;
+    memset(p, 0, sizeof *p);
+    p->fd = fd;
+    p->thr = p->sem_free = p->sem_full = -1;
+    p->remain = size;
+    if (size <= 0) return 1;
+    p->buf = (char *)malloc((size_t)TX_CHUNK * TX_BLOCKS);
+    if (p->buf)
+        p->sem_free = sceKernelCreateSema("psvsend_sfree", 0, TX_BLOCKS, TX_BLOCKS, NULL);
+    if (p->sem_free >= 0)
+        p->sem_full = sceKernelCreateSema("psvsend_sfull", 0, 0, TX_BLOCKS, NULL);
+    if (p->sem_full >= 0)
+        p->thr = sceKernelCreateThread("psvsend_rd", tx_reader, 0x40, 0x20000, 0,
+                                       SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
+    if (p->thr >= 0) {
+        TxPipe *pp = p;
+        started = sceKernelStartThread(p->thr, sizeof pp, &pp) >= 0;
+    }
+    if (!started) {
+        dlog("xfer: pipeline setup fail (thr=%d sem=%d/%d buf=%d)", (int)p->thr,
+             (int)p->sem_free, (int)p->sem_full, p->buf != NULL);
+        tx_pipe_stop(p, 0);
+        return -1;
+    }
+    return 0;
+}
+
+/* ---------- 发送前 sha256 预扫（设置项 sendSha，默认开） ----------
+ * prepare-upload 的 sha256 必须随请求一起发，所以只能"先整批算完再发请求"。
+ * 读盘交给 tx_reader（同一套双缓冲流水），本线程只做 sha256_update。
+ * 真机实测（d183 探针）：纯哈希 8.84MiB/s、读+哈希流水 8.41、串行读+哈希 4.65
+ * ——所以必须流水，串行会把等待时间翻倍。 */
+
+/* 算第 i 个文件的 sha256，成功写 out（65 字节 hex）。返回 0=完成（含跳过），
+ * 1=被取消。读失败/文件短读时不带 sha（上传阶段照旧会报该文件失败）。 */
+static int hash_one(int i, char *out)
+{
+    TxPipe p;
+    mbedtls_sha256_context ctx;
+    unsigned char dig[32];
+    SceUID fd;
+    int st, cancelled = 0;
+
+    out[0] = 0;
+    fd = sceIoOpen(g_j.files[i].path, SCE_O_RDONLY, 0);
+    if (fd < 0) return 0;
+    st = tx_pipe_start(&p, fd, g_j.files[i].size);
+    if (st != 0) {                       /* 零字节或起不来：不带 sha */
+        sceIoClose(fd);
+        return 0;
+    }
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    for (;;) {
+        int c, len;
+        sceKernelWaitSema(p.sem_full, 1, NULL);
+        c = p.idx_wr % TX_BLOCKS;
+        len = p.len[c];
+        ++p.idx_wr;
+        if (len <= 0) {                  /* 终止块（读满 / 读失败） */
+            sceKernelSignalSema(p.sem_free, 1);
+            break;
+        }
+        mbedtls_sha256_update(&ctx, (unsigned char *)p.buf + (size_t)c * TX_CHUNK,
+                              (unsigned)len);
+        sceKernelSignalSema(p.sem_free, 1);
+        lock();
+        g_j.v.hash_done += len;
+        g_j.v.hash_cur_done += len;
+        unlock();
+        if (g_j.cancel) { cancelled = 1; break; }
+    }
+    tx_pipe_stop(&p, 1);
+    sceIoClose(fd);
+    if (!cancelled && p.rd_err)
+        dlog("xfer: hash read error on file %d (no sha)", i + 1);
+    if (cancelled || p.rd_err) {
+        mbedtls_sha256_free(&ctx);
+        return cancelled;
+    }
+    mbedtls_sha256_finish(&ctx, dig);
+    mbedtls_sha256_free(&ctx);
+    {
+        int k;
+        for (k = 0; k < 32; k++) {
+            out[k * 2]     = "0123456789abcdef"[dig[k] >> 4];
+            out[k * 2 + 1] = "0123456789abcdef"[dig[k] & 0xF];
+        }
+        out[64] = 0;
+    }
+    return 0;
+}
+
+/* 整批预扫：更新 UI 快照（hashing/hash_done/msg），返回 0=完成 1=取消 */
+static int hash_phase(void)
+{
+    uint64_t t0 = now_us();
+    int i, n = g_j.count;
+
+    lock();
+    g_j.v.hashing = true;
+    g_j.v.hash_cur = -1;
+    g_j.v.hash_done = 0;
+    g_j.v.hash_total = g_j.v.total;
+    unlock();
+    for (i = 0; i < n; i++) {
+        lock();
+        g_j.v.hash_cur = i;
+        g_j.v.hash_cur_done = 0;
+        unlock();
+        set_msg("Calculating checksum (%d/%d)", i + 1, n);
+        if (hash_one(i, g_j.sha[i]) != 0) {
+            lock();
+            g_j.v.hashing = false;
+            g_j.v.hash_cur = -1;
+            unlock();
+            return 1;
+        }
+    }
+    dlog("xfer: sha256 prehash %lld B in %llu ms (%.2f MiB/s)", (long long)g_j.v.total,
+         (unsigned long long)((now_us() - t0) / 1000),
+         (double)(g_j.v.total) / 1048576.0 /
+             (((double)(now_us() - t0)) / 1000000.0 + 0.001));
+    lock();
+    g_j.v.hashing = false;
+    g_j.v.hash_cur = -1;
+    unlock();
+    return 0;
+}
+
 /* ---------- 上传 worker（阶段 2 的并发执行体） ---------- */
 
 /* 单个文件的完整上传：建连接 → 发字节 → 等回执（每文件一条独立连接）。
@@ -936,34 +1080,16 @@ static int upload_one(int i)
         return 1;
     }
     /* 读/发双缓冲流水：读盘交给读线程，本线程只做 ssl_write。 */
-    memset(&p, 0, sizeof p);
-    p.fd = fd;
-    p.thr = p.sem_free = p.sem_full = -1;
-    p.remain = g_j.files[i].size;
-    if (p.remain > 0) {
-        p.buf = (char *)malloc((size_t)TX_CHUNK * TX_BLOCKS);
-        if (p.buf)
-            p.sem_free = sceKernelCreateSema("psvsend_sfree", 0, TX_BLOCKS, TX_BLOCKS, NULL);
-        if (p.sem_free >= 0)
-            p.sem_full = sceKernelCreateSema("psvsend_sfull", 0, 0, TX_BLOCKS, NULL);
-        if (p.sem_full >= 0)
-            p.thr = sceKernelCreateThread("psvsend_rd", tx_reader, 0x40, 0x20000, 0,
-                                          SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
-        if (p.thr >= 0) {
-            TxPipe *pp = &p;
-            tx_started = sceKernelStartThread(p.thr, sizeof pp, &pp) >= 0;
-        }
-        if (!tx_started) {
-            dlog("xfer: send pipeline setup fail (thr=%d sem=%d/%d buf=%d)",
-                 (int)p.thr, (int)p.sem_free, (int)p.sem_full, p.buf != NULL);
-            tx_pipe_stop(&p, 0);
-            conn_close(&c);
-            sceIoClose(fd);
-            mark_file_failed(i, "out of memory for %s", g_j.files[i].name);
-            return 0;
-        }
+    sr = tx_pipe_start(&p, fd, g_j.files[i].size);
+    if (sr < 0) {
+        conn_close(&c);
+        sceIoClose(fd);
+        mark_file_failed(i, "out of memory for %s", g_j.files[i].name);
+        return 0;
     }
-    while (tx_started) {                 /* 零字节文件不起流水线，直接等回执 */
+    tx_started = (sr == 0);          /* 零字节文件不起流水线，直接等回执 */
+    sr = 0;                          /* 流水线就绪与否不参与下面的错误判定 */
+    while (tx_started) {
         int s, len;
         uint64_t t;
         sceKernelWaitSema(p.sem_full, 1, NULL);
@@ -1126,6 +1252,13 @@ static int xfer_thr(SceSize args, void *argp)
     dlog("xfer: thread entered, target %s:%d (%s)%s, %d file(s)",
          g_j.ip, g_j.port, g_j.tls ? "https" : "http",
          g_j.tls ? " tls" : "", g_j.count);
+
+    /* 阶段 0（可选）：发送前算 sha256 —— prepare 里要随请求带上，所以只能先算完
+     * 再发。代价实测约 12 s / 100MB（读+哈希流水 8.41MiB/s），大文件用户可关。 */
+    if (g_cfg.send_sha && g_j.v.total > 0) {
+        set_msg("Calculating checksum...");
+        if (hash_phase() != 0) { finish_cancelled(); goto out; }
+    }
 
     /* 阶段 1：prepare-upload（长等接收方决定）。401 = 对方要求 PIN：
      * 挂起等 UI 用系统键盘输入后带 ?pin= 重发（协议语义），最多 PIN_MAX_TRY 次。 */

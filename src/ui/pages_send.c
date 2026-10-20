@@ -922,6 +922,37 @@ void page_send_wait_render(void)
                                      : tr("PIN required"), card.w - 48);
         w_text_clip(48, 230, 1.0f, theme->text_dim,
                     tr("Enter the PIN to continue."), card.w - 48);
+    } else if (xv.hashing) {
+        /* 发送前 sha256 预扫：这段可能几秒到两分钟（8.4MiB/s），必须让用户看到
+         * 在动——否则和"卡死"没区别。
+         * 进度条按【文件个数】均分：每个文件占 1/N，文件内部再按字节填自己那一段。
+         * 这样大小文件混发时观感均匀（大文件在自己那格里慢慢走，小文件一闪而过），
+         * 不会出现"整条按字节跑、计数却一直停在 1/N"的别扭。 */
+        char cnt[32];
+        int cw = 0, ch = 0, pct = 0, k;
+        int left = 48, right = card.x + card.w - 24;   /* 与上方文字同宽（912） */
+        int n = xv.count > 0 ? xv.count : 1;
+        int cur = xv.hash_cur >= 0 ? xv.hash_cur : 0;
+        double frac = 1.0;
+        Rect bar;
+        if (cur < xv.count) {
+            SceOff cs = xv.f[cur].size;
+            frac = cs > 0 ? (double)xv.hash_cur_done / (double)cs : 1.0;
+            if (frac > 1.0) frac = 1.0;
+        }
+        pct = (int)(((double)cur + frac) * 100.0 / (double)n);
+        w_text_clip(48, 190, 1.3f, theme->accent, tr("Calculating checksum..."),
+                    card.w - 48);
+        snprintf(cnt, sizeof cnt, "%d/%d", cur + 1, n);
+        w_text_w(1.0f, cnt, &cw, &ch);
+        bar = (Rect){ left, 234, right - left - cw - 16, 12 };
+        w_bar(bar, theme->border, theme->accent, pct);
+        /* 段分隔线：每段够宽才画，避免几十个小文件时糊成一片 */
+        if (n > 1 && bar.w / n >= 8) {
+            for (k = 1; k < n; k++)
+                w_rect((Rect){ bar.x + bar.w * k / n, bar.y, 1, bar.h }, theme->card);
+        }
+        w_text_right(right, 230, 1.0f, theme->text_dim, "%s", cnt);
     } else {
         w_text_clip(48, 190, 1.3f, theme->accent,
                     tr("Waiting for receiver to accept..."), card.w - 48);

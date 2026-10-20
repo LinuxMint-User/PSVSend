@@ -119,6 +119,8 @@ void page_progress_render(void)
         }
         if (xv.active)
             g_app.prog_ms = (int)((sceKernelGetSystemTimeWide() - xv.start_us) / 1000);
+        /* sha256 预扫阶段不在这里展示：pages_tick 只在真正开始上传（cur>=0）后
+         * 才切到本页，预扫期间用户看到的是发送等待页（见 page_send_wait_render）。 */
         g_app.prog_pct = xv.total > 0
             ? (int)(xv.total_sent * 100 / xv.total)
             : (xv.finished && xv.ok ? 100 : 0);
