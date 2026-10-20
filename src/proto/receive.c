@@ -22,8 +22,10 @@
 #include <psp2/io/stat.h>
 #include <psp2/io/dirent.h>
 #include <psp2/io/devctl.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/kernel/threadmgr/thread.h>
 #include <psp2/kernel/threadmgr/mutex.h>
+#include <psp2/kernel/threadmgr/semaphore.h>
 #include <psp2/kernel/processmgr.h>
 #include <mbedtls/sha256.h>
 #include "proto/receive.h"
@@ -750,6 +752,60 @@ static void sess_fail_locked(const char *err)
         sess_terminal(RECV_ST_FAIL, err);
 }
 
+/* ---- 收体写盘线程：解密与写盘/校验重叠 ----
+ * 生产者（http worker）只做 fn()（socket 收 + TLS 解密）并攒满 64KB；消费者做
+ * sha256 与 sceIoWrite。双缓冲 + 两个计数信号量：
+ *   sem_free = 空闲缓冲数（初值 2），sem_job = 已发布待写任务数（初值 0）。
+ * 顺序性：生产者按 idx_in 轮转发布、消费者按 idx_out 轮转取用，天然 FIFO，
+ * 所以 sha256 的输入顺序与文件内容一致；f->got/got_total 也由消费者推进
+ * （= 已落盘字节），进度条不会跑到实际写入前面。
+ * 真机口径（148MB 单文件）：不拆时读 16.3s + 写 15.8s 串行，共 50.5s /
+ * 2.81MiB/s；拆分后 39.4s / 3.60MiB/s（read 24.5s、write 16.4s、sha 17.4s，
+ * 生产者反而在等空缓冲——瓶颈移到了写线程，sha256 本身就要 17s）。 */
+typedef struct {
+    SceUID thr, sem_free, sem_job, fd;
+    volatile int quit;                /* 生产者收完后置位，唤醒消费者退出 */
+    volatile int fail;                /* 消费者写盘失败 */
+    int    idx_in, idx_out;           /* 生产者/消费者各自的游标（各自独占，无需锁） */
+    int    len[2];                    /* 已发布任务长度（发布后不再改） */
+    unsigned char *buf;               /* 2 * RECV_CHUNK */
+    mbedtls_sha256_context *sha;
+    int    check_sha;
+    uint64_t t_write, t_sha;          /* 仅消费者累加，join 后由生产者读 */
+    RFile *f;
+} WrCtx;
+
+static int wr_thread(SceSize args, void *argp)
+{
+    WrCtx *w = *(WrCtx **)argp;
+    (void)args;
+    for (;;) {
+        int s, len;
+        unsigned char *p;
+        uint64_t t;
+        sceKernelWaitSema(w->sem_job, 1, NULL);
+        if (w->quit) break;
+        s = w->idx_out & 1;
+        len = w->len[s];
+        p = w->buf + (size_t)s * RECV_CHUNK;
+        ++w->idx_out;
+        if (w->check_sha) {
+            t = now_us();
+            mbedtls_sha256_update(w->sha, p, (unsigned)len);
+            w->t_sha += now_us() - t;
+        }
+        t = now_us();
+        if (sceIoWrite(w->fd, p, (unsigned)len) != len) w->fail = 1;
+        w->t_write += now_us() - t;
+        lock();
+        w->f->got += len;
+        g_sess.got_total += len;
+        unlock();
+        sceKernelSignalSema(w->sem_free, 1);
+    }
+    return 0;
+}
+
 /* upload：校验 query + 来源 IP → 经 fn 流式收 total 字节写盘。
  * fn 每次返回 ≤ max；0=对端关闭/空闲超时，<0=socket 错误。 */
 static int recv_http_upload(const char *query, const char *ip, int64_t total,
@@ -763,11 +819,12 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     bool check_sha = false, aborted = false;
     mbedtls_sha256_context hctx;
     unsigned char digest[32];
-    unsigned char buf[RECV_CHUNK];   /* 本 upload 私有：同会话多文件并发时不能共用静态缓冲 */
-    int fill = 0;                    /* buf 里已攒未写盘的字节（凑满 64KB 再写，见收体循环） */
+    WrCtx w;                         /* 写盘线程 + 双缓冲（见 wr_thread） */
+    SceOff produced = 0;             /* 已从 socket 收下的字节（写线程可能还在追） */
+    int rd_fail = 0;                 /* fn 的失败返回值（0 = 正常） */
+    int wr_ok = 0;                   /* 写线程是否起来了 */
     uint64_t t0, t_log;              /* 收体耗时/进度打点（2s 一条，用于定位掉速与截断） */
-    uint64_t t_read = 0, t_write = 0, t_mark;  /* 读（含 TLS 解密）/写盘各占多少时间：
-                                              * 交付后据此判断吞吐瓶颈在 CPU 还是 ux0: */
+    uint64_t t_read = 0, t_mark;     /* 生产者侧（socket 收 + TLS 解密）累计耗时 */
     SceOff log_got = 0;
 
     if (!query || !fn || !ctx) return 400;
@@ -837,76 +894,74 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         return 500;
     }
 
+    /* 起写盘线程：解密留在本线程，sha256 + 写盘交给它，两者重叠。
+     * 失败就按会话失败处理（只可能是内存/句柄耗尽），不做单线程退化分支。 */
+    memset(&w, 0, sizeof w);
+    w.sem_free = w.sem_job = w.thr = -1;
+    w.fd = fd;
+    w.f = f;
+    w.check_sha = check_sha ? 1 : 0;
+    w.sha = &hctx;
+    w.buf = (unsigned char *)malloc((size_t)RECV_CHUNK * 2);
+    if (w.buf)
+        w.sem_free = sceKernelCreateSema("psvsend_wfree", 0, 2, 2, NULL);
+    if (w.sem_free >= 0)
+        w.sem_job = sceKernelCreateSema("psvsend_wjob", 0, 0, 2, NULL);
+    if (w.sem_job >= 0)
+        w.thr = sceKernelCreateThread("psvsend_wr", wr_thread, 0x40, 0x20000, 0,
+                                      SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
+    if (w.thr >= 0) {
+        WrCtx *wp = &w;
+        wr_ok = sceKernelStartThread(w.thr, sizeof wp, &wp) >= 0;
+    }
+    if (!wr_ok) {
+        dlog("recv: writer setup fail (thr=%d sem=%d/%d buf=%d)", (int)w.thr,
+             (int)w.sem_free, (int)w.sem_job, w.buf != NULL);
+        if (w.thr >= 0) sceKernelDeleteThread(w.thr);
+        if (w.sem_job >= 0) sceKernelDeleteSema(w.sem_job);
+        if (w.sem_free >= 0) sceKernelDeleteSema(w.sem_free);
+        free(w.buf);
+        sceIoClose(fd); fd = -1;
+        lock();
+        f->busy = false;
+        sess_fail_locked("资源不足");
+        unlock();
+        if (check_sha) mbedtls_sha256_free(&hctx);
+        return 500;
+    }
+
+    /* 生产者：只负责收 + 解密，攒满一块就交给写线程 */
     t0 = t_log = now_us();
     for (;;) {
-        int n, wr;
-        if (f->got >= f->size) break;  /* 先确认收满：完整数据绝不做取消清理 */
+        unsigned char *pbuf;
+        int fill = 0, n;
+        if (produced >= f->size) break;         /* 收满 */
         lock();
         if (g_abort) aborted = true;
         unlock();
-        if (aborted) {
-            sceIoClose(fd); fd = -1;
-            lock();
-            f->busy = false;
-            cleanup_parts();                 /* 含本文件的临时文件 */
-            if (!sess_is_terminal(g_sess.state))     /* 别覆盖别处已判定的终态原因 */
-                sess_terminal(RECV_ST_CANCEL, "用户取消");
-            unlock();
-            if (check_sha) mbedtls_sha256_free(&hctx);
-            return 500;
-        }
-        if (f->got >= f->size) break;
-        {
-            /* 攒够 64KB 再写盘：TLS 一次只交付一个记录（≤16KB），按 16KB 逐次
-             * 写 ux0: 实测只有 9.4MB/s（148MB 花 15.8s）；凑满缓冲后写 64KB
-             * 对齐块，写调用少 3/4，也避开簇边界上的读-改-写。 */
-            SceOff rem = f->size - (f->got + fill);
-            int room = RECV_CHUNK - fill;
+        if (aborted) break;
+        if (w.fail) break;                      /* 写盘失败：不再收 */
+        if (sceKernelWaitSema(w.sem_free, 1, NULL) < 0) break;   /* 等空缓冲 */
+        pbuf = w.buf + (size_t)(w.idx_in & 1) * RECV_CHUNK;
+        while (fill < RECV_CHUNK && produced + fill < f->size) {
+            int want = RECV_CHUNK - fill;
+            if (f->size - produced - fill < want)
+                want = (int)(f->size - produced - fill);
             t_mark = now_us();
-            n = fn(ctx, buf + fill, (int)(rem < room ? rem : room));
+            n = fn(ctx, pbuf + fill, want);
             t_read += now_us() - t_mark;
+            if (n <= 0) { rd_fail = n; break; }
+            fill += n;
         }
-        if (n <= 0) {                        /* 断流/空闲超时/socket 错/用户中止 */
-            sceIoClose(fd); fd = -1;
-            lock();
-            f->busy = false;
-            /* 截断取证：收了多久、到多少字节停的。fn 的负返回值区分不了
-             * "对端关/空闲超时/读错"，http 层已有对应 dlog，这里给时间线。 */
-            dlog("recv: upload fail got %lld/%lld B after %llu ms (fn=%d)",
-                 (long long)(f->got + fill), (long long)f->size,
-                 (unsigned long long)((now_us() - t0) / 1000), n);
-            if (g_abort) {                   /* http 层看到中止标志提前退出 → 取消 */
-                cleanup_parts();
-                if (!sess_is_terminal(g_sess.state))     /* 别覆盖已判定的终态原因 */
-                    sess_terminal(RECV_ST_CANCEL, "用户取消");
-            } else {
-                sess_fail_locked(f->got > 0 ? "传输中断" : "对方未发送数据");
-            }
-            unlock();
-            if (check_sha) mbedtls_sha256_free(&hctx);
-            return 500;
+        if (fill > 0) {
+            w.len[w.idx_in & 1] = fill;
+            ++w.idx_in;
+            produced += fill;
+            sceKernelSignalSema(w.sem_job, 1);
+        } else {
+            sceKernelSignalSema(w.sem_free, 1); /* 一块都没收到（失败路径）：还回去 */
         }
-        if (check_sha) mbedtls_sha256_update(&hctx, buf + fill, (unsigned)n);
-        fill += n;
-        if (fill < RECV_CHUNK && f->got + fill < f->size)
-            continue;                        /* 没攒满、也没收完：接着收 */
-        t_mark = now_us();
-        wr = sceIoWrite(fd, buf, (unsigned)fill);
-        t_write += now_us() - t_mark;
-        if (wr != fill) {                    /* 磁盘满 / IO 错误 */
-            sceIoClose(fd); fd = -1;
-            lock();
-            f->busy = false;
-            sess_fail_locked("写入失败（磁盘空间不足？）");
-            unlock();
-            if (check_sha) mbedtls_sha256_free(&hctx);
-            return 500;
-        }
-        lock();
-        f->got += fill;
-        g_sess.got_total += fill;
-        fill = 0;
-        unlock();
+        if (rd_fail) break;
         if (now_us() - t_log >= 2000000ull) {   /* 2s 一条：速率 + 是否还在推进 */
             uint64_t tn = now_us();
             dlog("recv: progress %lld/%lld B  %.2f MiB/s",
@@ -916,6 +971,57 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             t_log = tn;
             log_got = f->got;
         }
+    }
+
+    /* 收尾顺序：先把在途块落盘、停掉写线程，再关 fd —— 否则消费者会对着
+     * 已关闭的 fd 继续写。超时兜底（正常 ≤128KB，几百毫秒内就该回来）。 */
+    {
+        SceUInt tmo = 10000000;
+        sceKernelWaitSema(w.sem_free, 2, &tmo);
+        sceKernelSignalSema(w.sem_free, 2);
+    }
+    w.quit = 1;
+    sceKernelSignalSema(w.sem_job, 1);
+    {
+        SceUInt tmo = 10000000;
+        sceKernelWaitThreadEnd(w.thr, NULL, &tmo);
+    }
+    sceKernelDeleteThread(w.thr);
+    sceKernelDeleteSema(w.sem_free);
+    sceKernelDeleteSema(w.sem_job);
+    free(w.buf);
+    sceIoClose(fd); fd = -1;
+
+    if (aborted) {
+        lock();
+        f->busy = false;
+        cleanup_parts();                     /* 含本文件的临时文件 */
+        if (!sess_is_terminal(g_sess.state)) /* 别覆盖别处已判定的终态原因 */
+            sess_terminal(RECV_ST_CANCEL, "用户取消");
+        unlock();
+        if (check_sha) mbedtls_sha256_free(&hctx);
+        return 500;
+    }
+    if (rd_fail || w.fail) {                 /* 断流/空闲超时/socket 错/写盘失败 */
+        lock();
+        f->busy = false;
+        /* 截断取证：收了多久、到多少字节停的。fn 的负返回值区分不了
+         * "对端关/空闲超时/读错"，http 层已有对应 dlog，这里给时间线。 */
+        dlog("recv: upload fail got %lld/%lld B after %llu ms (fn=%d wr=%d)",
+             (long long)f->got, (long long)f->size,
+             (unsigned long long)((now_us() - t0) / 1000), rd_fail, w.fail);
+        if (g_abort) {                       /* http 层看到中止标志提前退出 → 取消 */
+            cleanup_parts();
+            if (!sess_is_terminal(g_sess.state))     /* 别覆盖已判定的终态原因 */
+                sess_terminal(RECV_ST_CANCEL, "用户取消");
+        } else if (w.fail) {
+            sess_fail_locked("写入失败（磁盘空间不足？）");
+        } else {
+            sess_fail_locked(f->got > 0 ? "传输中断" : "对方未发送数据");
+        }
+        unlock();
+        if (check_sha) mbedtls_sha256_free(&hctx);
+        return 500;
     }
 
     if (check_sha) {
@@ -939,12 +1045,13 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     }
     {
         uint64_t total = now_us() - t0;
-        dlog("recv: file done %lld B in %llu ms (%.2f MiB/s) read=%llu ms write=%llu ms",
+        dlog("recv: file done %lld B in %llu ms (%.2f MiB/s) read=%llu ms write=%llu ms sha=%llu ms",
              (long long)f->got, (unsigned long long)(total / 1000),
              total ? (double)f->got / 1048576.0
                      / ((double)total / 1000000.0) : 0.0,
              (unsigned long long)(t_read / 1000),
-             (unsigned long long)(t_write / 1000));
+             (unsigned long long)(w.t_write / 1000),
+             (unsigned long long)(w.t_sha / 1000));
     }
     lock();
     f->st = 1;
