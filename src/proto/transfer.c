@@ -45,6 +45,7 @@
 #define POLL_US       20000          /* 20ms 轮询间隔 */
 #define TX_SOCK_BUF   8192           /* 响应收包缓冲 */
 #define TX_CHUNK      32768          /* 上传分块 */
+#define TX_BLOCKS     2              /* 发送流水线块数（读线程 / 发送线程各用一块） */
 #define RSP_BUF       65536          /* prepare 应答缓冲上限（头+body） */
 #define PREPARE_PATH  "/api/localsend/v2/prepare-upload"
 #define PIN_MAX_TRY   3              /* 401 时最多尝试的 PIN 次数（含首次无 PIN） */
@@ -88,6 +89,8 @@ static SceUID g_mtx = -1;
 
 static void lock(void)   { if (g_mtx >= 0) sceKernelLockMutex(g_mtx, 1, NULL); }
 static void unlock(void) { if (g_mtx >= 0) sceKernelUnlockMutex(g_mtx, 1); }
+
+static uint64_t now_us(void) { return (uint64_t)sceKernelGetSystemTimeWide(); }
 
 static void set_msg(const char *fmt, ...)
 {
@@ -302,10 +305,25 @@ static int vita_entropy_poll(void *arg, unsigned char *out, size_t len, size_t *
     return 0;
 }
 
-/* 发送 len 字节；返回 0=成功 -1=错误/超时 -2=已取消 -4=全局中止（对端不在） */
-static int conn_send_all(Conn *c, const char *data, int len)
+/* 发送窗口暂时没空（WANT_WRITE / EWOULDBLOCK）：先让出 CPU 空转几轮，仍不行
+ * 才睡 1ms。与接收侧 http.c 的 conn_read 同口径——旧写法每次都睡 20ms，实测
+ * 约四成的 32KB 块会撞一次，等于每块白扔 20ms，是发送 3.53MiB/s 的主要低效点。
+ * t_wait/n_wait（可空）只用于诊断日志。 */
+static void tx_backoff(int *spins, uint64_t *t_wait, int *n_wait)
 {
-    int off = 0;
+    uint64_t t = now_us();
+    if (++*spins <= 8) sceKernelDelayThread(0);
+    else sceKernelDelayThread(1000);
+    if (t_wait) *t_wait += now_us() - t;
+    if (n_wait) ++*n_wait;
+}
+
+/* 发送 len 字节；返回 0=成功 -1=错误/超时 -2=已取消 -4=全局中止（对端不在）。
+ * t_wait/n_wait（可空）累计"窗口没空"的退避次数与耗时，仅用于诊断。 */
+static int conn_send_all(Conn *c, const char *data, int len,
+                         uint64_t *t_wait, int *n_wait)
+{
+    int off = 0, spins = 0;
     SceLong64 dl = sceKernelGetSystemTimeWide() + CHUNK_DEADLINE_US;
     while (off < len) {
         if (!c->ignore_flags && g_j.cancel) return -2;
@@ -314,19 +332,19 @@ static int conn_send_all(Conn *c, const char *data, int len)
         if (c->tls) {
             int r = mbedtls_ssl_write(&c->ssl, (const unsigned char *)data + off,
                                       (size_t)(len - off));
-            if (r > 0) { off += r; continue; }
+            if (r > 0) { off += r; spins = 0; continue; }
             if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) {
-                sceKernelDelayThread(POLL_US);
+                tx_backoff(&spins, t_wait, n_wait);
                 continue;
             }
             dlog("xfer: ssl_write err -0x%04X", (unsigned)(-r));
             return -1;
         } else {
             int r = sceNetSend(c->fd, data + off, (unsigned)(len - off), 0);
-            if (r > 0) { off += r; continue; }
+            if (r > 0) { off += r; spins = 0; continue; }
             if (r == 0) return -1;
             if (NET_AGAIN(r)) {
-                sceKernelDelayThread(POLL_US);
+                tx_backoff(&spins, t_wait, n_wait);
                 continue;
             }
             return -1;
@@ -655,7 +673,7 @@ static int conn_open(Conn *c, const char *method_path, SceOff body_len)
                     "Content-Length: %lld\r\n"
                     "Connection: close\r\n\r\n",
                     method_path, g_j.ip, g_j.port, (long long)body_len);
-    r = conn_send_all(c, hdr, hlen);
+    r = conn_send_all(c, hdr, hlen, NULL, NULL);
     if (r < 0) {                        /* -1 发送失败 / -2 取消 */
         conn_close(c);
         return r;
@@ -782,6 +800,80 @@ static char *build_prepare_json(void)
     return b;
 }
 
+/* ---- 发送体双缓冲流水：读盘与加密发送各占一条线程 ----
+ * 旧实现是一条线程严格串行 sceIoRead(32KB) → mbedtls_ssl_write(32KB)，两段
+ * 时间直接相加（读盘约 9.6MiB/s、发送约 5.6MiB/s → 合起来 3.53MiB/s，正是
+ * d180 的实测值）。改成：读线程只管读盘，worker 本线程只管 ssl_write
+ * （mbedTLS 上下文只能由一条线程碰）。
+ *   sem_free = 空闲块数（初值 TX_BLOCKS）、sem_full = 已读满块数；
+ *   读线程：等空块 → 读 → 投 sem_full；发送侧：等满块 → 发 → 还 sem_free。
+ * 读线程按声明的 size 读满（或读失败）后投一个 len=0 的终止块，发送侧见到它
+ * 即收尾，不另设结束标志。每文件 2 条线程、64KB 堆缓冲；并发 N 路即 2N 条。
+ * 与接收侧（receive.c 的 sha/wr 线程）同口径：起不来就判本文件失败，不做退化
+ * 分支。 */
+typedef struct {
+    SceUID fd, thr, sem_free, sem_full;
+    volatile int quit;               /* 发送侧出错/取消：让读线程尽快退出 */
+    volatile int rd_err;             /* -1=读错误 -2=文件比声明的 size 短（0=正常） */
+    SceOff remain;                   /* 还没读的字节数（读线程独占） */
+    int    idx_rd, idx_wr;           /* 读/发各自游标（各自独占，无需锁） */
+    int    len[TX_BLOCKS];
+    char  *buf;                      /* TX_BLOCKS * TX_CHUNK */
+    uint64_t t_read;                 /* 读盘累计（发送侧 join 之后才读） */
+} TxPipe;
+
+static int tx_reader(SceSize args, void *argp)
+{
+    TxPipe *p = *(TxPipe **)argp;
+    (void)args;
+    for (;;) {
+        int s, rd, want;
+        uint64_t t;
+        sceKernelWaitSema(p->sem_free, 1, NULL);
+        if (p->quit) { sceKernelSignalSema(p->sem_free, 1); break; }
+        s = p->idx_rd % TX_BLOCKS;
+        if (p->remain <= 0) {           /* 读满声明的字节数：投终止块 */
+            p->len[s] = 0;
+            ++p->idx_rd;
+            sceKernelSignalSema(p->sem_full, 1);
+            break;
+        }
+        want = p->remain < (SceOff)TX_CHUNK ? (int)p->remain : TX_CHUNK;
+        t = now_us();
+        rd = sceIoRead(p->fd, p->buf + (size_t)s * TX_CHUNK, (unsigned)want);
+        p->t_read += now_us() - t;
+        if (rd <= 0) {                  /* 0=文件变短 <0=读错误：同样投终止块 */
+            p->rd_err = rd < 0 ? -1 : -2;
+            p->len[s] = 0;
+            ++p->idx_rd;
+            sceKernelSignalSema(p->sem_full, 1);
+            break;
+        }
+        p->len[s] = rd;
+        p->remain -= rd;
+        ++p->idx_rd;
+        sceKernelSignalSema(p->sem_full, 1);
+    }
+    return 0;
+}
+
+/* 收掉流水线：唤停读线程 → join → 删线程/信号量 → 释放缓冲。
+ * started=0 表示线程只是创建了没启动过（创建后启动失败），此时不能 join。 */
+static void tx_pipe_stop(TxPipe *p, int started)
+{
+    if (started) {
+        SceUInt tmo = 5000000;
+        p->quit = 1;
+        sceKernelSignalSema(p->sem_free, 1);   /* 读线程可能正等空块 */
+        sceKernelWaitThreadEnd(p->thr, NULL, &tmo);
+    }
+    if (p->thr >= 0) sceKernelDeleteThread(p->thr);
+    if (p->sem_full >= 0) sceKernelDeleteSema(p->sem_full);
+    if (p->sem_free >= 0) sceKernelDeleteSema(p->sem_free);
+    free(p->buf);
+    p->buf = NULL;
+}
+
 /* ---------- 上传 worker（阶段 2 的并发执行体） ---------- */
 
 /* 单个文件的完整上传：建连接 → 发字节 → 等回执（每文件一条独立连接）。
@@ -791,12 +883,14 @@ static char *build_prepare_json(void)
  * join 完全部 worker 之后写一次（理由见文件头注）。 */
 static int upload_one(int i)
 {
-    char chunk[TX_CHUNK];
     char q[320];
     char abuf[512];                 /* 上传回执缓冲（头 + 空 body） */
     Conn c;
-    int fd, rd, sr, blen;
+    TxPipe p;                       /* 读/发双缓冲流水（见 tx_reader） */
+    int fd, sr = 0, blen, tx_started = 0;
     int code = 0;
+    int n_wait = 0;                 /* 发送窗口没空的退避次数 */
+    uint64_t t_send = 0, t_wait = 0;
     SceOff sent_file = 0;
 
     if (i < 0 || i >= g_j.count) return 0;
@@ -841,38 +935,77 @@ static int upload_one(int i)
         sceIoClose(fd);
         return 1;
     }
-    while (sent_file < g_j.files[i].size) {
-        SceOff want = g_j.files[i].size - sent_file;
-        if (want > (SceOff)sizeof chunk) want = sizeof chunk;
-        rd = sceIoRead(fd, chunk, (unsigned)want);
-        if (rd < 0) {
+    /* 读/发双缓冲流水：读盘交给读线程，本线程只做 ssl_write。 */
+    memset(&p, 0, sizeof p);
+    p.fd = fd;
+    p.thr = p.sem_free = p.sem_full = -1;
+    p.remain = g_j.files[i].size;
+    if (p.remain > 0) {
+        p.buf = (char *)malloc((size_t)TX_CHUNK * TX_BLOCKS);
+        if (p.buf)
+            p.sem_free = sceKernelCreateSema("psvsend_sfree", 0, TX_BLOCKS, TX_BLOCKS, NULL);
+        if (p.sem_free >= 0)
+            p.sem_full = sceKernelCreateSema("psvsend_sfull", 0, 0, TX_BLOCKS, NULL);
+        if (p.sem_full >= 0)
+            p.thr = sceKernelCreateThread("psvsend_rd", tx_reader, 0x40, 0x20000, 0,
+                                          SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
+        if (p.thr >= 0) {
+            TxPipe *pp = &p;
+            tx_started = sceKernelStartThread(p.thr, sizeof pp, &pp) >= 0;
+        }
+        if (!tx_started) {
+            dlog("xfer: send pipeline setup fail (thr=%d sem=%d/%d buf=%d)",
+                 (int)p.thr, (int)p.sem_free, (int)p.sem_full, p.buf != NULL);
+            tx_pipe_stop(&p, 0);
             conn_close(&c);
             sceIoClose(fd);
-            mark_file_failed(i, "read error on %s", g_j.files[i].name);
+            mark_file_failed(i, "out of memory for %s", g_j.files[i].name);
             return 0;
         }
-        if (rd == 0) {
-            /* 文件比声明的 size 短（读取期间被替换/截断）：再转下去
-             * conn_send_all(len=0) 立即返回、sent_file 不增 → 100% CPU 空转，
-             * 对端一直等声明的字节数，只能靠用户取消。 */
-            conn_close(&c);
-            sceIoClose(fd);
-            mark_file_failed(i, "%s shrank during send", g_j.files[i].name);
-            return 0;
+    }
+    while (tx_started) {                 /* 零字节文件不起流水线，直接等回执 */
+        int s, len;
+        uint64_t t;
+        sceKernelWaitSema(p.sem_full, 1, NULL);
+        s = p.idx_wr % TX_BLOCKS;
+        len = p.len[s];
+        ++p.idx_wr;
+        if (len <= 0) {                 /* 读线程的终止块（读满 size / 读失败） */
+            sceKernelSignalSema(p.sem_free, 1);
+            break;
         }
-        sr = conn_send_all(&c, chunk, rd);
-        if (sr < 0) {
-            if (sr == -2) cancel_notify_peer(); /* 发送中被取消：断流前通知 */
-            conn_close(&c);
-            sceIoClose(fd);
-            /* -2 取消 / -4 别人已判"对端不在"：本 worker 收手，终态交监督者 */
-            if (sr == -2 || sr == -4) return 1;
-            /* 上传中途断流：对端没了（连接级）→ 全局中止 */
-            abort_xfer(i, "send error on %s", g_j.files[i].name);
-            return 1;
-        }
-        sent_file += rd;
+        t = now_us();
+        sr = conn_send_all(&c, p.buf + (size_t)s * TX_CHUNK, len, &t_wait, &n_wait);
+        t_send += now_us() - t;
+        sceKernelSignalSema(p.sem_free, 1);
+        if (sr < 0) break;
+        sent_file += len;
         set_file_state(i, 1, sent_file);
+    }
+    tx_pipe_stop(&p, tx_started);
+    dlog("xfer: file %d/%d body %lld/%lld B  read %llu send %llu wait %llu ms (%d)  r=%d",
+         i + 1, g_j.count, (long long)sent_file, (long long)g_j.files[i].size,
+         (unsigned long long)(p.t_read / 1000), (unsigned long long)(t_send / 1000),
+         (unsigned long long)(t_wait / 1000), n_wait, sr);
+    if (sr < 0) {
+        if (sr == -2) cancel_notify_peer(); /* 发送中被取消：断流前通知 */
+        conn_close(&c);
+        sceIoClose(fd);
+        /* -2 取消 / -4 别人已判"对端不在"：本 worker 收手，终态交监督者 */
+        if (sr == -2 || sr == -4) return 1;
+        /* 上传中途断流：对端没了（连接级）→ 全局中止 */
+        abort_xfer(i, "send error on %s", g_j.files[i].name);
+        return 1;
+    }
+    if (p.rd_err) {
+        /* 失败路径里的 p 字段仍有效（tx_pipe_stop 只释放了缓冲） */
+        conn_close(&c);
+        sceIoClose(fd);
+        if (p.rd_err == -2)
+            mark_file_failed(i, "%s shrank during send", g_j.files[i].name);
+        else
+            mark_file_failed(i, "read error on %s", g_j.files[i].name);
+        return 0;
     }
     /* 等对方回执（2xx 即成功） */
     blen = read_resp(&c, &code, abuf, sizeof abuf, OP_TIMEOUT_US);
@@ -1010,7 +1143,7 @@ static int xfer_thr(SceSize args, void *argp)
         c.tls = g_j.tls;
         rc = conn_open(&c, path, (SceOff)strlen(body));
         if (rc == 0)
-            rc = conn_send_all(&c, body, (int)strlen(body));
+            rc = conn_send_all(&c, body, (int)strlen(body), NULL, NULL);
         if (rc == 0)
             rc = read_resp(&c, &code, prep, RSP_BUF, PREPARE_WAIT_US);
         if (rc == -2) { conn_close(&c); finish_cancelled(); goto out; }
