@@ -90,6 +90,11 @@ static struct {
 } g_sess;
 
 static int  g_phase = PH_NONE;      /* 当前生命周期 */
+/* recv_clear 撞上"还有 worker 在收体"时不能当场清场：会删掉别人正在写的临时
+ * 文件，且复位 phase 后新 prepare 立刻覆盖 g_sess，而旧 worker 仍持有指向
+ * g_sess.f[i] 的指针。只能置中止位，等最后一个 worker 收尾时补做——否则
+ * g_phase 永远停在 PH_ACTIVE，之后所有 prepare 恒 409，只能重启应用。 */
+static int  g_clear_pending = 0;
 /* prepare 的占位序号：每次占上 PH_PENDING 就 +1。等待 UI 决定的 prepare 只在
  * "序号仍等于自己那次" 时才回写 g_phase/g_pend_result——否则它可能把一个已经
  * 换了新会话的状态改回自己的结论（recv_clear 撤销占位、新 prepare 又占上来的
@@ -326,6 +331,19 @@ static void cleanup_parts(void)
             sceIoRemove(g_sess.f[i].part);
 }
 
+/* recv_clear 曾因收体未结束而推迟清场 → 在本 worker 收尾处补做（持锁调用）。
+ * 必须等所有 busy 都清零再动手：此时 g_sess 不会再被任何 worker 访问，
+ * 复位 g_phase 后新 prepare 覆盖 g_sess 才是安全的。 */
+static void clear_pending_finish_locked(void)
+{
+    if (!g_clear_pending || any_busy_locked()) return;
+    cleanup_parts();
+    g_phase = PH_NONE;
+    g_abort = 0;
+    g_clear_pending = 0;
+    dlog("recv: session %s cleared (deferred)", g_sess.session);
+}
+
 /* 结束活动会话到终态（持有锁时调用）。不碰各文件的 busy 标志：仍在并发
  * 收体的 worker 会自行收尾并清自己的 busy。 */
 static void sess_terminal(int state, const char *err)
@@ -421,6 +439,7 @@ void recv_init(void)
     lock();
     g_phase = PH_NONE;
     g_abort = 0;
+    g_clear_pending = 0;
     unlock();
     /* 清扫上次异常退出残留的临时文件（接收中断只会留下 <名>.psvsend.tmp，不会
      * 留下正式文件；只扫当前默认/设置目录——临时目录里的崩溃残留是孤儿，不追扫）。
@@ -933,6 +952,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         lock();
         f->busy = false;
         sess_fail_locked("无法创建文件");
+        clear_pending_finish_locked();
         unlock();
         if (check_sha) mbedtls_sha256_free(&hctx);
         return 500;
@@ -989,6 +1009,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         lock();
         f->busy = false;
         sess_fail_locked("资源不足");
+        clear_pending_finish_locked();
         unlock();
         if (check_sha) mbedtls_sha256_free(&hctx);
         return 500;
@@ -1006,7 +1027,9 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         if (aborted) break;
         if (w.fail) break;                      /* 写盘失败：不再收 */
         w_mark = now_us();
-        if (sceKernelWaitSema(w.sem_free, 1, NULL) < 0) break;   /* 等空块 */
+        /* 等空块。拿不到也必须按失败收尾：裸 break 会落到"正常完成"分支，
+         * 把没接满的文件改名成正式文件（st=1）。 */
+        if (sceKernelWaitSema(w.sem_free, 1, NULL) < 0) { rd_fail = -1; break; }
         t_wait += now_us() - w_mark;
         pbuf = w.buf + (size_t)(w.idx_in % RECV_BLOCKS) * RECV_CHUNK;
         while (fill < RECV_CHUNK && produced + fill < f->size) {
@@ -1016,7 +1039,12 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             t_mark = now_us();
             n = fn(ctx, pbuf + fill, want);
             t_read += now_us() - t_mark;
-            if (n <= 0) { rd_fail = n; break; }
+            /* n==0 不是"没读失败"：http 层的 upload_stream 对"对端关闭"和"30s
+             * 空闲超时"都返回 0。旧代码只把负数当失败 → rd_fail=0 时外层
+             * if (rd_fail) 不成立，循环在 EOF 上空转烧 CPU，f->busy 也永远不清，
+             * 会话卡在 RECEIVING（连空闲超时都凑不齐条件）。统一按失败收尾；
+             * 记 -1 只为在日志里把"零字节"与"真错误码"区分开。 */
+            if (n <= 0) { rd_fail = n ? n : -1; break; }
             fill += n;
         }
         if (fill > 0) {
@@ -1089,6 +1117,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         cleanup_parts();                     /* 含本文件的临时文件 */
         if (!sess_is_terminal(g_sess.state)) /* 别覆盖别处已判定的终态原因 */
             sess_terminal(RECV_ST_CANCEL, "用户取消");
+        clear_pending_finish_locked();
         unlock();
         if (check_sha) mbedtls_sha256_free(&hctx);
         return 500;
@@ -1096,8 +1125,8 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     if (rd_fail || w.fail) {                 /* 断流/空闲超时/socket 错/写盘失败 */
         lock();
         f->busy = false;
-        /* 截断取证：收了多久、到多少字节停的。fn 的负返回值区分不了
-         * "对端关/空闲超时/读错"，http 层已有对应 dlog，这里给时间线。 */
+        /* 截断取证：收了多久、到多少字节停的。fn==-1 表示 fn 返回 0（对端关闭
+         * 或 http 层单块空闲超时，http 层已有对应 dlog），其余负值为 socket/TLS 错。 */
         dlog("recv: upload fail got %lld/%lld B after %llu ms (fn=%d wr=%d)",
              (long long)f->got, (long long)f->size,
              (unsigned long long)((now_us() - t0) / 1000), rd_fail, w.fail);
@@ -1110,6 +1139,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         } else {
             sess_fail_locked(f->got > 0 ? "传输中断" : "对方未发送数据");
         }
+        clear_pending_finish_locked();
         unlock();
         if (check_sha) mbedtls_sha256_free(&hctx);
         return 500;
@@ -1124,6 +1154,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         lock();
         f->busy = false;
         sess_fail_locked("sha256 校验失败");
+        clear_pending_finish_locked();
         unlock();
         return 422;
     }
@@ -1131,6 +1162,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         lock();
         f->busy = false;
         sess_fail_locked("文件落盘失败");
+        clear_pending_finish_locked();
         unlock();
         return 500;
     }
@@ -1168,6 +1200,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             g_sess.last_us = now_us();
         }
     }
+    clear_pending_finish_locked();
     unlock();
     return 200;
 }
@@ -1237,8 +1270,11 @@ void recv_clear(void)
 {
     lock();
     if (g_phase == PH_ACTIVE) {
-        if (any_busy_locked()) {             /* 收体进行中：别硬清，先请中止 */
+        if (any_busy_locked()) {             /* 收体进行中：别硬清，先请中止。
+                                              * 清场与复位 phase 推迟到最后一个 worker
+                                              * 收尾时（clear_pending_finish_locked） */
             g_abort = 1;
+            g_clear_pending = 1;
             unlock();
             return;
         }
@@ -1250,6 +1286,7 @@ void recv_clear(void)
     }
     g_phase = PH_NONE;
     g_abort = 0;
+    g_clear_pending = 0;
     unlock();
 }
 
