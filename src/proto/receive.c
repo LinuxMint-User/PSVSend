@@ -115,7 +115,8 @@ static uint64_t now_us(void) { return (uint64_t)sceKernelGetSystemTimeWide(); }
 static bool sess_is_terminal(int state)
 {
     return state == RECV_ST_DONE || state == RECV_ST_FAIL ||
-           state == RECV_ST_CANCEL || state == RECV_ST_TIMEOUT;
+           state == RECV_ST_CANCEL || state == RECV_ST_TIMEOUT ||
+           state == RECV_ST_PARTIAL;
 }
 
 /* 是否有任一文件正在流式收体（持锁调用）：同会话多文件可并发，busy 各自独立 */
@@ -777,12 +778,63 @@ static bool hex_eq_nocase(const char *a, const unsigned char *b, int n)
 }
 
 /* 标记会话整体失败并清理残留临时文件（持有锁时调用；fd 由调用点先关闭）。
- * 已是终态（如并发中另一个文件已先失败/被取消）则只做清理、不覆盖原终态。 */
+ * 已是终态（如并发中另一个文件已先失败/被取消）则只做清理、不覆盖原终态。
+ * 只用于**会话级**错误（断流 / 用户取消 / 超时）；单个文件的错误走
+ * file_fail_locked——与官方一致：一个文件失败不终止其余文件的接收。 */
 static void sess_fail_locked(const char *err)
 {
     cleanup_parts();
     if (!sess_is_terminal(g_sess.state))
         sess_terminal(RECV_ST_FAIL, err);
+}
+
+/* 会话终态收敛（持有锁时调用）：单文件失败只置 st=3，等所有文件都收尾
+ * （st != 0）才在这里汇总。失败当下不能直接判 PARTIAL——那会让还没开始
+ * 上传的其余文件命中 upload 入口的终态检查、直接吃 403。
+ *   g_abort 只收掉"还没结束"的会话（与旧行为一致：已收满的文件优先算完成）。 */
+static void check_all_done_locked(void)
+{
+    int i, all = 1, failed = 0;
+    if (sess_is_terminal(g_sess.state)) return;
+    for (i = 0; i < g_sess.n; i++) {
+        if (g_sess.f[i].st == 0) { all = 0; break; }
+        if (g_sess.f[i].st == 3) failed++;
+    }
+    if (all) {
+        if (failed) {
+            sess_terminal(RECV_ST_PARTIAL,
+                          g_sess.err[0] ? g_sess.err : "部分文件接收失败");
+            dlog("recv: session %s partial (%d/%d files failed)",
+                 g_sess.session, failed, g_sess.n);
+        } else {
+            sess_terminal(RECV_ST_DONE, NULL);
+            dlog("recv: session %s done (%d files, %lld B)", g_sess.session,
+                 g_sess.n, (long long)g_sess.got_total);
+        }
+    } else if (g_abort) {
+        /* 还有文件没收：用户取消 → 整会话收尾（已完成的文件保留） */
+        cleanup_parts();
+        sess_terminal(RECV_ST_CANCEL, "用户取消");
+        dlog("recv: session %s cancelled", g_sess.session);
+    } else {
+        /* 还有文件没到（或正在并发收）：等下一个 upload 收尾 */
+        g_sess.state = any_busy_locked() ? RECV_ST_RECEIVING : RECV_ST_READY;
+        g_sess.last_us = now_us();
+    }
+}
+
+/* 单文件失败（持有锁时调用）：只标这个文件，不结束会话。
+ * 首个失败原因留在 g_sess.err，供最后收敛成 PARTIAL 时显示。 */
+static void file_fail_locked(RFile *f, const char *err)
+{
+    f->st = 3;
+    f->busy = false;
+    update_cur_locked();
+    if (!g_sess.err[0])
+        snprintf(g_sess.err, sizeof g_sess.err, "%s", err);
+    dlog("recv: file %s failed: %s", f->name, err);
+    cleanup_parts();                     /* 删掉本文件未完成的 .psvpart */
+    check_all_done_locked();
 }
 
 /* ---- 收体三级流水：解密 / sha256 / 写盘各占一条线程 ----
@@ -921,13 +973,14 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         return 409;
     }
     if (total >= 0 && total != f->size) {    /* Content-Length 与清单不符（无 CL 时 total=-1，读完再验） */
-        sess_fail_locked("文件大小与清单不符");
+        file_fail_locked(f, "文件大小与清单不符");
         unlock();
         return 400;
     }
-    /* 磁盘预检（查不到就交给写失败兜底） */
+    /* 磁盘预检（查不到就交给写失败兜底）。空间不足只判这个文件：其余文件
+     * 可能更小、装得下（预检本来就是按当前文件的 size 算的）。 */
     if (disk_free(&free_space) == 0 && free_space < f->size) {
-        sess_fail_locked("存储空间不足");
+        file_fail_locked(f, "存储空间不足");
         unlock();
         return 500;
     }
@@ -950,8 +1003,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     if (fd < 0) {
         dlog("recv: open part fail 0x%08X (%s)", (unsigned)fd, f->part);
         lock();
-        f->busy = false;
-        sess_fail_locked("无法创建文件");
+        file_fail_locked(f, "无法创建文件");
         clear_pending_finish_locked();
         unlock();
         if (check_sha) mbedtls_sha256_free(&hctx);
@@ -959,7 +1011,8 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     }
 
     /* 起两条消费者线程（sha256 / 写盘）：解密留在本线程，三级流水。
-     * 失败就按会话失败处理（只可能是内存/句柄耗尽），不做退化分支。 */
+     * 失败只判这个文件失败（内存/句柄耗尽时其余文件通常也起不来，但按
+     * 单文件语义处理更接近官方：能收一个算一个），不做退化分支。 */
     memset(&w, 0, sizeof w);
     w.sem_free = w.sem_sha = w.sem_job = w.thr_sha = w.thr_wr = -1;
     w.fd = fd;
@@ -1007,8 +1060,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         free(w.buf);
         sceIoClose(fd); fd = -1;
         lock();
-        f->busy = false;
-        sess_fail_locked("资源不足");
+        file_fail_locked(f, "资源不足");
         clear_pending_finish_locked();
         unlock();
         if (check_sha) mbedtls_sha256_free(&hctx);
@@ -1135,8 +1187,11 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             if (!sess_is_terminal(g_sess.state))     /* 别覆盖已判定的终态原因 */
                 sess_terminal(RECV_ST_CANCEL, "用户取消");
         } else if (w.fail) {
-            sess_fail_locked("写入失败（磁盘空间不足？）");
+            /* 写盘失败只算这个文件（其余文件可能还能写进去） */
+            file_fail_locked(f, "写入失败（磁盘空间不足？）");
         } else {
+            /* 断流/空闲超时是会话级：对端已不可达，剩下的文件不会再开始；
+             * 按单文件处理反而要空等 120s 文件间超时才收场。 */
             sess_fail_locked(f->got > 0 ? "传输中断" : "对方未发送数据");
         }
         clear_pending_finish_locked();
@@ -1152,16 +1207,14 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     sceIoClose(fd); fd = -1;
     if (check_sha && !hex_eq_nocase(f->sha256, digest, 32)) {
         lock();
-        f->busy = false;
-        sess_fail_locked("sha256 校验失败");
+        file_fail_locked(f, "sha256 校验失败");
         clear_pending_finish_locked();
         unlock();
         return 422;
     }
     if (sceIoRename(f->part, f->final) < 0) {
         lock();
-        f->busy = false;
-        sess_fail_locked("文件落盘失败");
+        file_fail_locked(f, "文件落盘失败");
         clear_pending_finish_locked();
         unlock();
         return 500;
@@ -1180,26 +1233,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     f->st = 1;
     f->busy = false;
     update_cur_locked();
-    if (!sess_is_terminal(g_sess.state)) {
-        int all = 1;
-        for (i = 0; i < g_sess.n; i++)
-            if (g_sess.f[i].st == 0) { all = 0; break; }
-        if (all) {
-            sess_terminal(RECV_ST_DONE, NULL);
-            dlog("recv: session %s done (%d files, %lld B)", g_sess.session,
-                 g_sess.n, (long long)g_sess.got_total);
-        } else if (g_abort) {
-            /* 本文件收满后才收到取消：当前文件已完整、保留；
-             * 其余未收的文件按取消收尾，会话终态 CANCEL。 */
-            cleanup_parts();
-            sess_terminal(RECV_ST_CANCEL, "用户取消");
-            dlog("recv: session %s cancelled (file done)", g_sess.session);
-        } else {
-            /* 还有文件没到（或正在并发收）：等下一个 upload 完成 */
-            g_sess.state = any_busy_locked() ? RECV_ST_RECEIVING : RECV_ST_READY;
-            g_sess.last_us = now_us();
-        }
-    }
+    check_all_done_locked();
     clear_pending_finish_locked();
     unlock();
     return 200;
@@ -1259,6 +1293,7 @@ int recv_status_pull(RecvStatus *out)
             out->size[i] = g_sess.f[i].size;
             out->got[i] = g_sess.f[i].got < g_sess.f[i].size
                               ? g_sess.f[i].got : g_sess.f[i].size;
+            out->st[i] = (unsigned char)g_sess.f[i].st;
         }
         r = 1;
     }

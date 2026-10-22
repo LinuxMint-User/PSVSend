@@ -1124,7 +1124,10 @@ static int upload_one(int i)
         return 1;
     }
     if (p.rd_err) {
-        /* 失败路径里的 p 字段仍有效（tx_pipe_stop 只释放了缓冲） */
+        /* 只算这一个文件失败，其余照发。**故意不发 cancel**：cancel 是会话级
+         * （/cancel?sessionId），会把官方对端的整批一起取消；而对端若是本客户端，
+         * 它已按"单文件失败"处理，不需要这条通知。关连接即让对端看到 body 截断
+         * 并收尾该文件（d188 起接收侧不再因此判整个会话失败）。 */
         conn_close(&c);
         sceIoClose(fd);
         if (p.rd_err == -2)

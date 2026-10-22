@@ -151,7 +151,11 @@ void page_progress_render(void)
                          rs.name[i][0] ? rs.name[i] : "?");
                 xf_size[i] = rs.size[i];
                 done[i] = rs.got[i] < rs.size[i] ? rs.got[i] : rs.size[i];
-                if (xf_size[i] == 0 || done[i] >= xf_size[i]) fin++;
+                /* 逐文件状态与发送侧同口径：1=完成 3=失败（失败文件不计数完成，
+                 * 与发送路径的 "Files x/y" 一致） */
+                rfail[i] = rs.st[i] == 3;
+                if (rfail[i]) nfail++;
+                else if (rs.st[i] == 1) fin++;
             }
             active = rs.cur;                       /* 正在收的文件（-1=无） */
             sent_bytes = rs.got_total;
@@ -168,9 +172,13 @@ void page_progress_render(void)
             g_app.prog_cancel = rs.state == RECV_ST_CANCEL;
             fail_state = rs.state == RECV_ST_FAIL ||
                          rs.state == RECV_ST_TIMEOUT;
+            partial = rs.state == RECV_ST_PARTIAL; /* 部分成功：警示色 + N failed */
             if (fail_state) {
                 msg = rs.err[0] ? rs.err : tr("Receive failed");
                 msg_col = theme->danger;
+            } else if (partial) {
+                msg = rs.err[0] ? rs.err : tr("Receive failed");
+                msg_col = theme->warn;
             } else if (rs.state == RECV_ST_CANCEL) {
                 msg = rs.err[0] ? rs.err : tr("Cancelled");
             } else if (rs.state == RECV_ST_READY) {

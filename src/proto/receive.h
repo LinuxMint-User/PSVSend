@@ -5,6 +5,9 @@
  *   upload?sessionId&fileId&token  裸文件字节流 → 边收边写盘保存目录（临时文件
  *                   <名>.psvsend.tmp，收完改名；sha256 校验失败 422）。保存目录：config saveDir
  *                   持久默认，UI 可在接受前 recv_set_dir 覆盖为本次目录（内存态）。
+ *                   **单文件失败只影响该文件**（与官方一致）：写盘/校验/落盘等错误
+ *                   不终止会话，其余文件照收；全部收尾后若有失败，会话终态为
+ *                   RECV_ST_PARTIAL。断流/取消/超时仍是会话级（对端已不可达）。
  *   cancel?sessionId  发送方放弃会话
  * UI 轮询拉取"待确认请求 / 传输状态"，把勾选集合与接受决定写回；http 线程轮询唤醒。
  * 单活动会话：同一时刻只服务一个接收会话（另一台设备的第二个 prepare-upload 回
@@ -40,7 +43,8 @@ typedef enum {
     RECV_ST_DONE,        /* 全部文件收完 */
     RECV_ST_FAIL,        /* 传输失败（中断/校验/写盘） */
     RECV_ST_CANCEL,      /* 发送方放弃 */
-    RECV_ST_TIMEOUT      /* 接受后对方一直没传 */
+    RECV_ST_TIMEOUT,     /* 接受后对方一直没传 */
+    RECV_ST_PARTIAL      /* 全部文件已收尾，但其中有失败（部分成功） */
 } RecvStateId;
 
 typedef struct {
@@ -51,10 +55,12 @@ typedef struct {
     char name[RECV_MAX_FILES][192];
     SceOff size[RECV_MAX_FILES];
     SceOff got[RECV_MAX_FILES];    /* 每文件已收字节 */
+    unsigned char st[RECV_MAX_FILES]; /* 每文件状态：0=未完成 1=完成 3=失败
+                                       * （与发送侧 XferFile.state 同口径，UI 直接映射） */
     SceOff total;                  /* 本次要收的总字节 */
     SceOff got_total;
     uint64_t start_us;             /* 会话开始（accept 决定时刻） */
-    char err[192];                 /* FAIL/CANCEL/TIMEOUT 原因（其它状态空） */
+    char err[192];                 /* FAIL/CANCEL/TIMEOUT/PARTIAL 原因（其它状态空） */
 } RecvStatus;
 
 /* 后端初始化（建锁 + 清扫上次中断残留的 *.psvsend.tmp）；api_start 调用 */
