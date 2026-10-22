@@ -227,9 +227,13 @@ static int send_announce_bcast(void)
 static int send_announce_dnet(void)
 {
     const char *lip = net_local_ip();
-    unsigned int ip4 = 0, bc = 0xFFFFFFFFu;
+    unsigned int ip4 = 0, bc;
     if (sceNetInetPton(SCE_NET_AF_INET, lip, &ip4) != 1) return -1;
-    bc = (ip4 & 0xFFFFFF00u) | 0xFFu;    /* 按 /24 估定向广播（Vita DHCP 常规） */
+    /* ip4 是"网络序字节躺在内存里"（{a,b,c,d}），按 uint32 做位运算会把最低
+     * 字节当成 d 的邻居、算出 255.b.c.d；这里直接改内存第 4 字节，即
+     * a.b.c.255（/24 定向广播，Vita DHCP 常规）。 */
+    bc = ip4;
+    ((unsigned char *)&bc)[3] = 0xFF;
     if (bc == ip4) return -1;
     {
         SceNetSockaddrIn dst;
@@ -243,9 +247,16 @@ static int send_announce_dnet(void)
 }
 
 /* ---------- announce 发送（由 UI 主循环的 api_tick 每帧节流后调用） ---------- */
-/* 数到第 10 次（5 秒）发一轮组播/广播/定向广播。 */
+/* 数到第 10 次（5 秒）发一轮组播/广播/定向广播。
+ * 三份公告**错峰**发放（组播立即、受限广播 +1s、定向广播 +2s）：官方 2.x 每
+ * 收到一份公告就回一次 POST /register（500ms 预算，成功才把设备入库），而本机
+ * 单条 TLS 握手约 240ms；三份同时到会让对端并行开三条连接、互抢 CPU 后集体
+ * 超时，设备在对方列表里就时有时无（d190 实测：每轮 3 条 conn，1 成 2 败）。 */
+#define ANN_STAGE_GAP_MS 1000
 static int ann_ticks = 0;
-static bool ann_first = true;
+static unsigned ann_logged = 0;       /* 各阶段首轮结果只打一次（位=阶段） */
+static uint64_t ann_b_due = 0, ann_d_due = 0;  /* 待发阶段的到期时刻（0=无） */
+static int b_hard = 0, d_hard = 0;    /* 本轮广播/定向广播是否硬失败 */
 static int g_err = 1, b_err = 1, d_err = 1;
 static volatile int g_tx_dirty = 0;   /* 链路事件：下一 tick 重建发送 socket */
 static int ever_ok = 0;               /* 本会话广播/定向广播曾成功过 */
@@ -271,12 +282,50 @@ static void recycle_tx_now(void)
         g_tx_sock = -1;
     }
     g_err = b_err = d_err = 1;      /* 重建后如实记录新的失败码 */
-    ann_first = true;               /* 重建后再打一条 first announce 便于核对 */
+    ann_logged = 0;                 /* 重建后再打首轮结果便于核对 */
+    ann_b_due = ann_d_due = 0;      /* 旧轮的错峰计划作废，避免与新 socket 首轮撞车 */
     ann_ticks = 9;                  /* 下一 tick 立刻补发一轮 */
+}
+
+/* 发一个阶段的公告（0=组播 1=受限广播 2=定向广播）：首轮每阶段打一条结果，
+ * 失败码按阶段节流；本轮 b/d 的结果汇总给"发送 socket 自愈"用。 */
+static void ann_send_stage(int stage)
+{
+    static const char *nm[3] = { "group", "bcast", "dnet" };
+    int r = stage == 0 ? send_announce_group()
+          : stage == 1 ? send_announce_bcast()
+                       : send_announce_dnet();
+    int *last = stage == 0 ? &g_err : stage == 1 ? &b_err : &d_err;
+
+    if (!(ann_logged & (1u << stage))) {
+        ann_logged |= 1u << stage;
+        dlog("disc: first announce %s=%d", nm[stage], r);
+    }
+    if (r < 0 && r != *last) {
+        *last = r;
+        dlog("disc: %s send err 0x%08X", nm[stage], (unsigned)r);
+    }
+    if (r >= 0) ever_ok = 1;
+
+    if (stage == 1) b_hard = (r < 0 && !D_AGAIN(r));
+    if (stage == 2) {
+        d_hard = (r < 0 && !D_AGAIN(r));
+        /* 自愈：曾成功过、现在 Wi-Fi 连着却连广播/定向广播都报硬错 → 多半是
+         * 待机/唤醒后发送 socket 已失效，回收让下轮用新 socket 重发（30s 冷却） */
+        if (ever_ok && b_hard && d_hard) {
+            uint64_t t = now_ms();
+            if (t - last_rc_ms > 30000) {
+                last_rc_ms = t;
+                recycle_tx_now();
+                dlog("disc: bcast+dnet both hard-fail -> auto recycle tx");
+            }
+        }
+    }
 }
 
 void disc_tick_announce(void)
 {
+    uint64_t now;
     if (g_state != 1 || !g_run) {
         /* 闸门挡路：记录一次，便于判断 tick 有被调用但状态被重置 */
         static int gate = 0;
@@ -297,38 +346,26 @@ void disc_tick_announce(void)
         if (was) dlog("disc: tx recycled after link change");
     }
 
-    if (++ann_ticks < 10) return;
-    ann_ticks = 0;
-
     if (g_tx_sock < 0 && disc_open_tx() < 0)
         return;                     /* 发送 socket 没建起来，下一轮再试 */
 
-    {
-        int g = send_announce_group();
-        int b = send_announce_bcast();
-        int d = send_announce_dnet();
-        if (ann_first) {
-            ann_first = false;
-            dlog("disc: first announce sent (group=%d bcast=%d dnet=%d)", g, b, d);
-        }
-        if (g < 0 && g != g_err) { g_err = g; dlog("disc: group send err 0x%08X", (unsigned)g); }
-        if (b < 0 && b != b_err) { b_err = b; dlog("disc: bcast send err 0x%08X", (unsigned)b); }
-        if (d < 0 && d != d_err) { d_err = d; dlog("disc: dnet send err 0x%08X", (unsigned)d); }
-        if (b >= 0 || d >= 0) ever_ok = 1;
+    /* 错峰的第 2/3 份：到点补发（tick 粒度 500ms，实际落在 +1.0~1.5s / +2.0~2.5s）。
+     * 必须放在轮次计数之前——它们是上一轮计划的，不该等下一轮。 */
+    now = now_ms();
+    if (ann_b_due && now >= ann_b_due) { ann_b_due = 0; ann_send_stage(1); }
+    if (ann_d_due && now >= ann_d_due) { ann_d_due = 0; ann_send_stage(2); }
 
-        /* 自愈：曾成功过、现在 Wi-Fi 连着却连广播/定向广播都报硬错 → 多半是
-         * 待机/唤醒后发送 socket 已失效，回收让下轮用新 socket 重发（30s 冷却） */
-        if (ever_ok && b < 0 && d < 0 && !D_AGAIN(b) && !D_AGAIN(d)) {
-            uint64_t t = now_ms();
-            if (t - last_rc_ms > 30000) {
-                last_rc_ms = t;
-                recycle_tx_now();
-                dlog("disc: bcast=%d dnet=%d both hard-fail -> auto recycle tx",
-                     b, d);
-            }
-        }
-        table_purge();
-    }
+    if (++ann_ticks < 10) return;
+    ann_ticks = 0;
+
+    /* 新一轮：先作废上一轮没来得及发的阶段，再发组播并排好两次补发 */
+    ann_b_due = ann_d_due = 0;
+    b_hard = d_hard = 0;
+    ann_send_stage(0);
+    now = now_ms();
+    ann_b_due = now + ANN_STAGE_GAP_MS;
+    ann_d_due = now + 2 * ANN_STAGE_GAP_MS;
+    table_purge();
 }
 
 /* ---------- 发送 socket ----------
