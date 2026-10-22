@@ -259,7 +259,7 @@ void page_progress_render(void)
     char ov[48];
     snprintf(ov, sizeof ov, tr("Total   %d%%"), g_app.prog_pct);
     w_text(40, 376, 1.15f, theme->text, "%s", ov);
-    if (g_app.prog_done || g_app.prog_cancel || fail_state) {
+    if (g_app.prog_done || g_app.prog_cancel || fail_state || partial) {
         char stbuf[48];
         const char *st;
         uint32_t sc;
