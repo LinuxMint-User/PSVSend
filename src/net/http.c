@@ -412,8 +412,11 @@ static int own_identity(void)
 {
     int rc = 0;
     if (g_own_ready) return 0;
-    if (g_own_mtx < 0) g_own_mtx = sceKernelCreateMutex("psvsend_tlsown", 0, 0, NULL);
-    if (g_own_mtx >= 0) sceKernelLockMutex(g_own_mtx, 1, NULL);
+    /* 锁必须在 http_start 里先建好（连接线程只会在那之后才存在）；此处若还
+     * 去"惰性创建"，两条连接同时首进入会各建一把锁、各锁各的，等于没有锁，
+     * 进而并发对 g_own/g_ownpk 做 init/parse。锁没建好就当场失败，让握手重试。 */
+    if (g_own_mtx < 0) return -1;
+    sceKernelLockMutex(g_own_mtx, 1, NULL);
     if (!g_own_ready) {
         mbedtls_x509_crt_init(&g_own);
         mbedtls_pk_init(&g_ownpk);
@@ -427,7 +430,7 @@ static int own_identity(void)
             g_own_ready = 1;
         }
     }
-    if (g_own_mtx >= 0) sceKernelUnlockMutex(g_own_mtx, 1);
+    sceKernelUnlockMutex(g_own_mtx, 1);
     return rc;
 }
 
@@ -1313,8 +1316,12 @@ static void http_reap_zombie(void)
 int http_start(void)
 {
     /* 真机实测：4567 可绑，53317（动态区高位）被系统保留 EACCES。
-     * 候选顺序把已验证可用的低端口放前面，避免每次启动都白试高端口。 */
-    static const int cand[] = { 4567, 53318, 53316, 53319, 55555, 0 };
+     * 候选顺序把已验证可用的低端口放前面，避免每次启动都白试高端口。
+     * 末尾不要放 0（临时端口）：bind(0) 必成功，但实际端口要靠 getsockname
+     * 才知道，而公告里带的是本函数返回的端口 → 对端会拿到 0 连不上；
+     * 且 g_port 为 0 会让"已在跑"判断与 watch 的重启条件同时失灵（反复新建
+     * listener）。全候选失败就老实返回失败，交给 watch 下一轮重试。 */
+    static const int cand[] = { 4567, 53318, 53316, 53319, 55555 };
     SceNetSockaddrIn sa;
     int one = 1, i, s = -1, chosen = 0;
 
@@ -1325,6 +1332,9 @@ int http_start(void)
     if (g_conn_mtx < 0)              /* 连接登记表锁：随服务器首次启动创建，
                                       * 跨 stop/start 复用（stop 不销毁） */
         g_conn_mtx = sceKernelCreateMutex("psvsend_conn", 0, 0, NULL);
+    if (g_own_mtx < 0)               /* 本机身份解析锁：必须早于任何连接线程
+                                      * 创建（own_identity 不再惰性建锁） */
+        g_own_mtx = sceKernelCreateMutex("psvsend_tlsown", 0, 0, NULL);
 
     for (i = 0; i < (int)(sizeof cand / sizeof cand[0]); i++) {
         int r;

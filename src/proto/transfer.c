@@ -1595,7 +1595,23 @@ int xfer_start(const char *ip, int port, const char *proto, const char *fp,
         return -1;
     }
     dlog("xfer: thread create -> 0x%08X", (unsigned)g_j.th);
-    sceKernelStartThread(g_j.th, 0, NULL);
+    {
+        int sr = sceKernelStartThread(g_j.th, 0, NULL);
+        if (sr < 0) {
+            /* 起不来必须在这里收尾：active 上面已置 true，不清就再也没有
+             * 传输能启动（xfer_start 见 active 直接拒绝），线程对象也泄漏。 */
+            dlog("xfer: thread start fail 0x%08X", (unsigned)sr);
+            sceKernelDeleteThread(g_j.th);
+            lock();
+            g_j.th = -1;
+            g_j.v.active = false;
+            g_j.v.finished = true;
+            g_j.v.ok = false;
+            snprintf(g_j.v.err, sizeof g_j.v.err, "cannot start transfer thread");
+            unlock();
+            return -1;
+        }
+    }
     return 0;
 }
 

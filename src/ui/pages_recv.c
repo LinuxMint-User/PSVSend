@@ -300,6 +300,7 @@ static void start_recv(void)
     if (n == 0) { recv_reject_close(); return; }   /* 全被勾掉：当拒绝 */
     xf_count = n;
     xf_scroll = 0;
+    spd_reset();                     /* 上一笔的速度采样作废（间隔 <1s 时不会自动清） */
     g_app.prog_name[0] = 0;
     g_app.prog_size = tot;
     g_app.prog_dir = 1;

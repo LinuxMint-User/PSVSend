@@ -739,6 +739,7 @@ void scan_trigger(void)
         }
         if (sceKernelStartThread(t, 0, NULL) < 0) {
             dlog("scan: thread start fail");
+            sceKernelDeleteThread(t);   /* 不删：线程对象连同 128KB 栈一直挂着 */
             return;
         }
         g_thr = t;

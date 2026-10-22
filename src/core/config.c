@@ -249,12 +249,22 @@ static void config_write_locked(void)
                        0777);
         if (fd >= 0) {
             w = sceIoWrite(fd, out, (unsigned)len);
+            if (w == len) sceIoSyncByFd(fd, 0);
             sceIoClose(fd);
             if (w != len) dlog("cfg: direct write %d/%d fail", w, len);
         } else {
             dlog("cfg: direct open fail 0x%08X", (unsigned)fd);
+            w = -1;
         }
-        sceIoRemove(CFG_TMP);
+        if (fd >= 0 && w == len) {
+            sceIoRemove(CFG_TMP);        /* 已完整落盘，tmp 不再需要 */
+        } else {
+            /* 直写没写全：此时盘上是半截 config，留着它会让启动自愈失效
+             * （自愈要求"config 缺失 + tmp 完整"）。删掉半截文件、保留完整
+             * tmp，下次开机由 config_init 改名恢复，设置不至于退回默认。 */
+            sceIoRemove(PSVSEND_CONFIG);
+            dlog("cfg: keep tmp for recovery on next boot");
+        }
     }
 }
 

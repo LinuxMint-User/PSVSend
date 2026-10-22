@@ -49,6 +49,18 @@ static void spd_add(uint64_t now, SceOff bytes)
     s_spd_push_t = now;
 }
 
+/* 新传输开始：上一笔的采样与冻结读数全部作废。两笔间隔 <1s 时 spd_update
+ * 的"离开过 >1s"判据不成立，会沿用上一笔样本（首 300ms 显示 0 或冻结值），
+ * 故由 start_send / start_recv 在会话起点显式复位。 */
+void spd_reset(void)
+{
+    s_spd_n = 0;
+    s_spd_head = 0;
+    s_spd_push_t = 0;
+    s_spd_draw_t = 0;
+    s_spd_last = 0.0;
+}
+
 /* 每帧调用一次（仅在高级面板可见时）：推进采样并返回窗口速率（十进制 MB/s） */
 static double spd_update(SceOff bytes)
 {
@@ -56,9 +68,7 @@ static double spd_update(SceOff bytes)
     int i, oldest;
     /* 页面刚进来 / 离开过（>1s 没画）→ 旧采样作废，避免跨传输算差 */
     if (s_spd_draw_t == 0 || now - s_spd_draw_t > 1000000ull) {
-        s_spd_n = 0;
-        s_spd_head = 0;
-        s_spd_push_t = 0;
+        spd_reset();
         spd_add(now, bytes);
     }
     s_spd_draw_t = now;
@@ -100,6 +110,7 @@ void page_progress_render(void)
     bool fail_state = false, partial = false;
     XferInfo xv;
     const char *msg = NULL;
+    char msg_buf[160] = "";        /* 接收路径的错误文案落点：rs 出块后不可用 */
     uint32_t msg_col = theme->text_dim;
 
     if (g_app.prog_dir == 0) {
@@ -204,6 +215,12 @@ void page_progress_render(void)
                 msg = tr("Session was not created (request expired).");
                 msg_col = theme->danger;
             }
+        }
+        /* rs 是本分支的局部快照：rs.err 的地址出了作用域就不再保证有效，而
+         * msg 要到页面底部才画。指向 rs.err 的一律先拷进函数级缓冲。 */
+        if (msg == rs.err) {
+            snprintf(msg_buf, sizeof msg_buf, "%s", rs.err);
+            msg = msg_buf;
         }
     }
     if (active < 0 && xf_count > 0) active = xf_count - 1;

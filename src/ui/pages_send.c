@@ -869,6 +869,7 @@ static void start_send(int dev_idx)
     }
     g_app.dev_target = dev_idx;   /* 仅用于进度页返回时恢复选中行 */
     g_app.prog_dir = 0;
+    spd_reset();                  /* 上一笔的速度采样作废（间隔 <1s 时不会自动清） */
     xf_scroll = 0;
     g_app.prog_pct = 0;
     g_app.prog_done = false;
