@@ -820,7 +820,15 @@ static char *build_prepare_json(void)
  * 即收尾，不另设结束标志。每文件 2 条线程、64KB 堆缓冲；并发 N 路即 2N 条。
  * 与接收侧（receive.c 的 sha/wr 线程）同口径：起不来就判本文件失败，不做退化
  * 分支。 */
+/* 流水线槽位（d190）：静态、有界，读线程直接持有它。主线程 join 超时时不再
+ * DeleteThread/free 一个可能还在读盘的线程上下文，而是把槽位标 ZOMBIE、
+ * 资源全部冻结，等线程退出后由 tx_reap_zombies 回收。 */
+#define TX_SLOTS 6               /* = PARALLEL_MAX（每文件一条流水线） */
+enum { TXSLOT_FREE = 0, TXSLOT_ACTIVE, TXSLOT_ZOMBIE };
+
 typedef struct {
+    int    state;                    /* TXSLOT_* */
+    int    stuck_stage;              /* 遗弃时卡在哪（目前只有 1=join 超时） */
     SceUID fd, thr, sem_free, sem_full;
     volatile int quit;               /* 发送侧出错/取消：让读线程尽快退出 */
     volatile int rd_err;             /* -1=读错误 -2=文件比声明的 size 短（0=正常） */
@@ -830,6 +838,9 @@ typedef struct {
     char  *buf;                      /* TX_BLOCKS * TX_CHUNK */
     uint64_t t_read;                 /* 读盘累计（发送侧 join 之后才读） */
 } TxPipe;
+
+static TxPipe g_tx[TX_SLOTS];
+static SceUID g_tx_mtx = -1;         /* 只保护槽位状态；不反向取 g_j 锁 */
 
 static int tx_reader(SceSize args, void *argp)
 {
@@ -866,34 +877,67 @@ static int tx_reader(SceSize args, void *argp)
     return 0;
 }
 
-/* 收掉流水线：唤停读线程 → join → 删线程/信号量 → 释放缓冲。
- * started=0 表示线程只是创建了没启动过（创建后启动失败），此时不能 join。 */
-static void tx_pipe_stop(TxPipe *p, int started)
+static void tx_lock(void)   { if (g_tx_mtx >= 0) sceKernelLockMutex(g_tx_mtx, 1, NULL); }
+static void tx_unlock(void) { if (g_tx_mtx >= 0) sceKernelUnlockMutex(g_tx_mtx, 1); }
+
+/* 线程是否已退出（1=已退出）。异常返回一律当"没退出"：宁可多挂一轮。 */
+static int tx_thread_exited(SceUID thr)
 {
-    if (started) {
-        SceUInt tmo = 5000000;
-        p->quit = 1;
-        sceKernelSignalSema(p->sem_free, 1);   /* 读线程可能正等空块 */
-        sceKernelWaitThreadEnd(p->thr, NULL, &tmo);
-    }
+    int st = 0;
+    if (thr < 0) return 1;
+    return sceKernelGetThreadExitStatus(thr, &st) >= 0;
+}
+
+/* 释放槽位内资源（持 g_tx_mtx，且已确认读线程退出） */
+static void tx_slot_do_release(TxPipe *p)
+{
     if (p->thr >= 0) sceKernelDeleteThread(p->thr);
     if (p->sem_full >= 0) sceKernelDeleteSema(p->sem_full);
     if (p->sem_free >= 0) sceKernelDeleteSema(p->sem_free);
-    free(p->buf);
-    p->buf = NULL;
+    if (p->buf) { free(p->buf); p->buf = NULL; }
+    if (p->fd >= 0) sceIoClose(p->fd);
+    memset(p, 0, sizeof *p);
+    p->thr = p->sem_free = p->sem_full = p->fd = -1;
+    p->state = TXSLOT_FREE;
 }
 
-/* 起"读线程 + 本线程消费"的双缓冲流水。
- * 返回 0=已起（消费方按 sem_full 取块）、1=零字节（无需流水线）、<0=建不起来。
- * 消费方负责调 tx_pipe_stop（started=0 时也能安全清理）。 */
-static int tx_pipe_start(TxPipe *p, SceUID fd, SceOff size)
+/* 回收已退出的 ZOMBIE 槽位（发送任务开头调用，只持 g_tx_mtx） */
+static void tx_reap_zombies(void)
 {
-    int started = 0;
-    memset(p, 0, sizeof *p);
-    p->fd = fd;
-    p->thr = p->sem_free = p->sem_full = -1;
-    p->remain = size;
-    if (size <= 0) return 1;
+    int i;
+    if (g_tx_mtx < 0) return;
+    tx_lock();
+    for (i = 0; i < TX_SLOTS; i++) {
+        TxPipe *p = &g_tx[i];
+        if (p->state != TXSLOT_ZOMBIE) continue;
+        if (!tx_thread_exited(p->thr)) continue;
+        dlog("xfer: reap slot %d (stage %d)", i, p->stuck_stage);
+        tx_slot_do_release(p);
+    }
+    tx_unlock();
+}
+
+/* 起"读线程 + 本线程消费"的双缓冲流水（占一个静态槽位）。
+ * 返回槽位指针；*zero=1 表示零字节文件（无需流水线，仍要 tx_pipe_stop 归还）；
+ * NULL=并发已满或资源不足（fd 已由槽位接管并关闭，调用者不要再关）。 */
+static TxPipe *tx_pipe_begin(SceUID fd, SceOff size, int *zero)
+{
+    int i, started = 0;
+    TxPipe *p = NULL;
+    *zero = 0;
+    tx_lock();
+    for (i = 0; i < TX_SLOTS; i++)
+        if (g_tx[i].state == TXSLOT_FREE) { p = &g_tx[i]; break; }
+    if (p) {
+        memset(p, 0, sizeof *p);
+        p->fd = fd;
+        p->thr = p->sem_free = p->sem_full = -1;
+        p->remain = size;
+        p->state = TXSLOT_ACTIVE;
+    }
+    tx_unlock();
+    if (!p) return NULL;
+    if (size <= 0) { *zero = 1; return p; }
     p->buf = (char *)malloc((size_t)TX_CHUNK * TX_BLOCKS);
     if (p->buf)
         p->sem_free = sceKernelCreateSema("psvsend_sfree", 0, TX_BLOCKS, TX_BLOCKS, NULL);
@@ -909,9 +953,35 @@ static int tx_pipe_start(TxPipe *p, SceUID fd, SceOff size)
     if (!started) {
         dlog("xfer: pipeline setup fail (thr=%d sem=%d/%d buf=%d)", (int)p->thr,
              (int)p->sem_free, (int)p->sem_full, p->buf != NULL);
-        tx_pipe_stop(p, 0);
+        tx_lock();
+        tx_slot_do_release(p);
+        tx_unlock();
+        return NULL;
+    }
+    return p;
+}
+
+/* 收掉流水线。返回 0=已释放（fd 也关了）；-1=读线程未退出 → 槽位转 ZOMBIE，
+ * fd/缓冲全部冻结（调用者不得再关 fd），下次发送开头由 tx_reap_zombies 回收。 */
+static int tx_pipe_stop(TxPipe *p)
+{
+    int stuck = 0;
+    if (p->thr >= 0) {
+        SceUInt tmo = 5000000;
+        p->quit = 1;
+        sceKernelSignalSema(p->sem_free, 1);   /* 读线程可能正等空块 */
+        if (sceKernelWaitThreadEnd(p->thr, NULL, &tmo) < 0) stuck = 1;
+    }
+    tx_lock();
+    if (stuck) {
+        p->stuck_stage = 1;
+        p->state = TXSLOT_ZOMBIE;
+        tx_unlock();
+        dlog("xfer: read thread stuck, slot %d -> zombie", (int)(p - g_tx));
         return -1;
     }
+    tx_slot_do_release(p);
+    tx_unlock();
     return 0;
 }
 
@@ -925,46 +995,53 @@ static int tx_pipe_start(TxPipe *p, SceUID fd, SceOff size)
  * 1=被取消。读失败/文件短读时不带 sha（上传阶段照旧会报该文件失败）。 */
 static int hash_one(int i, char *out)
 {
-    TxPipe p;
+    TxPipe *p;
     mbedtls_sha256_context ctx;
     unsigned char dig[32];
     SceUID fd;
-    int st, cancelled = 0;
+    int cancelled = 0, zero = 0, rd_err = 0;
 
     out[0] = 0;
     fd = sceIoOpen(g_j.files[i].path, SCE_O_RDONLY, 0);
     if (fd < 0) return 0;
-    st = tx_pipe_start(&p, fd, g_j.files[i].size);
-    if (st != 0) {                       /* 零字节或起不来：不带 sha */
-        sceIoClose(fd);
+    tx_reap_zombies();                   /* 顺手回收已退出的僵尸槽位 */
+    p = tx_pipe_begin(fd, g_j.files[i].size, &zero);
+    if (!p)                              /* 并发已满/资源不足：不带 sha（fd 已由槽位关闭） */
+        return 0;
+    if (zero) {                          /* 零字节文件：不带 sha */
+        tx_pipe_stop(p);
         return 0;
     }
     mbedtls_sha256_init(&ctx);
     mbedtls_sha256_starts(&ctx, 0);
     for (;;) {
         int c, len;
-        sceKernelWaitSema(p.sem_full, 1, NULL);
-        c = p.idx_wr % TX_BLOCKS;
-        len = p.len[c];
-        ++p.idx_wr;
+        sceKernelWaitSema(p->sem_full, 1, NULL);
+        c = p->idx_wr % TX_BLOCKS;
+        len = p->len[c];
+        ++p->idx_wr;
         if (len <= 0) {                  /* 终止块（读满 / 读失败） */
-            sceKernelSignalSema(p.sem_free, 1);
+            sceKernelSignalSema(p->sem_free, 1);
             break;
         }
-        mbedtls_sha256_update(&ctx, (unsigned char *)p.buf + (size_t)c * TX_CHUNK,
+        mbedtls_sha256_update(&ctx, (unsigned char *)p->buf + (size_t)c * TX_CHUNK,
                               (unsigned)len);
-        sceKernelSignalSema(p.sem_free, 1);
+        sceKernelSignalSema(p->sem_free, 1);
         lock();
         g_j.v.hash_done += len;
         g_j.v.hash_cur_done += len;
         unlock();
         if (g_j.cancel) { cancelled = 1; break; }
     }
-    tx_pipe_stop(&p, 1);
-    sceIoClose(fd);
-    if (!cancelled && p.rd_err)
+    rd_err = p->rd_err;
+    if (tx_pipe_stop(p) < 0) {           /* 读盘线程卡死：槽位遗弃，本次不带 sha */
+        dlog("xfer: hash slot abandoned (read stuck), no sha for file %d", i + 1);
+        mbedtls_sha256_free(&ctx);
+        return cancelled;
+    }
+    if (!cancelled && rd_err)
         dlog("xfer: hash read error on file %d (no sha)", i + 1);
-    if (cancelled || p.rd_err) {
+    if (cancelled || rd_err) {
         mbedtls_sha256_free(&ctx);
         return cancelled;
     }
@@ -1030,11 +1107,11 @@ static int upload_one(int i)
     char q[320];
     char abuf[512];                 /* 上传回执缓冲（头 + 空 body） */
     Conn c;
-    TxPipe p;                       /* 读/发双缓冲流水（见 tx_reader） */
+    TxPipe *p = NULL;               /* 读/发双缓冲流水槽位（见 tx_reader） */
     int fd, sr = 0, blen, tx_started = 0;
-    int code = 0;
+    int code = 0, zero = 0, abandoned = 0, rd_err = 0;
     int n_wait = 0;                 /* 发送窗口没空的退避次数 */
-    uint64_t t_send = 0, t_wait = 0;
+    uint64_t t_send = 0, t_wait = 0, t_read = 0;
     SceOff sent_file = 0;
 
     if (i < 0 || i >= g_j.count) return 0;
@@ -1079,58 +1156,66 @@ static int upload_one(int i)
         sceIoClose(fd);
         return 1;
     }
-    /* 读/发双缓冲流水：读盘交给读线程，本线程只做 ssl_write。 */
-    sr = tx_pipe_start(&p, fd, g_j.files[i].size);
-    if (sr < 0) {
+    /* 读/发双缓冲流水：读盘交给读线程，本线程只做 ssl_write。
+     * 槽位满（并发上限/资源不足）时 fd 已由槽位接管并关闭。 */
+    tx_reap_zombies();
+    p = tx_pipe_begin(fd, g_j.files[i].size, &zero);
+    if (!p) {
         conn_close(&c);
-        sceIoClose(fd);
         mark_file_failed(i, "out of memory for %s", g_j.files[i].name);
         return 0;
     }
-    tx_started = (sr == 0);          /* 零字节文件不起流水线，直接等回执 */
-    sr = 0;                          /* 流水线就绪与否不参与下面的错误判定 */
+    tx_started = !zero;              /* 零字节文件不起流水线，直接等回执 */
     while (tx_started) {
         int s, len;
         uint64_t t;
-        sceKernelWaitSema(p.sem_full, 1, NULL);
-        s = p.idx_wr % TX_BLOCKS;
-        len = p.len[s];
-        ++p.idx_wr;
+        sceKernelWaitSema(p->sem_full, 1, NULL);
+        s = p->idx_wr % TX_BLOCKS;
+        len = p->len[s];
+        ++p->idx_wr;
         if (len <= 0) {                 /* 读线程的终止块（读满 size / 读失败） */
-            sceKernelSignalSema(p.sem_free, 1);
+            sceKernelSignalSema(p->sem_free, 1);
             break;
         }
         t = now_us();
-        sr = conn_send_all(&c, p.buf + (size_t)s * TX_CHUNK, len, &t_wait, &n_wait);
+        sr = conn_send_all(&c, p->buf + (size_t)s * TX_CHUNK, len, &t_wait, &n_wait);
         t_send += now_us() - t;
-        sceKernelSignalSema(p.sem_free, 1);
+        sceKernelSignalSema(p->sem_free, 1);
         if (sr < 0) break;
         sent_file += len;
         set_file_state(i, 1, sent_file);
     }
-    tx_pipe_stop(&p, tx_started);
+    t_read = p->t_read;
+    rd_err = p->rd_err;
+    abandoned = tx_pipe_stop(p) < 0;  /* 1=读盘线程卡死，槽位转 ZOMBIE */
+    p = NULL;
     dlog("xfer: file %d/%d body %lld/%lld B  read %llu send %llu wait %llu ms (%d)  r=%d",
          i + 1, g_j.count, (long long)sent_file, (long long)g_j.files[i].size,
-         (unsigned long long)(p.t_read / 1000), (unsigned long long)(t_send / 1000),
+         (unsigned long long)(t_read / 1000), (unsigned long long)(t_send / 1000),
          (unsigned long long)(t_wait / 1000), n_wait, sr);
     if (sr < 0) {
         if (sr == -2) cancel_notify_peer(); /* 发送中被取消：断流前通知 */
         conn_close(&c);
-        sceIoClose(fd);
         /* -2 取消 / -4 别人已判"对端不在"：本 worker 收手，终态交监督者 */
         if (sr == -2 || sr == -4) return 1;
         /* 上传中途断流：对端没了（连接级）→ 全局中止 */
         abort_xfer(i, "send error on %s", g_j.files[i].name);
         return 1;
     }
-    if (p.rd_err) {
+    if (abandoned) {
+        /* 存储卡死、流水线已遗弃：只标这个文件失败，其余照发。fd/缓冲冻结在
+         * 槽位里（由下次发送开头的 reap 回收），这里只关 socket。 */
+        conn_close(&c);
+        mark_file_failed(i, "storage not responding for %s", g_j.files[i].name);
+        return 0;
+    }
+    if (rd_err) {
         /* 只算这一个文件失败，其余照发。**故意不发 cancel**：cancel 是会话级
          * （/cancel?sessionId），会把官方对端的整批一起取消；而对端若是本客户端，
          * 它已按"单文件失败"处理，不需要这条通知。关连接即让对端看到 body 截断
          * 并收尾该文件（d188 起接收侧不再因此判整个会话失败）。 */
         conn_close(&c);
-        sceIoClose(fd);
-        if (p.rd_err == -2)
+        if (rd_err == -2)
             mark_file_failed(i, "%s shrank during send", g_j.files[i].name);
         else
             mark_file_failed(i, "read error on %s", g_j.files[i].name);
@@ -1139,7 +1224,6 @@ static int upload_one(int i)
     /* 等对方回执（2xx 即成功） */
     blen = read_resp(&c, &code, abuf, sizeof abuf, OP_TIMEOUT_US);
     conn_close(&c);
-    sceIoClose(fd);
     if (blen == -2) {
         cancel_notify_peer();       /* body 已发完等回执时取消：收尾前通知 */
         return 1;
@@ -1444,6 +1528,14 @@ int xfer_start(const char *ip, int port, const char *proto, const char *fp,
     int i;
     if (g_mtx < 0)
         g_mtx = sceKernelCreateMutex("psvsend_xfer", 0, 0, NULL);
+    if (g_tx_mtx < 0) {
+        int k;
+        g_tx_mtx = sceKernelCreateMutex("psvsend_txslot", 0, 0, NULL);
+        for (k = 0; k < TX_SLOTS; k++) {
+            memset(&g_tx[k], 0, sizeof g_tx[k]);
+            g_tx[k].thr = g_tx[k].sem_free = g_tx[k].sem_full = g_tx[k].fd = -1;
+        }
+    }
     lock();
     if (g_j.v.active) {
         /* 已有传输在跑（含"上一次刚取消、线程还在收尾"的窗口）：只报失败返回，

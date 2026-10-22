@@ -43,6 +43,8 @@
  * 把它当残留删掉——永久丢数据。改成一个正常文件名里基本不会出现的后缀。
  * 注：不再顺带清扫旧版遗留的 *.part（宁可留垃圾也不误删用户文件）。 */
 #define RECV_PART_SUFFIX       ".psvsend.tmp"
+#define RECV_BLOCKS            3         /* 收体轮转缓冲块数（每块 RECV_CHUNK） */
+#define RECV_SLOTS             8         /* 收体流水线槽位上限（= 并发 upload 上限） */
 
 /* 会话生命周期：无 / 待决定 / 活动（接受后直到 recv_clear） */
 enum { PH_NONE = 0, PH_PENDING, PH_ACTIVE };
@@ -59,7 +61,38 @@ typedef struct {
     char sha256[65];      /* 期望 sha256（准备报文里给了才校验，空串=不校验） */
     int  st;              /* 0=等待 1=完成 2=跳过 3=失败 */
     bool busy;            /* 本文件正在流式收体（同会话多文件可并发，各自独立） */
+    bool orphan;          /* 收体流水线被遗弃：临时文件由槽位接管，cleanup_parts 跳过 */
 } RFile;
+
+/* ---- 收体流水线槽位 ------------------------------------------------
+ * 每个 upload 占一个固定槽位（上限 RECV_SLOTS），槽位是静态的，消费者线程
+ * 直接持有它的指针。这样主线程因存储卡死而超时返回时，仍在跑的线程不会踩到
+ * 已释放的栈帧/堆内存（旧实现把 WrCtx 放在栈上，超时后照样 free/DeleteThread）。
+ *   FREE → ACTIVE →（正常收尾，两线程已退）→ FREE
+ *                 └→（收尾超时）→ ZOMBIE →（线程退出后 reap 回收）→ FREE
+ * ZOMBIE 期间缓冲/信号量/线程句柄/fd/临时文件全部冻结，只由 reap_zombies 在
+ * 确认线程退出后释放。reap 只持 g_reap_mtx，绝不反向取 g_lock。 */
+enum { SLOT_FREE = 0, SLOT_ACTIVE, SLOT_ZOMBIE };
+
+typedef struct {
+    int   state;              /* SLOT_* */
+    int   stuck_stage;        /* 遗弃时卡在哪：1=等空块 2=join 3=起线程 */
+    int   detached;           /* 已遗弃：消费者不得再碰 g_sess / f（锁内检查） */
+    char  part[800];          /* 遗弃文件的临时路径（reap 时删；正常路径为空） */
+    RFile *f;                 /* 绑定的文件；detached 后不再解引用 */
+    SceUID thr_sha, thr_wr, sem_free, sem_sha, sem_job, fd;
+    volatile int quit;        /* 生产者收完：唤醒两条消费者退出 */
+    volatile int fail;        /* 写盘线程写失败 */
+    int    idx_in, idx_sha, idx_out;
+    int    len[RECV_BLOCKS];
+    unsigned char *buf;       /* RECV_BLOCKS * RECV_CHUNK（ACTIVE 时分配） */
+    mbedtls_sha256_context sha;  /* 内嵌：不能指向主线程栈（线程会用） */
+    int    check_sha;
+    uint64_t t_write, t_sha;
+} RecvSlot;
+
+static RecvSlot g_slots[RECV_SLOTS];
+static SceUID   g_reap_mtx = -1;   /* 保护槽位状态（g_lock 之外独立一把，锁序 g_lock → g_reap_mtx） */
 
 /* 待决定请求（PH_PENDING） */
 static struct {
@@ -110,6 +143,93 @@ static char g_dir[512];
 static void lock(void)   { if (g_mtx >= 0) sceKernelLockMutex(g_mtx, 1, NULL); }
 static void unlock(void) { if (g_mtx >= 0) sceKernelUnlockMutex(g_mtx, 1); }
 static uint64_t now_us(void) { return (uint64_t)sceKernelGetSystemTimeWide(); }
+
+/* 槽位内资源释放（调用者持 g_reap_mtx，且已确认两条线程都退出） */
+static void slot_do_release(RecvSlot *s)
+{
+    if (s->thr_sha >= 0)  sceKernelDeleteThread(s->thr_sha);
+    if (s->thr_wr >= 0)   sceKernelDeleteThread(s->thr_wr);
+    if (s->sem_job >= 0)  sceKernelDeleteSema(s->sem_job);
+    if (s->sem_sha >= 0)  sceKernelDeleteSema(s->sem_sha);
+    if (s->sem_free >= 0) sceKernelDeleteSema(s->sem_free);
+    if (s->check_sha) mbedtls_sha256_free(&s->sha);
+    if (s->buf) { free(s->buf); s->buf = NULL; }
+    if (s->fd >= 0) sceIoClose(s->fd);
+    if (s->part[0] && sceIoRemove(s->part) < 0)
+        dlog("recv: reap: remove %s failed", s->part);
+    memset(s, 0, sizeof *s);
+    s->thr_sha = s->thr_wr = s->sem_free = s->sem_sha = s->sem_job = s->fd = -1;
+    s->state = SLOT_FREE;
+}
+
+/* 线程是否已退出（1=已退出）。非零/异常返回一律当"未退出"：宁可多挂一轮，
+ * 不可误删一个可能还活着的线程。 */
+static int thread_exited(SceUID thr)
+{
+    int st = 0;
+    if (thr < 0) return 1;
+    return sceKernelGetThreadExitStatus(thr, &st) >= 0;
+}
+
+/* 回收已退出的 ZOMBIE 槽位。调用点（prepare 开头 / upload 开头 / recv_clear
+ * 开头）都在不持 g_lock 的位置，整段只持 g_reap_mtx。 */
+static void reap_zombies(void)
+{
+    int i;
+    if (g_reap_mtx < 0) return;
+    sceKernelLockMutex(g_reap_mtx, 1, NULL);
+    for (i = 0; i < RECV_SLOTS; i++) {
+        RecvSlot *s = &g_slots[i];
+        if (s->state != SLOT_ZOMBIE) continue;
+        if (!thread_exited(s->thr_wr)) continue;
+        if (!thread_exited(s->thr_sha)) continue;
+        dlog("recv: reap slot %d (stage %d)", i, s->stuck_stage);
+        slot_do_release(s);
+    }
+    sceKernelUnlockMutex(g_reap_mtx, 1);
+}
+
+/* 取一个空闲槽位（返回 NULL = 并发已满）。 */
+static RecvSlot *slot_alloc(void)
+{
+    int i;
+    RecvSlot *s = NULL;
+    if (g_reap_mtx < 0) return NULL;
+    sceKernelLockMutex(g_reap_mtx, 1, NULL);
+    for (i = 0; i < RECV_SLOTS; i++)
+        if (g_slots[i].state == SLOT_FREE) { s = &g_slots[i]; break; }
+    if (s) {
+        memset(s, 0, sizeof *s);
+        s->thr_sha = s->thr_wr = s->sem_free = s->sem_sha = s->sem_job = s->fd = -1;
+        s->state = SLOT_ACTIVE;
+        dlog("recv: slot %d allocated", (int)(s - g_slots));
+    }
+    sceKernelUnlockMutex(g_reap_mtx, 1);
+    return s;
+}
+
+/* 正常收尾：两条线程已确认退出 → 释放资源并归还槽位 */
+static void slot_release(RecvSlot *s)
+{
+    sceKernelLockMutex(g_reap_mtx, 1, NULL);
+    slot_do_release(s);
+    sceKernelUnlockMutex(g_reap_mtx, 1);
+}
+
+/* 该临时路径是否正被某个 ZOMBIE 槽位占用（alloc_paths 避让同名 part 用）。
+ * 调用点可能持 g_lock：锁序 g_lock → g_reap_mtx；reap 不取 g_lock，无环。 */
+static bool part_in_zombie(const char *part)
+{
+    int i;
+    bool hit = false;
+    if (g_reap_mtx < 0) return false;
+    sceKernelLockMutex(g_reap_mtx, 1, NULL);
+    for (i = 0; i < RECV_SLOTS; i++)
+        if (g_slots[i].state == SLOT_ZOMBIE && g_slots[i].part[0] &&
+            strcmp(g_slots[i].part, part) == 0) { hit = true; break; }
+    sceKernelUnlockMutex(g_reap_mtx, 1);
+    return hit;
+}
 
 /* 会话是否已到终态（终态后不再改变，除 recv_clear 清场） */
 static bool sess_is_terminal(int state)
@@ -289,11 +409,14 @@ static void alloc_paths(const char *raw, char *final, int fn,
         if (k == 0) snprintf(cand, sizeof cand, "%s%s", base, ext);
         else        snprintf(cand, sizeof cand, "%s (%d)%s", base, k, ext);
         snprintf(final, fn, "%s/%s", g_dir, cand);
+        snprintf(part, pn, "%s%s", final, RECV_PART_SUFFIX);
         if (sceIoGetstat(final, &st) < 0) {         /* 磁盘上不存在 */
             for (t = 0; t < prev_n; t++)            /* 本会话也没占用 */
                 if (prev[t].final[0] &&
                     strcmp(final, prev[t].final) == 0) break;
-            if (t == prev_n) break;                 /* 真正可用 */
+            /* 同名临时文件可能正被遗弃的僵尸线程写（fd 冻结、路径还占着）：
+             * 绝不复用，否则两个写者写同一个 FAT 文件。 */
+            if (t == prev_n && !part_in_zombie(part)) break;   /* 真正可用 */
         }
         if (++k > 999) {                            /* 兜底：保底名字 */
             snprintf(cand, sizeof cand, "file-%llx%s",
@@ -328,7 +451,7 @@ static void cleanup_parts(void)
 {
     int i;
     for (i = 0; i < g_sess.n; i++)
-        if (g_sess.f[i].st != 1 && !g_sess.f[i].busy)
+        if (g_sess.f[i].st != 1 && !g_sess.f[i].busy && !g_sess.f[i].orphan)
             sceIoRemove(g_sess.f[i].part);
 }
 
@@ -436,6 +559,16 @@ void recv_init(void)
     if (g_mtx < 0)
         g_mtx = sceKernelCreateMutex("psvsend_recv", 0, 0, NULL);
     if (g_mtx < 0) return;
+    if (g_reap_mtx < 0) {
+        int i;
+        g_reap_mtx = sceKernelCreateMutex("psvsend_recv_reap", 0, 0, NULL);
+        for (i = 0; i < RECV_SLOTS; i++) {
+            memset(&g_slots[i], 0, sizeof g_slots[i]);
+            g_slots[i].thr_sha = g_slots[i].thr_wr = -1;
+            g_slots[i].sem_free = g_slots[i].sem_sha = g_slots[i].sem_job = -1;
+            g_slots[i].fd = -1;
+        }
+    }
     if (!g_dir[0]) config_get_save_dir(g_dir, sizeof g_dir);
     lock();
     g_phase = PH_NONE;
@@ -552,6 +685,9 @@ static int recv_http_prepare(const char *body, const char *ip, char *resp, int r
     bool pend_accept;
 
     if (respsz > 0) resp[0] = 0;
+    /* 必须在 alloc_paths 之前：先把旧遗留槽位回收掉，避免新会话复用正被
+     * 僵尸线程写的临时文件路径。 */
+    reap_zombies();
 
     infov = json_get_val(body, "info");
     filesv = json_get_val(body, "files");
@@ -833,8 +969,34 @@ static void file_fail_locked(RFile *f, const char *err)
     if (!g_sess.err[0])
         snprintf(g_sess.err, sizeof g_sess.err, "%s", err);
     dlog("recv: file %s failed: %s", f->name, err);
-    cleanup_parts();                     /* 删掉本文件未完成的 .psvpart */
+    cleanup_parts();                     /* 删掉本文件未完成的临时文件（orphan 除外） */
     check_all_done_locked();
+}
+
+/* 遗弃流水线（调用时不持 g_lock）：业务上标该文件失败、把临时文件路径交给
+ * 槽位，资源一律冻结，等 reap_zombies 在两条线程都退出后回收。
+ * stage: 1=等空块超时 2=join 超时 3=起线程超时 */
+static void slot_abandon(RecvSlot *w, RFile *f, int stage, const char *err)
+{
+    lock();
+    w->detached = 1;             /* 消费者此后不再碰 g_sess / f（wr_thread 锁内检查） */
+    w->f = NULL;
+    if (f) snprintf(w->part, sizeof w->part, "%s", f->part);
+    /* 必须在放开 g_lock 之前把槽位标成 ZOMBIE：phase 一旦复位，新会话的
+     * alloc_paths 会来避让同名临时文件，若此时槽位还是 ACTIVE 就避不开。 */
+    sceKernelLockMutex(g_reap_mtx, 1, NULL);
+    w->stuck_stage = stage;
+    w->state = SLOT_ZOMBIE;
+    sceKernelUnlockMutex(g_reap_mtx, 1);
+    if (f) {
+        f->orphan = true;        /* cleanup_parts 跳过，临时文件由槽位接管 */
+        file_fail_locked(f, err);
+    } else if (!sess_is_terminal(g_sess.state)) {
+        sess_fail_locked(err);
+    }
+    clear_pending_finish_locked();
+    unlock();
+    dlog("recv: pipeline abandoned (stage %d): %s", stage, err);
 }
 
 /* ---- 收体三级流水：解密 / sha256 / 写盘各占一条线程 ----
@@ -848,24 +1010,11 @@ static void file_fail_locked(RFile *f, const char *err)
  * 一致；f->got/got_total 仍由写盘线程推进（= 已落盘字节），进度条不会超前。
  * 对方没给 sha256（check_sha=0）就不起 sha 线程，生产者直接投 sem_job。
  * 注意：每块 64KB，三块共 192KB/文件；多文件并发时线程与内存都按文件数倍增。 */
-#define RECV_BLOCKS 3
-
-typedef struct {
-    SceUID thr_sha, thr_wr, sem_free, sem_sha, sem_job, fd;
-    volatile int quit;                /* 生产者收完后置位，唤醒两条消费者退出 */
-    volatile int fail;                /* 写盘线程写失败 */
-    int    idx_in, idx_sha, idx_out;  /* 三个阶段各自的游标（各自独占，无需锁） */
-    int    len[RECV_BLOCKS];          /* 已发布块长度（发布后不再改） */
-    unsigned char *buf;               /* RECV_BLOCKS * RECV_CHUNK */
-    mbedtls_sha256_context *sha;
-    int    check_sha;
-    uint64_t t_write, t_sha;          /* 各自线程累加，锁内更新（见下） */
-    RFile *f;
-} WrCtx;
+/* 结构体见文件前部的 RecvSlot（静态槽位，不能放栈上）。 */
 
 static int sha_thread(SceSize args, void *argp)
 {
-    WrCtx *w = *(WrCtx **)argp;
+    RecvSlot *w = *(RecvSlot **)argp;
     (void)args;
     for (;;) {
         int s, len;
@@ -878,7 +1027,7 @@ static int sha_thread(SceSize args, void *argp)
         p = w->buf + (size_t)s * RECV_CHUNK;
         ++w->idx_sha;
         t = now_us();
-        mbedtls_sha256_update(w->sha, p, (unsigned)len);
+        mbedtls_sha256_update(&w->sha, p, (unsigned)len);
         dt = now_us() - t;
         /* 累计值进锁：生产者每 2s 在锁内读它打诊断日志，64 位量不加锁读会撕裂 */
         lock();
@@ -891,7 +1040,7 @@ static int sha_thread(SceSize args, void *argp)
 
 static int wr_thread(SceSize args, void *argp)
 {
-    WrCtx *w = *(WrCtx **)argp;
+    RecvSlot *w = *(RecvSlot **)argp;
     (void)args;
     for (;;) {
         int s, len;
@@ -908,8 +1057,12 @@ static int wr_thread(SceSize args, void *argp)
         dt = now_us() - t;
         lock();
         w->t_write += dt;
-        w->f->got += len;
-        g_sess.got_total += len;
+        /* 流水线已遗弃（主线程超时返回）时不得再碰 g_sess：临时文件可能已
+         * 被新会话复用，f 也可能是别的会话的文件。 */
+        if (!w->detached && w->f) {
+            w->f->got += len;
+            g_sess.got_total += len;
+        }
         unlock();
         sceKernelSignalSema(w->sem_free, 1);
     }
@@ -927,9 +1080,8 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     int idx = -1, i;
     SceUID fd = -1;
     bool check_sha = false, aborted = false;
-    mbedtls_sha256_context hctx;
     unsigned char digest[32];
-    WrCtx w;                         /* 三级流水（见 sha_thread / wr_thread） */
+    RecvSlot *w = NULL;              /* 三级流水槽位（见文件前部 RecvSlot） */
     SceOff produced = 0;             /* 已从 socket 收下的字节（写线程可能还在追） */
     int rd_fail = 0;                 /* fn 的失败返回值（0 = 正常） */
     int wr_ok = 0;                   /* 流水线线程是否都起来了 */
@@ -938,9 +1090,12 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     uint64_t t_read = 0, t_mark;     /* 生产者侧（socket 收 + TLS 解密）累计耗时 */
     uint64_t t_wait = 0, w_mark;     /* 生产者等空缓冲（=写线程追不上）的累计耗时 */
     uint64_t l_read = 0, l_wait = 0, l_write = 0, l_sha = 0; /* 上一条日志时的累计值 */
+    uint64_t t_write = 0, t_sha = 0; /* 槽位释放前取出：之后槽位会被 memset 归还 */
+    int wr_fail = 0;                 /* 同上：写盘线程的失败标志 */
     SceOff log_got = 0;
 
     if (!query || !fn || !ctx) return 400;
+    reap_zombies();                  /* 传输开头顺手回收已退出的僵尸槽位 */
     query_get(query, "sessionId", sid, sizeof sid);
     query_get(query, "fileId", fid, sizeof fid);
     query_get(query, "token", tok, sizeof tok);
@@ -994,11 +1149,6 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     check_sha = f->sha256[0] != 0 && g_cfg.recv_sha;
     unlock();
 
-    if (check_sha) {
-        mbedtls_sha256_init(&hctx);
-        mbedtls_sha256_starts(&hctx, 0);
-    }
-
     fd = sceIoOpen(f->part, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     if (fd < 0) {
         dlog("recv: open part fail 0x%08X (%s)", (unsigned)fd, f->part);
@@ -1006,64 +1156,74 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         file_fail_locked(f, "无法创建文件");
         clear_pending_finish_locked();
         unlock();
-        if (check_sha) mbedtls_sha256_free(&hctx);
         return 500;
     }
 
+    /* 取一个静态槽位：并发已满就拒这一条（503 = 临时性的，对端可重试）。 */
+    w = slot_alloc();
+    if (!w) {
+        sceIoClose(fd); fd = -1;
+        lock();
+        file_fail_locked(f, "接收并发已满");
+        clear_pending_finish_locked();
+        unlock();
+        return 503;
+    }
     /* 起两条消费者线程（sha256 / 写盘）：解密留在本线程，三级流水。
      * 失败只判这个文件失败（内存/句柄耗尽时其余文件通常也起不来，但按
      * 单文件语义处理更接近官方：能收一个算一个），不做退化分支。 */
-    memset(&w, 0, sizeof w);
-    w.sem_free = w.sem_sha = w.sem_job = w.thr_sha = w.thr_wr = -1;
-    w.fd = fd;
-    w.f = f;
-    w.check_sha = check_sha ? 1 : 0;
-    w.sha = &hctx;
-    w.buf = (unsigned char *)malloc((size_t)RECV_CHUNK * RECV_BLOCKS);
-    if (w.buf)
-        w.sem_free = sceKernelCreateSema("psvsend_wfree", 0, RECV_BLOCKS, RECV_BLOCKS, NULL);
-    if (w.sem_free >= 0)
-        w.sem_sha = sceKernelCreateSema("psvsend_wsha", 0, 0, RECV_BLOCKS, NULL);
-    if (w.sem_sha >= 0)
-        w.sem_job = sceKernelCreateSema("psvsend_wjob", 0, 0, RECV_BLOCKS, NULL);
-    if (w.sem_job >= 0)
-        w.thr_wr = sceKernelCreateThread("psvsend_wr", wr_thread, 0x40, 0x20000, 0,
-                                         SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
-    /* 对方给了 sha256 才起校验线程；没给就让生产者直接投 sem_job。 */
-    if (w.thr_wr >= 0 && w.check_sha)
-        w.thr_sha = sceKernelCreateThread("psvsend_sha", sha_thread, 0x40, 0x20000, 0,
+    w->fd = fd;
+    w->f = f;
+    w->check_sha = check_sha ? 1 : 0;
+    if (check_sha) {
+        mbedtls_sha256_init(&w->sha);
+        mbedtls_sha256_starts(&w->sha, 0);
+    }
+    w->buf = (unsigned char *)malloc((size_t)RECV_CHUNK * RECV_BLOCKS);
+    if (w->buf)
+        w->sem_free = sceKernelCreateSema("psvsend_wfree", 0, RECV_BLOCKS, RECV_BLOCKS, NULL);
+    if (w->sem_free >= 0)
+        w->sem_sha = sceKernelCreateSema("psvsend_wsha", 0, 0, RECV_BLOCKS, NULL);
+    if (w->sem_sha >= 0)
+        w->sem_job = sceKernelCreateSema("psvsend_wjob", 0, 0, RECV_BLOCKS, NULL);
+    if (w->sem_job >= 0)
+        w->thr_wr = sceKernelCreateThread("psvsend_wr", wr_thread, 0x40, 0x20000, 0,
                                           SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
-    if (w.thr_wr >= 0 && (!w.check_sha || w.thr_sha >= 0)) {
-        WrCtx *wp = &w;
-        wr_ok = sceKernelStartThread(w.thr_wr, sizeof wp, &wp) >= 0;
+    /* 对方给了 sha256 才起校验线程；没给就让生产者直接投 sem_job。 */
+    if (w->thr_wr >= 0 && w->check_sha)
+        w->thr_sha = sceKernelCreateThread("psvsend_sha", sha_thread, 0x40, 0x20000, 0,
+                                           SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
+    if (w->thr_wr >= 0 && (!w->check_sha || w->thr_sha >= 0)) {
+        /* StartThread 会把参数块按字节拷进新线程栈，传栈上临时指针安全；
+         * 指针值本身指向静态槽位，线程怎么用都不会悬空。 */
+        RecvSlot *wp = w;
+        wr_ok = sceKernelStartThread(w->thr_wr, sizeof wp, &wp) >= 0;
         wr_started = wr_ok;
-        if (wr_ok && w.check_sha)
-            wr_ok = sceKernelStartThread(w.thr_sha, sizeof wp, &wp) >= 0;
+        if (wr_ok && w->check_sha)
+            wr_ok = sceKernelStartThread(w->thr_sha, sizeof wp, &wp) >= 0;
     }
     if (!wr_ok) {
         dlog("recv: pipeline setup fail (wr=%d sha=%d sem=%d/%d/%d buf=%d)",
-             (int)w.thr_wr, (int)w.thr_sha, (int)w.sem_free, (int)w.sem_sha,
-             (int)w.sem_job, w.buf != NULL);
-        /* 写线程可能已经起来并阻塞在 sem_job：置 quit 唤醒它收尸 */
+             (int)w->thr_wr, (int)w->thr_sha, (int)w->sem_free, (int)w->sem_sha,
+             (int)w->sem_job, w->buf != NULL);
+        /* 写线程可能已经起来并阻塞在 sem_job：置 quit 唤醒它退出 */
         if (wr_started) {
-            w.quit = 1;
-            sceKernelSignalSema(w.sem_job, 1);
-            sceKernelWaitThreadEnd(w.thr_wr, NULL, NULL);
-            sceKernelDeleteThread(w.thr_wr);
-        } else if (w.thr_wr >= 0) {
-            sceKernelDeleteThread(w.thr_wr);
+            SceUInt t = 5000000;
+            w->quit = 1;
+            sceKernelSignalSema(w->sem_job, 1);
+            if (sceKernelWaitThreadEnd(w->thr_wr, NULL, &t) < 0) {
+                /* 连收尸都等不到：整条流水线遗弃，fd/缓冲全交给槽位 */
+                fd = -1;
+                slot_abandon(w, f, 3, "资源不足");
+                return 500;
+            }
         }
-        if (w.thr_sha >= 0) sceKernelDeleteThread(w.thr_sha);
-        if (w.sem_job >= 0) sceKernelDeleteSema(w.sem_job);
-        if (w.sem_sha >= 0) sceKernelDeleteSema(w.sem_sha);
-        if (w.sem_free >= 0) sceKernelDeleteSema(w.sem_free);
-        free(w.buf);
-        sceIoClose(fd); fd = -1;
+        fd = -1;                     /* 所有权在槽位：由 slot_release 关闭 */
+        slot_release(w);
         lock();
         file_fail_locked(f, "资源不足");
         clear_pending_finish_locked();
         unlock();
-        if (check_sha) mbedtls_sha256_free(&hctx);
         return 500;
     }
 
@@ -1077,13 +1237,13 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         if (g_abort) aborted = true;
         unlock();
         if (aborted) break;
-        if (w.fail) break;                      /* 写盘失败：不再收 */
+        if (w->fail) break;                     /* 写盘失败：不再收 */
         w_mark = now_us();
         /* 等空块。拿不到也必须按失败收尾：裸 break 会落到"正常完成"分支，
          * 把没接满的文件改名成正式文件（st=1）。 */
-        if (sceKernelWaitSema(w.sem_free, 1, NULL) < 0) { rd_fail = -1; break; }
+        if (sceKernelWaitSema(w->sem_free, 1, NULL) < 0) { rd_fail = -1; break; }
         t_wait += now_us() - w_mark;
-        pbuf = w.buf + (size_t)(w.idx_in % RECV_BLOCKS) * RECV_CHUNK;
+        pbuf = w->buf + (size_t)(w->idx_in % RECV_BLOCKS) * RECV_CHUNK;
         while (fill < RECV_CHUNK && produced + fill < f->size) {
             int want = RECV_CHUNK - fill;
             if (f->size - produced - fill < want)
@@ -1100,12 +1260,12 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             fill += n;
         }
         if (fill > 0) {
-            w.len[w.idx_in % RECV_BLOCKS] = fill;
-            ++w.idx_in;
+            w->len[w->idx_in % RECV_BLOCKS] = fill;
+            ++w->idx_in;
             produced += fill;
-            sceKernelSignalSema(w.check_sha ? w.sem_sha : w.sem_job, 1);
+            sceKernelSignalSema(w->check_sha ? w->sem_sha : w->sem_job, 1);
         } else {
-            sceKernelSignalSema(w.sem_free, 1); /* 一块都没收到（失败路径）：还回去 */
+            sceKernelSignalSema(w->sem_free, 1); /* 一块都没收到（失败路径）：还回去 */
         }
         if (rd_fail) break;
         if (now_us() - t_log >= 2000000ull) {   /* 2s 一条：速率 + 是否还在推进 */
@@ -1118,8 +1278,8 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
              *   三者都不满但仍慢 → CPU 抢占（UI/握手），看三者之和 */
             uint64_t ww, ws;
             lock();
-            ww = w.t_write;
-            ws = w.t_sha;
+            ww = w->t_write;
+            ws = w->t_sha;
             unlock();
             dlog("recv: progress %lld/%lld B  %.2f MiB/s"
                  "  [wait %llu read %llu write %llu sha %llu ms]",
@@ -1140,28 +1300,48 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     }
 
     /* 收尾顺序：先等三块全部回到空闲（= sha 与写盘都把在途块处理完），再停
-     * 线程，最后关 fd —— 否则消费者会对着已关闭的 fd 继续写。
-     * 超时兜底（正常 ≤192KB，几百毫秒内就该回来）。 */
+     * 线程。任一步等不到就**遗弃**整条流水线：不删线程、不释放资源，槽位转
+     * ZOMBIE，等线程自己退出后由 reap_zombies 回收（旧代码在这里直接
+     * DeleteThread + free，线程若还卡在 IO 里就会踩已释放的内存）。
+     * 正常情况 ≤192KB，几百毫秒内就该回来。 */
     {
+        int stuck = 0;
         SceUInt tmo = 10000000;
-        sceKernelWaitSema(w.sem_free, RECV_BLOCKS, &tmo);
-        sceKernelSignalSema(w.sem_free, RECV_BLOCKS);
+        if (sceKernelWaitSema(w->sem_free, RECV_BLOCKS, &tmo) < 0) {
+            stuck = 1;
+        } else {
+            sceKernelSignalSema(w->sem_free, RECV_BLOCKS);
+            w->quit = 1;
+            if (w->thr_sha >= 0) sceKernelSignalSema(w->sem_sha, 1);
+            sceKernelSignalSema(w->sem_job, 1);
+            tmo = 10000000;                  /* 每次重置：超时值会被写回剩余量 */
+            if (sceKernelWaitThreadEnd(w->thr_wr, NULL, &tmo) < 0) stuck = 2;
+            if (!stuck && w->thr_sha >= 0) {
+                tmo = 10000000;
+                if (sceKernelWaitThreadEnd(w->thr_sha, NULL, &tmo) < 0) stuck = 2;
+            }
+        }
+        if (stuck) {
+            fd = -1;                         /* 所有权留在槽位（reap 负责关闭） */
+            slot_abandon(w, f, stuck, "存储无响应");
+            /* 遗弃后仍要通知两条消费者退出：stuck==1（等空块就超时）时上面还
+             * 没置过 quit，写线程处理完在途块后会一直阻塞在 sem_job（生产者已
+             * 返回），线程不退出 → ZOMBIE 永远没有 reap 的机会，8 次后槽位耗尽。
+             * 两条线程都是 WaitSema 返回后先查 quit，故不会误写未就绪的块。 */
+            w->quit = 1;
+            if (w->thr_sha >= 0) sceKernelSignalSema(w->sem_sha, 1);
+            sceKernelSignalSema(w->sem_job, 1);
+            return 500;
+        }
     }
-    w.quit = 1;
-    if (w.thr_sha >= 0) sceKernelSignalSema(w.sem_sha, 1);
-    sceKernelSignalSema(w.sem_job, 1);
-    {
-        SceUInt tmo = 10000000;
-        sceKernelWaitThreadEnd(w.thr_wr, NULL, &tmo);
-        if (w.thr_sha >= 0) sceKernelWaitThreadEnd(w.thr_sha, NULL, &tmo);
-    }
-    if (w.thr_sha >= 0) sceKernelDeleteThread(w.thr_sha);
-    sceKernelDeleteThread(w.thr_wr);
-    sceKernelDeleteSema(w.sem_free);
-    sceKernelDeleteSema(w.sem_sha);
-    sceKernelDeleteSema(w.sem_job);
-    free(w.buf);
-    sceIoClose(fd); fd = -1;
+
+    /* 两条消费者都已退出：先取摘要/统计，再释放槽位（关 fd、删线程、归还）。 */
+    if (check_sha) mbedtls_sha256_finish(&w->sha, digest);
+    wr_fail = w->fail;
+    t_write = w->t_write;
+    t_sha = w->t_sha;
+    fd = -1;                                 /* 所有权在槽位，由 slot_release 关闭 */
+    slot_release(w);
 
     if (aborted) {
         lock();
@@ -1171,22 +1351,21 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
             sess_terminal(RECV_ST_CANCEL, "用户取消");
         clear_pending_finish_locked();
         unlock();
-        if (check_sha) mbedtls_sha256_free(&hctx);
         return 500;
     }
-    if (rd_fail || w.fail) {                 /* 断流/空闲超时/socket 错/写盘失败 */
+    if (rd_fail || wr_fail) {                /* 断流/空闲超时/socket 错/写盘失败 */
         lock();
         f->busy = false;
         /* 截断取证：收了多久、到多少字节停的。fn==-1 表示 fn 返回 0（对端关闭
          * 或 http 层单块空闲超时，http 层已有对应 dlog），其余负值为 socket/TLS 错。 */
         dlog("recv: upload fail got %lld/%lld B after %llu ms (fn=%d wr=%d)",
              (long long)f->got, (long long)f->size,
-             (unsigned long long)((now_us() - t0) / 1000), rd_fail, w.fail);
+             (unsigned long long)((now_us() - t0) / 1000), rd_fail, wr_fail);
         if (g_abort) {                       /* http 层看到中止标志提前退出 → 取消 */
             cleanup_parts();
             if (!sess_is_terminal(g_sess.state))     /* 别覆盖已判定的终态原因 */
                 sess_terminal(RECV_ST_CANCEL, "用户取消");
-        } else if (w.fail) {
+        } else if (wr_fail) {
             /* 写盘失败只算这个文件（其余文件可能还能写进去） */
             file_fail_locked(f, "写入失败（磁盘空间不足？）");
         } else {
@@ -1196,15 +1375,9 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         }
         clear_pending_finish_locked();
         unlock();
-        if (check_sha) mbedtls_sha256_free(&hctx);
         return 500;
     }
 
-    if (check_sha) {
-        mbedtls_sha256_finish(&hctx, digest);
-        mbedtls_sha256_free(&hctx);
-    }
-    sceIoClose(fd); fd = -1;
     if (check_sha && !hex_eq_nocase(f->sha256, digest, 32)) {
         lock();
         file_fail_locked(f, "sha256 校验失败");
@@ -1226,8 +1399,8 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
              total ? (double)f->got / 1048576.0
                      / ((double)total / 1000000.0) : 0.0,
              (unsigned long long)(t_read / 1000),
-             (unsigned long long)(w.t_write / 1000),
-             (unsigned long long)(w.t_sha / 1000));
+             (unsigned long long)(t_write / 1000),
+             (unsigned long long)(t_sha / 1000));
     }
     lock();
     f->st = 1;
@@ -1303,6 +1476,7 @@ int recv_status_pull(RecvStatus *out)
 
 void recv_clear(void)
 {
+    reap_zombies();                      /* 会话收尾顺手回收已退出的僵尸槽位 */
     lock();
     if (g_phase == PH_ACTIVE) {
         if (any_busy_locked()) {             /* 收体进行中：别硬清，先请中止。
