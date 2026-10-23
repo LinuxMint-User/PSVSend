@@ -135,6 +135,7 @@ static int  g_clear_pending = 0;
  * ABA 竞态：老的醒来会把新会话清掉，表现为新确认页点 Accept 无效、60s 后 403）。 */
 static unsigned g_gen = 0;
 static int  g_pend_result = 0;      /* 0=未决 1=接受 2=拒绝 3=超时 */
+static int  g_peer_gone_evt = 0;    /* 上一份 pending 因"发送方断开"消失（UI 一次性取走） */
 static volatile int g_abort = 0;    /* 用户中止请求（http 收体循环轮询） */
 static SceUID g_mtx = -1;
 /* 本会话保存目录：accept 前由 UI 用 recv_set_dir 设定（临时、不入 config）；
@@ -623,6 +624,16 @@ int recv_pending_pull(RecvPending *out)
     return r;
 }
 
+int recv_pending_peer_gone_take(void)
+{
+    int r;
+    lock();
+    r = g_peer_gone_evt;
+    g_peer_gone_evt = 0;
+    unlock();
+    return r;
+}
+
 void recv_set_include(const bool inc[RECV_MAX_FILES])
 {
     int i;
@@ -676,7 +687,7 @@ static bool recv_abort_pending(void)
 
 /* prepare-upload：解析 → 挂起等 UI（≤60s）→ 回 HTTP 码并填 resp（200 时 JSON） */
 static int recv_http_prepare(const char *body, const char *ip, const char *peer_fp,
-                             char *resp, int respsz)
+                             const HttpPeer *peer, char *resp, int respsz)
 {
     const char *infov, *filesv, *p;
     JsonIter it;
@@ -686,6 +697,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
     unsigned my_gen = 0;                     /* 本次占位的序号（见 g_gen） */
     SceLong64 dl;
     bool pend_accept;
+    int probe_ticks = 0, peer_gone = 0;
 
     if (respsz > 0) resp[0] = 0;
     /* 必须在 alloc_paths 之前：先把旧遗留槽位回收掉，避免新会话复用正被
@@ -716,6 +728,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
     }
     g_phase = PH_PENDING;                    /* 先占位：锁内的并发 prepare 409 */
     my_gen = ++g_gen;                        /* 本次占位的身份（见 g_gen） */
+    g_peer_gone_evt = 0;                     /* 上一份的"对方取消"标志不得串到本份 */
     g_pend.alias[0] = 0;
     g_pend.type[0] = 0;
     snprintf(g_pend.ip, sizeof g_pend.ip, "%s", ip ? ip : "");
@@ -793,7 +806,26 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
         unlock();
         if (r) break;
         if ((SceLong64)now_us() >= dl) { r = 3; break; }
+        /* 发送方放弃：官方在"等接受"阶段是 abort 掉 prepare 请求（关连接），
+         * 不会调 /cancel——那时 sessionId 还没生成。每 200ms 探一次连接，
+         * 断了就立刻收场，别让用户对着一个已经不存在的请求等满 60s。 */
+        if (peer && ++probe_ticks >= 4) {
+            probe_ticks = 0;
+            if (http_peer_gone(peer) == 1) { peer_gone = 1; break; }
+        }
         sceKernelDelayThread(50 * 1000);
+    }
+
+    if (peer_gone) {
+        lock();
+        if (g_gen == my_gen) {               /* 仍是本次占位：撤掉，把原因留给 UI */
+            g_phase = PH_NONE;
+            g_peer_gone_evt = 1;
+        }
+        unlock();
+        dlog("recv: prepare abandoned by sender (connection closed) from %s",
+             ip ? ip : "?");
+        return 403;                          /* 对端已经走了，这个码没人收 */
     }
 
     lock();

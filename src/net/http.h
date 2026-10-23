@@ -55,11 +55,20 @@ int http_chunked_decode(char *body, int len);
  * include proto 层（此前 http.c→receive.h 与 transfer.c→http.h 构成依赖环）。 */
 typedef int (*http_stream_fn)(void *ctx, unsigned char *buf, int max);
 
+/* 不透明句柄：一条正在服务的连接（只有 http.c 知道它的内部结构）。
+ * prepare 挂起等用户决定期间，用它探测对端是否已经放弃（见 http_peer_gone）。 */
+typedef struct HttpPeer HttpPeer;
+
+/* 对端是否已关闭这条连接：1=已断（FIN / TLS close_notify / RST），0=仍连着，
+ * -1=无法判断。内部用 MSG_PEEK 非阻塞读，不会消费数据、不会阻塞。 */
+int http_peer_gone(const HttpPeer *peer);
+
 typedef struct {
     /* POST /prepare-upload：body=清单 JSON，ip=来源，peer_fp=对端叶证书 SHA-256
-     * （明文连接为空串）；回执写 resp，返回 HTTP 状态码 */
+     * （明文连接为空串），peer=本连接句柄（等用户决定期间探活用）；回执写 resp，
+     * 返回 HTTP 状态码 */
     int  (*prepare)(const char *body, const char *ip, const char *peer_fp,
-                    char *resp, int respsz);
+                    const HttpPeer *peer, char *resp, int respsz);
     /* POST /upload?...：total<0 表示 chunked（无 Content-Length）；rd/ctx 由 http 层
      * 提供，协议层经它流式读 body（阻塞轮询语义：返回实读字节 / 0 关闭或超时 / <0 错） */
     int  (*upload)(const char *query, const char *ip, int64_t total,

@@ -135,6 +135,12 @@ static const TrEntry s_tr[] = {
     { "Incoming files", "收到文件", "收到檔案", "收到檔案", "受信ファイル" },
     { "This request has expired.", "此请求已过期。", "此請求已過期。", "此請求已過期。",
       "このリクエストは期限切れです。" },
+    /* 发送方在确认页阶段放弃：官方是 abort 掉 prepare 请求（关连接），不是 /cancel */
+    { "The sender has canceled the request.",
+      "发送方已取消请求。",
+      "傳送方已取消請求。",
+      "傳送方已取消請求。",
+      "送信者がリクエストをキャンセルしました。" },
     { "No response was sent to the sender.",
       "未向发送方发出响应。",
       "未向傳送方送出回應。",

@@ -311,6 +311,30 @@ typedef struct {
  * 让 http_stop 的有预算 join 能等到它，而不是干耗到 recv 超时。 */
 static inline int gen_stale(int my_gen) { return g_gen != my_gen; }
 
+/* 等用户决定期间探活（见 http.h）。MSG_PEEK 只"看"不取，DONTWAIT 不阻塞；
+ * Vita 的非阻塞失败以 0x80410123（EAGAIN）返回，与 discovery.c 的 D_AGAIN 同口径。 */
+int http_peer_gone(const HttpPeer *peer)
+{
+    const Conn *c = (const Conn *)peer;
+    unsigned char b = 0;
+    int r;
+    if (!c || c->fd < 0) return -1;
+    r = sceNetRecv(c->fd, &b, 1, SCE_NET_MSG_PEEK | SCE_NET_MSG_DONTWAIT);
+    if (r == 0) return 1;                         /* FIN：对端已关 */
+    if (r < 0) {
+        if ((unsigned)r == (unsigned)SCE_NET_ERROR_EAGAIN)
+            return 0;                             /* 没数据，仍连着 */
+        if ((unsigned)r == (unsigned)SCE_NET_ERROR_ECONNRESET ||
+            (unsigned)r == (unsigned)SCE_NET_ERROR_ENOTCONN)
+            return 1;                             /* 已断 */
+        return -1;                                /* 认不出的错误：不下结论 */
+    }
+    /* 有字节待读：这段等待里对端不该再发应用数据，正常的只有 TLS alert
+     * （close_notify 首字节 0x15）——当已断；其它情况保守地认为还连着。 */
+    if (c->tls && b == 0x15) return 1;
+    return 0;
+}
+
 /* ---------- 服务端 TLS ---------- */
 
 /* Vita 熵源：时间 + 栈/全局地址 + 计数器混洗（splitmix64，与客户端同一口径）。 */
@@ -899,7 +923,8 @@ static void h_prepare(HttpReq *r)
         return;
     }
     {
-        int code = g_recv->prepare(body, r->ip, r->cn->peer_fp, resp, (int)sizeof resp);
+        int code = g_recv->prepare(body, r->ip, r->cn->peer_fp,
+                                   (const HttpPeer *)r->cn, resp, (int)sizeof resp);
         dlog("http: prepare -> %d (tls=%d)", code, r->cn->tls);
         http_respond(r->cn, code, reason_of(code), resp);
     }

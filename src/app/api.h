@@ -70,6 +70,8 @@ void api_send_info(XferInfo *out);
 
 /* 有"等待决定"的接收请求？1=有并拷贝 out（out==NULL 时仅探测） */
 int  api_recv_pending_pull(RecvPending *out);
+/* 上一份待确认请求是否因"发送方放弃（断开连接）"而消失；一次性，取走即清零 */
+int  api_recv_peer_gone_take(void);
 /* 同步"本次勾选接收的文件"（下标与 pending 一致） */
 void api_recv_set_include(const bool inc[RECV_MAX_FILES]);
 /* 接受前逐文件指定"保存名"（idx 与 pending 一致；空串=保持原名） */

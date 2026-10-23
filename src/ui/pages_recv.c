@@ -36,6 +36,7 @@ static int recv_included(void)
 
 /* ================= 接收请求确认（真实：后端 PENDING 会话） ================= */
 static bool g_recv_expired = false;  /* 请求 60s 没人响应、已被后端作废 */
+static bool g_recv_peer_gone = false;/* 请求消失是因为发送方撤销（关掉 prepare 连接） */
 static uint64_t g_recv_supp_ms = 0;  /* 决定后抑制重弹到：毫秒时间戳 */
 
 /* 拒绝当前请求并离开接收流程（后端回 403，发送方会看到拒绝） */
@@ -69,15 +70,22 @@ void page_recv_confirm_render(void)
      * 控制，一律裁尾，不许裸画压到相邻内容上（文件名另走路内 w_text_mid）。 */
     int lmax = card.w - 72;
 
-    /* 请求还在等 UI 决定吗？不在了（超时被后端作废）→ 只给关闭，不再给决定按钮 */
+    /* 请求还在等 UI 决定吗？不在了（超时被后端作废 / 发送方撤销）→ 只给关闭 */
     g_recv_expired = api_recv_pending_pull(NULL) == 0;
     if (g_recv_expired) {
         w_rect(card, theme->card);
         w_text_clip(48, 120, 1.5f, theme->text, g_app.recv_alias, lmax);
-        w_text_clip(48, 172, 1.25f, theme->text_dim,
-                    tr("This request has expired."), lmax);
-        w_text_clip(48, 216, 1.0f, theme->text_dim,
-                    tr("No response was sent to the sender."), lmax);
+        if (g_recv_peer_gone) {
+            /* 发送方在"等接受"阶段撤销：官方是 abort 掉 prepare 请求（关连接），
+             * 与"没人响应而超时"是两回事，文案要分开（官方同款语气）。 */
+            w_text_clip(48, 172, 1.25f, theme->warn,
+                        tr("The sender has canceled the request."), lmax);
+        } else {
+            w_text_clip(48, 172, 1.25f, theme->text_dim,
+                        tr("This request has expired."), lmax);
+            w_text_clip(48, 216, 1.0f, theme->text_dim,
+                        tr("No response was sent to the sender."), lmax);
+        }
         Rect close = { SCR_W / 2 - 100, 444, 200, 48 };
         w_add(2, close);
         w_button(close, tr("Close"), true);
@@ -755,6 +763,7 @@ static void open_recv_request(const RecvPending *rp)
     rs_scroll = 0;
     rename_pop = false;
     recv_focus = 2;
+    g_recv_peer_gone = false;
     /* 设置页的另一种离开方式：接收请求把设置页顶掉（返回键那条出口在
      * page_settings_input 里收）。不收尾的话预读线程与"另外两份 CJK"的 ~33MB
      * 会一直留在页外。不在设置页时该调用是空操作。 */
@@ -788,7 +797,13 @@ void pages_tick(void)
      * 仍按旧页（设置页/接收设置页）处理，两边状态就指向不同的页了。请求留在
      * pending 里，等键盘关掉后下一帧照常弹。 */
     if (page_ime_busy()) return;
-    if (api_recv_pending_pull(&rp) != 1) return; /* 无"待决定"请求 */
+    if (api_recv_pending_pull(&rp) != 1) {
+        /* 请求不在了：若后端报"发送方断开了连接"，确认页要换成"对方已取消"
+         * 而不是"已过期"。事件不管在哪页都取走，避免陈旧标志误判下一次超时。 */
+        int gone = api_recv_peer_gone_take();
+        if (gone && g_app.page == PAGE_RECV_CONFIRM) g_recv_peer_gone = true;
+        return;                              /* 无"待决定"请求 */
+    }
     switch (g_app.page) {
     case PAGE_DEVICES:
     case PAGE_FILES:

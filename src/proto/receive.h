@@ -71,6 +71,11 @@ void recv_init(void);
  * 不拷贝，用 1/0 回答"有没有"）；0=无（含已消失/已超时） */
 int recv_pending_pull(RecvPending *out);
 
+/* 上一份待确认请求是否因"发送方放弃"而消失（一次性：取走即清零）。
+ * 官方发送方在等接受的阶段取消时是 abort 掉 prepare 请求（关连接），
+ * 不会、也无法调 /cancel——那时 sessionId 还没生成。 */
+int recv_pending_peer_gone_take(void);
+
 /* UI 在决定前同步"本次勾选接收的文件"（下标与 pending 的 files 一致；
  * 未勾选的会在接受后被后端标记跳过、不出现在 prepare 响应里）。 */
 void recv_set_include(const bool inc[RECV_MAX_FILES]);
