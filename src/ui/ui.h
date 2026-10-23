@@ -11,6 +11,13 @@ typedef struct vita2d_font vita2d_font;
 /* 取 size 像素字号的字体对象（ui_main.c 按字号分槽懒加载；cjk=0/1） */
 vita2d_font *font_get(int size, int cjk);
 
+/* 验证页图标图集（纹理句柄同样不透明；ui_main.c 启动时帧外建一次、常驻不释放）。
+ * 非 NULL 时：260 个图标按官方字母表顺序排成 16 列 × 17 行，每格 48px + 1px
+ * 透明边（格距 50），格子下标 = base-260 的 digit（生成脚本
+ * scripts/gen-verify-icons.py）。NULL = 不可用，页面只画文本半区。 */
+struct vita2d_texture;
+struct vita2d_texture *ui_verify_icons(void);
+
 #define SCR_W 960
 #define SCR_H 544
 
@@ -173,6 +180,10 @@ typedef struct {
     char    verify_code[129];  /* 128 hex + NUL；空=本机身份还没生成好 */
     char    verify_alias[64];
     int     verify_ret;        /* 返回页（发送等待页 / 接收确认页） */
+    /* verify_code 的图标形式（官方 fingerprintToIcons 口径）：
+     * SHA-256(128 hex) 取前 16 字节 → base-260 的 16 位数字，digit[0] 最高位。
+     * 下标 = 图集格子号；verify_code 为空时无意义。 */
+    unsigned char verify_digits[16];
 
     /* 设置 */
     int     theme_id;      /* 色系：0=Yaru 1=OLED */

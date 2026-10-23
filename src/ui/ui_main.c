@@ -271,6 +271,79 @@ static void font_preload_all(void)
          g_font_lang, cjk_slot_current(), (void *)g_fs[0].lat, (void *)g_fs[0].cjk);
 }
 
+/* ---------- 验证页图标图集（帧外一次性加载，常驻不释放） ----------
+ * 图集内容：官方 iconAlphabet 的 260 个 Material 图标，按 digit 顺序排成
+ * 16 列 × 17 行、每格 48px + 1px 透明边（生成脚本 scripts/gen-verify-icons.py）。
+ * 为什么走图片而不是图标字体：libvita2d 的字形缓存是固定 512×512 单页、永不淘汰，
+ * 260 个图标在 32px 就必然溢出，而溢出是"静默不画"；且它的 UTF-8 解码不认 4 字节
+ * 码位（字母表里 45 个图标在 U+FFFF 以上）。图集没有这两个限制。
+ * 生命周期：只在启动时建一次纹理，之后只读。vita2d_load_PNG_buffer 内部就是
+ * "建显存纹理 + 解码写入"，落在渲染 pass 中途会触发 GPU crash（见 font_preload_all
+ * 注释），释放/重建同理——所以页面绝不碰它的生命周期。解码输入 buffer 用完即
+ * free（加载器不持有它，已核对 libvita2d 源码）。 */
+#define VERIFY_ICONS_PATH "app0:/fonts/verify/icons-48.png"
+#define VERIFY_ICONS_W    800
+#define VERIFY_ICONS_H    850
+static struct vita2d_texture *g_verify_icons;
+
+static void verify_icons_init(void)
+{
+    SceUID fd;
+    SceOff sz;
+    void *buf;
+    int rd;
+
+    fd = sceIoOpen(VERIFY_ICONS_PATH, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        dlog("verify icons: open failed 0x%08X", (unsigned)fd);
+        return;
+    }
+    sz = sceIoLseek(fd, 0, SCE_SEEK_END);
+    if (sz <= 0 || sz > (1 << 20) || sceIoLseek(fd, 0, SCE_SEEK_SET) < 0) {
+        sceIoClose(fd);
+        dlog("verify icons: bad size %lld", (long long)sz);
+        return;
+    }
+    buf = malloc((size_t)sz);
+    if (!buf) {
+        sceIoClose(fd);
+        dlog("verify icons: oom %lld", (long long)sz);
+        return;
+    }
+    rd = sceIoRead(fd, buf, (SceSize)sz);
+    sceIoClose(fd);
+    if (rd != (int)sz) {
+        free(buf);
+        dlog("verify icons: short read %d/%lld", rd, (long long)sz);
+        return;
+    }
+    g_verify_icons = vita2d_load_PNG_buffer(buf);
+    free(buf);
+    if (!g_verify_icons) {
+        dlog("verify icons: decode failed");
+        return;
+    }
+    if (vita2d_texture_get_width(g_verify_icons) != VERIFY_ICONS_W ||
+        vita2d_texture_get_height(g_verify_icons) != VERIFY_ICONS_H) {
+        dlog("verify icons: unexpected size %ux%u (want %dx%d)",
+             vita2d_texture_get_width(g_verify_icons),
+             vita2d_texture_get_height(g_verify_icons),
+             VERIFY_ICONS_W, VERIFY_ICONS_H);
+        vita2d_free_texture(g_verify_icons);
+        g_verify_icons = NULL;
+        return;
+    }
+    /* 1:1 绘制，POINT 采样——既保锐利，也让 1px 透明边真正起到防渗色作用 */
+    vita2d_texture_set_filters(g_verify_icons, SCE_GXM_TEXTURE_FILTER_POINT,
+                               SCE_GXM_TEXTURE_FILTER_POINT);
+    dlog("verify icons: loaded %dx%d", VERIFY_ICONS_W, VERIFY_ICONS_H);
+}
+
+struct vita2d_texture *ui_verify_icons(void)
+{
+    return g_verify_icons;
+}
+
 /* 界面语言换了地区（简↔繁↔日）时，把各字号的 CJK 字体对象换成对应地区那份：
  * 先建新的、成功后再释放旧的。必须帧外调用——vita2d_load_font_mem 会建 512x512
  * 显存纹理，落在渲染 pass 中途有 GPU crash 风险（见 font_preload_all 注释）；
@@ -491,6 +564,7 @@ void ui_run(void)
     pages_init();
     update_init();             /* 更新检查状态机（自动周期由 config 决定） */
     font_preload_all();        /* 建齐字号字体对象（帧外；首次触发 ttf 读进 RAM） */
+    verify_icons_init();       /* 验证页图标图集（帧外建纹理，之后常驻只读） */
 
     while (!g_app.done) {
         /* 主线程心跳（诊断用）：开机头 12s 或"网络未就绪"期间每秒打一行，
