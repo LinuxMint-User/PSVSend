@@ -21,6 +21,7 @@
 #include "ui/ui.h"
 #include "ui/pages_internal.h"
 #include "ui/theme.h"
+#include "app/api.h"
 #include "core/config.h"
 #include "core/i18n.h"
 #include "net/identity.h"
@@ -79,11 +80,16 @@ void open_verify(const char *peer_fp, const char *alias)
     snprintf(g_app.verify_alias, sizeof g_app.verify_alias, "%s",
              alias && alias[0] ? alias : "?");
     g_app.verify_ret = (int)g_app.page;
+    /* 从接收确认页进来：暂停那 60s 决定窗口（用户在比对，不该被计时）。
+     * 从发送等待页进来不涉及接收请求，hold 调用在非 PENDING 时本就是空操作，
+     * 这里按来源收窄只是为了语义清楚。 */
+    if (g_app.verify_ret == PAGE_RECV_CONFIRM) api_recv_decide_hold(1);
     g_app.page = PAGE_VERIFY;
 }
 
 static void verify_back(void)
 {
+    if (g_app.verify_ret == PAGE_RECV_CONFIRM) api_recv_decide_hold(0);
     if (g_app.verify_ret > 0 && g_app.verify_ret < PAGE_COUNT)
         g_app.page = (PageId)g_app.verify_ret;
     else

@@ -127,6 +127,22 @@ void page_recv_confirm_render(void)
                  sz, seln, n);
     w_text_clip(48, 190, 1.0f, theme->text_dim, line, lmax);
 
+    /* 决定窗口倒计时：放在 Total 行右端（本来空着），是页面脚注而不是主按钮——
+     * 平时次要色、最后 10 秒转警示色；进子页暂停或无请求时不显示。
+     * 数字固定 "0:47" 形态，右对齐，秒数跳动不会让右边缘抖。 */
+    {
+        int left_s = api_recv_decide_left_s();
+        if (left_s >= 0) {
+            char tbuf[16], cbuf[48];
+            int cw = 0;
+            snprintf(tbuf, sizeof tbuf, "%d:%02d", left_s / 60, left_s % 60);
+            snprintf(cbuf, sizeof cbuf, tr("%s left"), tbuf);
+            w_text_w(1.0f, cbuf, &cw, NULL);
+            w_text(card.x + card.w - 24 - cw, 190, 1.0f,
+                   left_s <= 10 ? theme->warn : theme->text_dim, "%s", cbuf);
+        }
+    }
+
     /* 名字过长、接收后会被自动缩短的文件数（后端在 prepare 时就算好了 trunc；
      * 用户自己改过名的行按新名算，不再提示）。缩短口径=保后缀、截主名。 */
     int toolong = 0;
@@ -251,6 +267,8 @@ void page_recv_confirm_input(const Input *in)
         if (in->tap || in->confirm || in->back) recv_close();
         return;
     }
+    if (in->tap || in->confirm || in->back || in->left || in->right)
+        api_recv_decide_touch();   /* 人在操作：60s 窗口重开（含方向键） */
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id == 2) {
@@ -265,6 +283,7 @@ void page_recv_confirm_input(const Input *in)
             g_app.inc_sel = 0;
             rs_scroll = 0;
             rename_pop = false;
+            api_recv_decide_hold(1);   /* 进设置页：暂停 60s 决定窗口 */
             g_app.page = PAGE_RECV_SETUP;
         } else if (id == 3) {
             recv_focus = 3;
@@ -296,6 +315,7 @@ void page_recv_confirm_input(const Input *in)
             g_app.inc_sel = 0;
             rs_scroll = 0;
             rename_pop = false;
+            api_recv_decide_hold(1);   /* 进设置页：暂停 60s 决定窗口 */
             g_app.page = PAGE_RECV_SETUP;
         } else if (recv_focus == 0) {
             recv_reject_close();
@@ -365,13 +385,12 @@ enum {
     IME_TX_HOST,       /* 设置页：改本机设备名 alias（config） */
     IME_TX_PIN,        /* 发送等待页：对方要求 PIN（回填给 transfer.c） */
 };
-/* 接收改名的键盘时限：须赶在 prepare 等 UI 决定窗口（receive.c 的
- * RECV_DECIDE_TIMEOUT_US = 60s）内完成，窗口一过 pending 清场、改名白做；
- * 取 50s 略短于窗口，给关键盘后点接受/拒绝留时间。主机名是纯设置项、无业务
- * 时限，但也不能完全不设限：键盘引擎一旦假死（d55-d58 真机遇过），"进行中"
- * 会一直为真 → 输入被永久屏蔽、界面连同退出一起锁死；取 5 分钟当保险丝，
- * 正常改名远用不到，真卡住时还能自己回来（见 ime.h limit_us）。 */
-#define RN_IME_LIMIT_US   (50ll * 1000 * 1000)
+/* 接收改名的键盘时限：决定窗口在设置页里是暂停的（recv_decide_hold），所以
+ * 不再有"须赶在 60s 窗口内改完"的约束，这里纯粹是键盘引擎假死的保险丝。
+ * 主机名是纯设置项、同样无业务时限，但也得设限：键盘引擎一旦假死（d55-d58
+ * 真机遇过），"进行中"会一直为真 → 输入被永久屏蔽、界面连同退出一起锁死；
+ * 取 5 分钟当保险丝，正常改名远用不到，真卡住时还能自己回来（见 ime.h limit_us）。 */
+#define RN_IME_LIMIT_US   (110ll * 1000 * 1000)
 #define HOST_IME_LIMIT_US (300ll * 1000 * 1000)
 /* PIN 键盘：须短于 transfer.c 的 PIN_WAIT_US（120s），键盘假死时后台也能先
  * 超时收尾，不会两边一起挂住。 */
@@ -667,6 +686,7 @@ static void rs_leave(void)
 {
     rename_pop = false;
     recv_focus_sane();
+    api_recv_decide_hold(0);   /* 回确认页：决定窗口重开成满 60s */
     g_app.page = PAGE_RECV_CONFIRM;
 }
 

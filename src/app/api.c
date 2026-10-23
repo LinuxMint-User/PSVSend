@@ -405,6 +405,21 @@ void api_recv_decide(bool accept)
     recv_decide(accept);
 }
 
+void api_recv_decide_hold(int on)
+{
+    recv_decide_hold(on);
+}
+
+void api_recv_decide_touch(void)
+{
+    recv_decide_touch();
+}
+
+int api_recv_decide_left_s(void)
+{
+    return recv_decide_left_s();
+}
+
 void api_recv_abort(void)
 {
     recv_abort();

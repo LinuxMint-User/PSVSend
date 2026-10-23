@@ -100,6 +100,16 @@ void recv_set_dir(const char *dir);
  * / 0 拒绝（回 403）。 */
 void recv_decide(bool accept);
 
+/* 决定窗口的暂停/重开（仅 PENDING 有效，其余时候空操作）。窗口语义是"确认页
+ * 上没有操作满 60s"：UI 进接收设置页/验证页（含其中打开的目录选择页）时
+ * hold=1 暂停，回到确认页 hold=0 并把窗口重开成满 60s（不是接着走）。
+ * 对方撤销由探活独立判定，暂停不影响它。 */
+void recv_decide_hold(int on);
+/* 确认页上有任何操作 → 重开满窗（暂停期间调用无效）。 */
+void recv_decide_touch(void);
+/* 确认页倒计时：剩余整秒；-1 = 无待决定请求或正在暂停（不该显示数字）。 */
+int  recv_decide_left_s(void);
+
 /* 用户中止进行中的接收：正在流式收体时置标志让 http 线程尽快收尾
  * （删临时文件、回 CANCEL 态），空闲（READY/文件间）时立即生效。 */
 void recv_abort(void);

@@ -83,6 +83,12 @@ void api_recv_sanitize_name(const char *in, char *out, int n);
 void api_recv_set_dir(const char *dir);
 /* 决定（仅 PENDING 有效）：accept=1 接受 / 0 拒绝 */
 void api_recv_decide(bool accept);
+/* 决定窗口挂起/恢复：1 = UI 在子页里（暂停计时），0 = 回确认页（重开满窗） */
+void api_recv_decide_hold(int on);
+/* 确认页上有操作 → 重开满窗 */
+void api_recv_decide_touch(void);
+/* 确认页倒计时剩余整秒；-1 = 无请求/暂停中（不显示） */
+int  api_recv_decide_left_s(void);
 /* 用户中止进行中的接收 */
 void api_recv_abort(void);
 /* 轮询接收会话状态；1=有会话（含终态）0=空闲 */

@@ -142,6 +142,12 @@ static SceUID g_mtx = -1;
  * 启动清扫等默认场景在 recv_init 里回退 config saveDir。 */
 static char g_dir[512];
 
+/* 决定窗口的暂停/重开状态（UI 驱动，见 recv_decide_hold）：
+ * hold=1 = 用户正在接收设置页/验证页里操作，不计时；
+ * g_pend_dl = 当前截止时刻（绝对 us），暂停期间每轮被推到"现在 + 满窗"。 */
+static volatile int g_pend_hold;
+static volatile SceLong64 g_pend_dl;
+
 static void lock(void)   { if (g_mtx >= 0) sceKernelLockMutex(g_mtx, 1, NULL); }
 static void unlock(void) { if (g_mtx >= 0) sceKernelUnlockMutex(g_mtx, 1); }
 static uint64_t now_us(void) { return (uint64_t)sceKernelGetSystemTimeWide(); }
@@ -465,6 +471,7 @@ static void clear_pending_finish_locked(void)
     if (!g_clear_pending || any_busy_locked()) return;
     cleanup_parts();
     g_phase = PH_NONE;
+    g_pend_hold = 0;
     g_abort = 0;
     g_clear_pending = 0;
     dlog("recv: session %s cleared (deferred)", g_sess.session);
@@ -667,6 +674,48 @@ void recv_decide(bool accept)
     unlock();
 }
 
+/* 决定窗口的语义 = "确认页上没有操作满 60s"（不是"从弹窗开始 60s"）：
+ *   - 用户在接收设置页 / 验证页（含设置页里再打开的目录选择页）里时由 UI
+ *     置 hold=1，暂停计时；回到确认页置 0，窗口重开成满 60s。回来时是"重开"
+ *     而不是"接着走"——接着走会出现"看完验证页回来只剩 5s"，比不暂停更糟。
+ *   - 确认页上任何按键/触摸走 recv_decide_touch，同样重开满窗。
+ * 暂停不阻断 d199 的探活：对方撤销照样 200ms 内收场，回来看到的是"对方已取消"。
+ * 一律在锁内判定 PH_PENDING：请求已结束（接受/拒绝/对方撤销/到点）时这些调用
+ * 都是空操作，不会把状态留给下一份请求。 */
+void recv_decide_hold(int on)
+{
+    lock();
+    if (g_phase == PH_PENDING) {
+        g_pend_hold = on ? 1 : 0;
+        if (!on) g_pend_dl = (SceLong64)now_us() + RECV_DECIDE_TIMEOUT_US;
+    }
+    unlock();
+}
+
+void recv_decide_touch(void)
+{
+    lock();
+    if (g_phase == PH_PENDING && !g_pend_hold)
+        g_pend_dl = (SceLong64)now_us() + RECV_DECIDE_TIMEOUT_US;
+    unlock();
+}
+
+/* 确认页倒计时用：剩余整秒。-1 = 没有待决定请求或正在暂停（不该显示数字）。
+ * 注意 now_us() 与 RECV_DECIDE_TIMEOUT_US 都是微秒，这里要除 1000000。 */
+int recv_decide_left_s(void)
+{
+    SceLong64 left;
+    lock();
+    if (g_phase != PH_PENDING || g_pend_hold) {
+        unlock();
+        return -1;
+    }
+    left = g_pend_dl - (SceLong64)now_us();
+    unlock();
+    if (left < 0) left = 0;
+    return (int)(left / 1000000);
+}
+
 void recv_abort(void)
 {
     lock();
@@ -695,7 +744,6 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
     long long sz;
     int i, n = 0, code = 200, r;
     unsigned my_gen = 0;                     /* 本次占位的序号（见 g_gen） */
-    SceLong64 dl;
     bool pend_accept;
     int probe_ticks = 0, peer_gone = 0;
 
@@ -780,32 +828,41 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
     }
     if (code != 200) {
         g_phase = PH_NONE;                   /* 撤销占位 */
+        g_pend_hold = 0;
         unlock();
         return 400;
     }
     if (n == 0) {                            /* 没有要传的文件 */
         g_phase = PH_NONE;                   /* 撤销占位 */
+        g_pend_hold = 0;
         unlock();
         return 204;
     }
     g_pend.n = n;
     g_pend_result = 0;
+    g_pend_hold = 0;                         /* 新请求从满窗开始（上一份的暂停状态不得串过来） */
+    g_pend_dl = (SceLong64)now_us() + RECV_DECIDE_TIMEOUT_US;
     dlog("recv: prepare %d files from %s (%s)", n, g_pend.alias, g_pend.ip);
     if (g_pend.overflow)
         dlog("recv: %d more file(s) exceed the cap %d, will be dropped",
              g_pend.overflow, RECV_MAX_FILES);
     unlock();
 
-    /* 等 UI 决定：轮询（本连接占一个 http worker，最长 60s；期间其他连接
-     * 由各自的 worker 并发处理，遇到 PH_PENDING 一律 409，不会踩这份状态） */
-    dl = (SceLong64)now_us() + RECV_DECIDE_TIMEOUT_US;
+    /* 等 UI 决定：轮询（本连接占一个 http worker；期间其他连接由各自的 worker
+     * 并发处理，遇到 PH_PENDING 一律 409，不会踩这份状态）。窗口是"确认页上
+     * 没有操作满 60s"——UI 在子页里时 hold=1，这里把截止时刻一直推到现在+满窗，
+     * 等价于暂停；放开的瞬间就自动恢复成完整 60s（见 recv_decide_hold）。 */
     for (;;) {
+        int expired;
         lock();
         r = g_pend_result;
         if (g_gen != my_gen) r = 3;          /* 占位已被 recv_clear 撤销/被新 prepare 顶替 */
+        if (!r && g_pend_hold)
+            g_pend_dl = (SceLong64)now_us() + RECV_DECIDE_TIMEOUT_US;
+        expired = !g_pend_hold && (SceLong64)now_us() >= g_pend_dl;
         unlock();
         if (r) break;
-        if ((SceLong64)now_us() >= dl) { r = 3; break; }
+        if (expired) { r = 3; break; }
         /* 发送方放弃：官方在"等接受"阶段是 abort 掉 prepare 请求（关连接），
          * 不会调 /cancel——那时 sessionId 还没生成。每 200ms 探一次连接，
          * 断了就立刻收场，别让用户对着一个已经不存在的请求等满 60s。 */
@@ -820,6 +877,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
         lock();
         if (g_gen == my_gen) {               /* 仍是本次占位：撤掉，把原因留给 UI */
             g_phase = PH_NONE;
+            g_pend_hold = 0;
             g_peer_gone_evt = 1;
         }
         unlock();
@@ -843,6 +901,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
         SceOff tot = 0;
         memset(&g_sess, 0, sizeof g_sess);
         g_phase = PH_ACTIVE;
+        g_pend_hold = 0;
         gen_hex(g_sess.session, 16);         /* 32 hex */
         snprintf(g_sess.peer_ip, sizeof g_sess.peer_ip, "%s", g_pend.ip);
         snprintf(g_sess.peer_alias, sizeof g_sess.peer_alias, "%s", g_pend.alias);
@@ -901,6 +960,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
         g_abort = 0;
         if (m == 0) {                        /* 全被勾掉：告诉对方不用传 */
             g_phase = PH_NONE;
+            g_pend_hold = 0;
             code = 204;
         } else {
             g_sess.state = has_pending ? RECV_ST_READY : RECV_ST_DONE;
@@ -926,6 +986,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
              g_sess.session, m, g_sess.peer_alias);
     } else {
         g_phase = PH_NONE;
+        g_pend_hold = 0;
         code = 403;                          /* 拒绝 / 超时未决 */
         dlog("recv: prepare %s from %s", r == 2 ? "rejected" : "timeout",
              g_pend.alias);
@@ -1532,6 +1593,7 @@ void recv_clear(void)
                                               * 这次结果（50ms 轮询窗口）也不会回写状态 */
     }
     g_phase = PH_NONE;
+    g_pend_hold = 0;
     g_abort = 0;
     g_clear_pending = 0;
     unlock();
