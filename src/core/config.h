@@ -17,7 +17,7 @@
 
 /* 发送侧并发上传数（协议 §4.2 明确允许 upload 并行调用）。
  * 上限 6 是为给接收侧 worker 池留余量：对端 HTTP_MAX_CONN = 8，6 路上传 + 1 路
- * prepare / 取消通知仍不越界（详见 docs/TODO.md「并发上传的隐患」隐患 2）。
+ * prepare / 取消通知仍不越界。
  * 1 = 退回逐文件串行。 */
 #define PARALLEL_MIN      1
 #define PARALLEL_MAX      6
