@@ -39,6 +39,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
+      # 升级此 tag 时需重跑真机标定（TLS 握手 230~250ms、收发吞吐），镜像内的 mbedtls/freetype 等随之变化
       image: docker.io/vitasdk/vitasdk:2026.08
     outputs:
       ver: ${{ steps.ver.outputs.ver }}
@@ -48,6 +49,25 @@ jobs:
       # 镜像通常已预装大部分常用库；vdpm install 幂等，缺的会自动补装
       - name: Install library deps
         run: vdpm install libvita2d libjpeg-turbo
+
+      # 直接读 SDK 自带的 pacman 数据库（vdpm 装进 $VITASDK/var/lib/pacman，不在宿主系统库里）
+      - name: Show toolchain libs
+        run: |
+          db="${VITASDK:-/usr/local/vitasdk}/var/lib/pacman/local"
+          [ -d "$db" ] || { echo "::error::找不到 SDK 包数据库：$db"; exit 1; }
+          ls "$db" | grep -E '^(vitasdk-core|libvita2d|libjpeg-turbo|mbedtls|freetype|libpng|zlib)-[0-9]'
+
+      # libvita2d 直接决定渲染行为，上游一旦重建/升版必须人工确认
+      - name: Assert libvita2d version
+        run: |
+          db="${VITASDK:-/usr/local/vitasdk}/var/lib/pacman/local"
+          expected="0.0.0.r188.ga8f15ab-1"  # 与本机 vitasdk 一致；升级 SDK 需先真机回归再改这里
+          actual=$(ls -d "$db"/libvita2d-* 2>/dev/null | head -n1 | sed 's|.*/libvita2d-||')
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::libvita2d 版本漂移：期望 $expected，实际 ${actual:-未安装}。请先在本机升级 SDK 并重跑真机回归，再更新此处的期望值。"
+            exit 1
+          fi
+          echo "libvita2d $actual 与本机一致"
 
       - name: Configure & build VPK
         run: |
