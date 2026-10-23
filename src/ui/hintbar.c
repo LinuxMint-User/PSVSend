@@ -22,7 +22,6 @@ typedef enum {
     HICON_CIRCLE,    /* O 键 */
     HICON_TRIANGLE,  /* 三角键 */
     HICON_SQUARE,    /* 方块键 */
-    HICON_START,     /* START */
     HICON_DPAD       /* 方向键（十字）：按 dir_off 分亮臂/灰臂 */
 } HintIcon;
 
@@ -114,12 +113,6 @@ static void w_icon(HintIcon ic, float cx, float cy, uint32_t c, uint8_t dir_off)
         w_rect((Rect){ (int)cx - 9, (int)cy - 9, 18, 18 }, c);
         w_rect((Rect){ (int)cx - 6, (int)cy - 6, 12, 12 }, theme->bg);
         break;
-    case HICON_START:
-        /* 横向胶囊：填充 + 两条竖向挖空 */
-        w_rect((Rect){ (int)cx - 12, (int)cy - 7, 24, 14 }, c);
-        w_rect((Rect){ (int)cx - 9, (int)cy - 7, 3, 14 }, theme->bg);
-        w_rect((Rect){ (int)cx + 6, (int)cy - 7, 3, 14 }, theme->bg);
-        break;
     case HICON_DPAD: {
         /* 旋转 45° 的空心菱形（描边），在四条边中点附近切开成四份、各占一个角，
          * 中心留空。切缝从中点向两侧各让出 s，四份之间才有明显空隙。
@@ -184,7 +177,8 @@ void w_page_footer_charge(HintKey key, float pct)
 static HintIcon icon_of(HintKey k)
 {
     switch (k) {
-    case HKEY_START:    return HICON_START;
+    case HKEY_START:                       /* 无符号图标，靠文案说明（同 SELECT） */
+    case HKEY_SELECT:   return HICON_NONE;
     case HKEY_DPAD:     return HICON_DPAD;
     case HKEY_CONFIRM:  return g_app.confirm_layout == 0 ? HICON_CROSS : HICON_CIRCLE;
     case HKEY_BACK:     return g_app.confirm_layout == 0 ? HICON_CIRCLE : HICON_CROSS;

@@ -48,6 +48,7 @@
 #define WID_HDR_BACK_CP  0x8204               /* 色盘页：取消选色并返回 */
 #define WID_HDR_BACK_DP  0x8205               /* 目录选择页：退出选择（不改目录） */
 #define WID_HDR_BACK_RS  0x8206               /* 接收设置页：回接收确认页 */
+#define WID_HDR_BACK_VER 0x8207               /* 身份验证页：返回进入前的页面 */
 
 /* ---------- 各页共用的小工具 ---------- */
 
@@ -172,6 +173,7 @@ void goto_devices(void);            /* pages_progress.c：回设备页并复位�
 void spd_reset(void);               /* pages_progress.c：新传输起点作废上一笔的速度采样 */
 void open_dir_pick(PageId origin, bool persist, const char *start_dir); /* pages_settings.c */
 void open_color_pick(void);         /* pages_settings.c：进自定义色盘页（实时预览、确认落盘） */
+void open_verify(const char *peer_fp, const char *alias); /* pages_verify.c：进身份验证页 */
 void ask_ime_host(void);            /* pages_recv.c：打开系统键盘改本机设备名（设置页主机名行用） */
 void ask_ime_pin(void);             /* pages_recv.c：发送等待页对方要求 PIN → 弹键盘输入 */
 void settings_open(void);           /* pages_settings.c：进设置页（焦点回首项、滚动归顶） */

@@ -783,9 +783,9 @@ static char *build_prepare_json(void)
     o = jcat(b, cap, 0,
              "{\"info\":{\"alias\":\"%s\",\"version\":\"2.0\","
              "\"deviceModel\":\"PlayStation Vita\",\"deviceType\":\"mobile\","
-             "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"https\","
+             "\"fingerprint\":\"%s\",\"port\":%d,\"protocol\":\"%s\","
              "\"download\":false},\"files\":{",
-             ae, fe, http_port());
+             ae, fe, http_port(), g_j.tls ? "https" : "http");
     for (i = 0; o >= 0 && i < g_j.count; i++) {
         char esc[2 * 128 + 8];
         char sh[80];

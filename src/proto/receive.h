@@ -27,6 +27,7 @@ typedef struct {
     char peer_alias[64];
     char peer_type[24];
     char peer_ip[16];
+    char peer_fp[65];            /* 对端叶证书 SHA-256（TLS 才有；明文为空） */
     int  count;                  /* 列入清单的文件数（≤ RECV_MAX_FILES） */
     int  overflow;               /* 发送方实际文件数超过上限、被丢弃的个数 */
     /* name 已经是"规整后的落盘名"（净化 + 超长保后缀截断），不是对方原样给的

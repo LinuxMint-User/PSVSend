@@ -899,7 +899,7 @@ static void h_prepare(HttpReq *r)
         return;
     }
     {
-        int code = g_recv->prepare(body, r->ip, resp, (int)sizeof resp);
+        int code = g_recv->prepare(body, r->ip, r->cn->peer_fp, resp, (int)sizeof resp);
         dlog("http: prepare -> %d (tls=%d)", code, r->cn->tls);
         http_respond(r->cn, code, reason_of(code), resp);
     }

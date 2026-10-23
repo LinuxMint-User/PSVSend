@@ -16,7 +16,7 @@
 typedef enum {
     HKEY_NONE = 0,  /* 无键（不画图标，纯文案段）；取 0 使 `= { 0 }` 零初始化安全 */
     HKEY_SELECT,    /* SELECT：无符号图标，靠文案说明 */
-    HKEY_START,     /* START */
+    HKEY_START,     /* START：无符号图标，靠文案说明（同 SELECT） */
     HKEY_DPAD,      /* 方向键（十字）：按 dir_off 分亮臂/灰臂 */
     HKEY_CONFIRM,   /* 确认键：图标随布局在 ○/✗ 间切 */
     HKEY_BACK,      /* 返回键：与确认键互补 */

@@ -110,6 +110,7 @@ typedef enum {
     PAGE_PROGRESS,     /* 传输进度 */
     PAGE_SETTINGS,     /* 设置 */
     PAGE_COLOR_PICK,   /* 色盘：自定义主题选主色（设置页子页） */
+    PAGE_VERIFY,       /* 设备身份验证：两侧指纹拼接后的 128 hex（发送等待/接收确认页进入） */
     PAGE_COUNT
 } PageId;
 
@@ -159,12 +160,19 @@ typedef struct {
     /* 接收请求（mock，多文件；发送方取消用方块键模拟） */
     char    recv_alias[64];
     char    recv_type[24];
+    char    recv_fp[65];    /* 对端证书 SHA-256（仅 TLS 有值；空=明文，验证入口不显示） */
     InFile  inc_files[MAX_INF];
     int     inc_count;
     int     inc_sel;       /* 接收设置页焦点：0=目录行，1..=文件行 */
     char    recv_dir[512]; /* 本次保存目录（新请求来时=config saveDir；Setup 页可临时改） */
     bool    recv_cancel;   /* 发送方已取消请求 */
     int     recv_overflow; /* 发送方文件数超出上限被丢弃的个数（确认页提示） */
+
+    /* 身份验证页（PAGE_VERIFY）：两台设备各自把自己与对端的指纹按字典序
+     * 排序后直接拼接（官方 CombinedFingerprint 口径，不哈希），两边应完全一致 */
+    char    verify_code[129];  /* 128 hex + NUL；空=本机身份还没生成好 */
+    char    verify_alias[64];
+    int     verify_ret;        /* 返回页（发送等待页 / 接收确认页） */
 
     /* 设置 */
     int     theme_id;      /* 色系：0=Yaru 1=OLED */
@@ -219,6 +227,8 @@ void page_settings_render(void);
 void page_settings_input(const Input *in);
 void page_color_pick_render(void);
 void page_color_pick_input(const Input *in);
+void page_verify_render(void);
+void page_verify_input(const Input *in);
 
 /* ---------- 系统键盘（IME）改名事务（pages.c + app/ime.c） ---------- */
 bool page_ime_busy(void);   /* 改名事务进行中：主循环应跳过页面按键/触摸 */

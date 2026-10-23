@@ -36,6 +36,7 @@ static uint64_t dev_scan_end_us = 0;
 static int      dev_scan_was = 0;
 static int      dev_scan_last_found = 0;
 static uint64_t dev_hint_us = 0;
+static int sw_focus = 0;           /* 发送等待页焦点：0=取消/完成，1=验证（仅 https 对端） */
 
 static void start_send(int dev_idx);
 static void open_files(void);
@@ -879,6 +880,7 @@ static void start_send(int dev_idx)
     g_app.prog_running = true;
     g_app.prog_start = sceKernelGetSystemTimeWide();
     xf_count = n;
+    sw_focus = 0;                  /* 焦点默认落在"取消/完成"上，验证是次要动作 */
     g_app.page = PAGE_SEND_WAIT;   /* 先进等待页；对端接受后由 pages_tick 切进度页 */
 }
 
@@ -888,10 +890,19 @@ static void start_send(int dev_idx)
  * 若在开始上传前就出结果（被拒/连不上），结果就地报在本页，不再跳到进度页
  * 去报——过渡页自己就是"这次请求"的完整反馈面。
  *
- * 交互：本页只有一个主操作，画成焦点态（accent 实底），页脚按语义确认键的
- * 图标提示（确认键=激活该按钮），触摸按钮同义；返回键是等价的退出（与进度
- * 页一致），不再单独提示，免得一个动作在页脚出现两条一样的说明。
+ * 交互：主操作是"取消/完成"（焦点态 accent 实底）；https 对端时右侧多一个
+ * "验证"按钮，左右切换焦点、确认键激活当前按钮，触摸同义；返回键等价于退出。
  * 等待中=取消（通知后台收尾）；已出结果=退出。都回设备页，已选文件保留。 */
+/* 身份验证入口是否可用：与官方一致，只对 https 对端开放（明文对端的
+ * fingerprint 是自报随机串，比对没有意义）。对端指纹来自发现公告，发送时
+ * 已用证书 pin 校验过同一串，故可信。 */
+static bool wait_can_verify(void)
+{
+    return g_app.dev_target >= 0 && g_app.dev_target < g_app.dev_count &&
+           strcmp(g_app.dev_proto[g_app.dev_target], "https") == 0 &&
+           g_app.dev_fp[g_app.dev_target][0] != 0;
+}
+
 void page_send_wait_render(void)
 {
     char line[256], sz[16];
@@ -960,32 +971,72 @@ void page_send_wait_render(void)
         w_text_clip(48, 230, 1.0f, theme->text_dim,
                     tr("Please accept on the other device."), card.w - 48);
     }
-    Rect btn = { SCR_W / 2 - 100, 444, 200, 48 };
-    w_add(0, btn);
-    w_button(btn, ended ? tr("Done") : tr("Cancel"), true);   /* 唯一动作，焦点态 */
-    HintSeg segs[2] = { 0 };
+    /* 底部按钮：取消/完成（左）+ 验证（右，仅 https 对端）。验证是次要动作，
+     * 默认焦点不落在它上面；左右切换，触摸可直接点。 */
+    bool can_verify = wait_can_verify();
+    const char *act = ended ? tr("Done") : tr("Cancel");
+    Rect cancel = can_verify ? (Rect){ 270, 444, 200, 48 }
+                             : (Rect){ SCR_W / 2 - 100, 444, 200, 48 };
+    Rect vfy = { 490, 444, 200, 48 };
+    if (!can_verify) sw_focus = 0;
+    w_add(0, cancel);
+    w_button(cancel, act, sw_focus == 0);
+    if (can_verify) {
+        w_add(1, vfy);
+        w_button(vfy, tr("Verify"), sw_focus == 1);
+    }
+    HintSeg segs[4] = { 0 };
     int ns = 0;
-    segs[ns].key  = HKEY_CONFIRM;
-    segs[ns].key2 = HKEY_BACK;   /* 确认/返回都退出本页 → 合并成「确认/返回 …」 */
-    segs[ns++].text = ended ? tr("Done") : tr("Cancel");
+    if (can_verify) {
+        segs[ns].key = HKEY_DPAD; segs[ns].dir_off = HDIR_VERT;
+        segs[ns++].text = tr("Switch");
+    }
+    if (sw_focus == 1) {
+        segs[ns].key = HKEY_CONFIRM; segs[ns++].text = tr("Verify");
+        segs[ns].key = HKEY_BACK;    segs[ns++].text = act;
+    } else {
+        segs[ns].key  = HKEY_CONFIRM;
+        segs[ns].key2 = HKEY_BACK;   /* 确认/返回都退出本页 → 合并成「确认/返回 …」 */
+        segs[ns++].text = act;
+    }
     w_page_footer_segs(segs, ns);
+}
+
+/* 等待页退出：还在等就通知后台收尾，然后回设备页（已选文件保留） */
+static void wait_exit(void)
+{
+    XferInfo xv;
+    api_send_info(&xv);
+    if (!xv.finished) api_send_cancel();
+    goto_devices();
 }
 
 void page_send_wait_input(const Input *in)
 {
-    XferInfo xv;
+    bool can_verify = wait_can_verify();
     if (in->drag_start || in->dragging) return;
     if (in->tap) {
-        if (w_hit(in->tap_x, in->tap_y) == 0) {
-            api_send_info(&xv);
-            if (!xv.finished) api_send_cancel();   /* 还在等 → 通知后台收尾 */
-            goto_devices();
+        int id = w_hit(in->tap_x, in->tap_y);
+        if (id == 0) {
+            wait_exit();
+        } else if (id == 1 && can_verify) {
+            open_verify(g_app.dev_fp[g_app.dev_target],
+                        g_app.dev_alias[g_app.dev_target]);
         }
         return;
     }
-    if (in->confirm || in->back) {
-        api_send_info(&xv);
-        if (!xv.finished) api_send_cancel();
-        goto_devices();
+    if (in->left || in->right) {
+        if (can_verify) sw_focus = sw_focus ? 0 : 1;
+        return;
     }
+    if (in->confirm) {
+        if (sw_focus == 1 && can_verify) {
+            open_verify(g_app.dev_fp[g_app.dev_target],
+                        g_app.dev_alias[g_app.dev_target]);
+        } else {
+            wait_exit();
+        }
+        return;
+    }
+    if (in->back) wait_exit();
 }

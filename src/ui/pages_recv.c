@@ -57,6 +57,7 @@ static void recv_close(void)
 static void recv_focus_sane(void)
 {
     if (recv_focus == 2 && recv_included() == 0) recv_focus = 1;
+    if (recv_focus == 3 && !g_app.recv_fp[0]) recv_focus = 2;
 }
 
 void page_recv_confirm_render(void)
@@ -162,13 +163,19 @@ void page_recv_confirm_render(void)
         w_text(60, list_y + show * 26, 1.0f, theme->text_dim,
                tr("  ... %d more"), n - show);
 
-    /* 底部三个按钮：Reject / Setup / Accept */
+    /* 底部按钮：Reject / Setup / Accept（+ TLS 对端的 Verify）。
+     * 有验证按钮时四格等宽、整体居中（102 起、180 宽、12 间距，两端各留 102）；
+     * 没有时三格保持原位置（183/385/587，190 宽），不因分支改变既有布局。 */
     const char *s_reject = tr("Reject");
     const char *s_setup  = tr("Setup");
     const char *s_accept = tr("Accept");
-    Rect rej = { 183, 444, 190, 48 };
-    Rect set = { 385, 444, 190, 48 };
-    Rect acc = { 587, 444, 190, 48 };
+    bool can_v = g_app.recv_fp[0] != 0;
+    int bw = can_v ? 180 : 190;
+    int bx = can_v ? 102 : 183;
+    Rect rej = { bx, 444, bw, 48 };
+    Rect set = { bx + (bw + 12), 444, bw, 48 };
+    Rect acc = { bx + (bw + 12) * 2, 444, bw, 48 };
+    Rect vfy = { bx + (bw + 12) * 3, 444, bw, 48 };
     w_add(0, rej);
     w_add(1, set);
     w_add(2, acc);
@@ -198,10 +205,19 @@ void page_recv_confirm_render(void)
                theme->text_dim, "%s", s_accept);
     }
 
+    /* 身份验证按钮（次要动作，排在末位）：只在能拿到对端证书指纹（TLS）
+     * 时出现；明文连接的 fingerprint 是自报随机串，官方那边同样是禁用态。 */
+    if (can_v) {
+        w_add(3, vfy);
+        w_button(vfy, tr("Verify"), recv_focus == 3);
+    } else if (recv_focus == 3) {
+        recv_focus = 2;
+    }
+
     /* 页脚：只声明本页用到的键，位置交给 hintbar 按默认键序排。确认段文案不写死
      * Accept（那会在焦点压到别的按钮上时撒谎）；焦点落在 Reject 上时它与返回键
      * 同动作 → 合并成「确认/返回 Reject」，两个键都显示，文案不重复。 */
-    HintSeg segs[6] = { 0 };
+    HintSeg segs[8] = { 0 };
     int ns = 0;
     segs[ns].key = HKEY_DPAD;  segs[ns].dir_off = HDIR_VERT;
     segs[ns++].text = tr("Switch");
@@ -209,6 +225,9 @@ void page_recv_confirm_render(void)
         segs[ns].key  = HKEY_CONFIRM;
         segs[ns].key2 = HKEY_BACK;
         segs[ns++].text = s_reject;
+    } else if (recv_focus == 3) {
+        segs[ns].key = HKEY_CONFIRM;  segs[ns++].text = tr("Verify");
+        segs[ns].key = HKEY_BACK;     segs[ns++].text = s_reject;
     } else {
         segs[ns].key = HKEY_CONFIRM;
         segs[ns++].text = recv_focus == 1 ? s_setup : s_accept;
@@ -239,6 +258,9 @@ void page_recv_confirm_input(const Input *in)
             rs_scroll = 0;
             rename_pop = false;
             g_app.page = PAGE_RECV_SETUP;
+        } else if (id == 3) {
+            recv_focus = 3;
+            open_verify(g_app.recv_fp, g_app.recv_alias);
         } else if (id == 0) {
             recv_focus = 0;
             recv_reject_close();
@@ -247,16 +269,20 @@ void page_recv_confirm_input(const Input *in)
     }
     if (in->left || in->right) {
         int d = in->right ? 1 : -1;
+        int nfocus = g_app.recv_fp[0] ? 4 : 3;   /* 3 = 验证按钮（仅 TLS 对端有） */
         int guard;
-        for (guard = 0; guard < 3; guard++) {
+        for (guard = 0; guard < nfocus; guard++) {
             recv_focus += d;
-            if (recv_focus < 0) recv_focus = 2;
-            if (recv_focus > 2) recv_focus = 0;
+            if (recv_focus < 0) recv_focus = nfocus - 1;
+            if (recv_focus >= nfocus) recv_focus = 0;
             if (recv_focus != 2 || recv_included() > 0) break;  /* 跳过不可点的 Accept */
         }
+        return;
     }
     if (in->confirm) {
-        if (recv_focus == 2 && recv_included() > 0) {
+        if (recv_focus == 3) {
+            open_verify(g_app.recv_fp, g_app.recv_alias);
+        } else if (recv_focus == 2 && recv_included() > 0) {
             start_recv();
         } else if (recv_focus == 1) {
             g_app.inc_sel = 0;
@@ -712,6 +738,7 @@ static void open_recv_request(const RecvPending *rp)
     if (n > MAX_INF) n = MAX_INF;
     g_app.recv_overflow = rp->overflow;
     snprintf(g_app.recv_alias, sizeof g_app.recv_alias, "%s", rp->peer_alias);
+    snprintf(g_app.recv_fp, sizeof g_app.recv_fp, "%s", rp->peer_fp);
     snprintf(g_app.recv_type, sizeof g_app.recv_type, "%s",
              rp->peer_type[0] ? rp->peer_type : "unknown");
     g_app.inc_count = n;

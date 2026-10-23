@@ -56,8 +56,10 @@ int http_chunked_decode(char *body, int len);
 typedef int (*http_stream_fn)(void *ctx, unsigned char *buf, int max);
 
 typedef struct {
-    /* POST /prepare-upload：body=清单 JSON，ip=来源；回执写 resp，返回 HTTP 状态码 */
-    int  (*prepare)(const char *body, const char *ip, char *resp, int respsz);
+    /* POST /prepare-upload：body=清单 JSON，ip=来源，peer_fp=对端叶证书 SHA-256
+     * （明文连接为空串）；回执写 resp，返回 HTTP 状态码 */
+    int  (*prepare)(const char *body, const char *ip, const char *peer_fp,
+                    char *resp, int respsz);
     /* POST /upload?...：total<0 表示 chunked（无 Content-Length）；rd/ctx 由 http 层
      * 提供，协议层经它流式读 body（阻塞轮询语义：返回实读字节 / 0 关闭或超时 / <0 错） */
     int  (*upload)(const char *query, const char *ip, int64_t total,

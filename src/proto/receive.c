@@ -99,6 +99,7 @@ static struct {
     char alias[64];
     char type[24];
     char ip[16];
+    char fp[65];             /* 对端叶证书 SHA-256（TLS 才有；明文为空） */
     int  n;                  /* 列入清单的文件数（≤ RECV_MAX_FILES） */
     int  overflow;           /* 超上限被丢弃的可用文件数（确认页明示用） */
     struct { char fileid[160]; char name[192]; SceOff size; char sha256[65];
@@ -604,6 +605,7 @@ int recv_pending_pull(RecvPending *out)
         snprintf(out->peer_alias, sizeof out->peer_alias, "%s", g_pend.alias);
         snprintf(out->peer_type,  sizeof out->peer_type,  "%s", g_pend.type);
         snprintf(out->peer_ip,    sizeof out->peer_ip,    "%s", g_pend.ip);
+        snprintf(out->peer_fp,    sizeof out->peer_fp,    "%s", g_pend.fp);
         out->count = g_pend.n;
         out->overflow = g_pend.overflow;
         out->total = 0;
@@ -673,7 +675,8 @@ static bool recv_abort_pending(void)
 }
 
 /* prepare-upload：解析 → 挂起等 UI（≤60s）→ 回 HTTP 码并填 resp（200 时 JSON） */
-static int recv_http_prepare(const char *body, const char *ip, char *resp, int respsz)
+static int recv_http_prepare(const char *body, const char *ip, const char *peer_fp,
+                             char *resp, int respsz)
 {
     const char *infov, *filesv, *p;
     JsonIter it;
@@ -716,6 +719,9 @@ static int recv_http_prepare(const char *body, const char *ip, char *resp, int r
     g_pend.alias[0] = 0;
     g_pend.type[0] = 0;
     snprintf(g_pend.ip, sizeof g_pend.ip, "%s", ip ? ip : "");
+    /* 对端证书指纹由 TLS 层在握手时算好传进来（官方口径：注册/准备里的
+     * fingerprint 在 HTTPS 模式下被忽略，一律以证书为准）。 */
+    snprintf(g_pend.fp, sizeof g_pend.fp, "%s", peer_fp ? peer_fp : "");
     json_get_str(infov, "alias", g_pend.alias, sizeof g_pend.alias);
     json_get_str(infov, "deviceType", g_pend.type, sizeof g_pend.type);
     if (!g_pend.alias[0]) snprintf(g_pend.alias, sizeof g_pend.alias, "%s", ip);
