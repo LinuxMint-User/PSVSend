@@ -9,6 +9,7 @@
 #include "ui/ui.h"
 #include "ui/theme.h"
 #include "app/api.h"
+#include "app/cam_bench.h"
 #include "app/update.h"
 #include "core/dlog.h"
 #include "core/i18n.h"
@@ -533,6 +534,8 @@ static void render_page(void)
     case PAGE_SETTINGS:      page_settings_render(); break;
     case PAGE_COLOR_PICK:    page_color_pick_render(); break;
     case PAGE_VERIFY:        page_verify_render(); break;
+    case PAGE_LAB:           page_lab_render(); break;
+    case PAGE_CAM_BENCH:     page_cam_bench_render(); break;
     default: break;
     }
 }
@@ -550,6 +553,8 @@ static void input_page(const Input *in)
     case PAGE_SETTINGS:      page_settings_input(in); break;
     case PAGE_COLOR_PICK:    page_color_pick_input(in); break;
     case PAGE_VERIFY:        page_verify_input(in); break;
+    case PAGE_LAB:           page_lab_input(in); break;
+    case PAGE_CAM_BENCH:     page_cam_bench_input(in); break;
     default: break;
     }
 }
@@ -583,9 +588,15 @@ void ui_run(void)
         }
         api_tick();          /* announce 节奏（500ms 节流；sendto 只在主线程可靠） */
         pages_tick();        /* 检测新到待决定的接收请求 → 弹接收确认页 */
+        /* 基准页被强制切走（如新接收请求弹出）时把摄像头停掉，别让它在后台
+         * 一直占着摄像头/CPU；正常返回路径在页面里已经停过，这里是兜底。 */
+        if (g_app.page != PAGE_CAM_BENCH && cam_bench_running())
+            cam_bench_stop();
         update_tick();       /* 自动检查更新：到周期且网络就绪时后台触发 */
         page_ime_pump();     /* 系统键盘改名事务：帧间打开挂起键盘 / 轮询收尾
                               * （须非绘制中调用 + 打开期间持续出帧，见 ime.c d56） */
+        cam_bench_pre_frame();  /* 摄像头基准预览：帧外建纹理 / 上传最新 Y 帧
+                                 * （纹理创建与写入不能落在渲染 pass 中途） */
 
         vita2d_start_drawing();
         g_in_frame = 1;              /* 此间 font_get 禁止新建字体槽（GPU crash 风险） */

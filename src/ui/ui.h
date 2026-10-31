@@ -118,6 +118,8 @@ typedef enum {
     PAGE_SETTINGS,     /* 设置 */
     PAGE_COLOR_PICK,   /* 色盘：自定义主题选主色（设置页子页） */
     PAGE_VERIFY,       /* 设备身份验证：两侧指纹拼接后的 128 hex（发送等待/接收确认页进入） */
+    PAGE_LAB,          /* 实验室：设置页「实验」分组进入，实验性小工具列表 */
+    PAGE_CAM_BENCH,    /* 摄像头基准：后摄采集 + QR 解码性能实测（实验室子页） */
     PAGE_COUNT
 } PageId;
 
@@ -240,6 +242,10 @@ void page_color_pick_render(void);
 void page_color_pick_input(const Input *in);
 void page_verify_render(void);
 void page_verify_input(const Input *in);
+void page_lab_render(void);
+void page_lab_input(const Input *in);
+void page_cam_bench_render(void);
+void page_cam_bench_input(const Input *in);
 
 /* ---------- 系统键盘（IME）改名事务（pages.c + app/ime.c） ---------- */
 bool page_ime_busy(void);   /* 改名事务进行中：主循环应跳过页面按键/触摸 */

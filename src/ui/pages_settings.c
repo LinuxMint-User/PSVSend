@@ -34,6 +34,7 @@ enum {
     SET_ITEM_SAVEDIR,      /* 存储：默认保存目录（动作行：进目录选择器并落盘） */
     SET_ITEM_CHECK,        /* 更新：检查更新（动作行：按任意键/点任意半即查） */
     SET_ITEM_AUTO,         /* 更新：自动检查频率 */
+    SET_ITEM_LAB,          /* 实验：实验室（动作行：进实验性小工具列表） */
     SET_ITEM_N
 };
 
@@ -57,6 +58,8 @@ enum {
     SET_SLOT_HDR_UPD,      /* 分组：更新 */
     SET_SLOT_CHECK,
     SET_SLOT_AUTO,
+    SET_SLOT_HDR_LAB,      /* 分组：实验 */
+    SET_SLOT_LAB,
     SET_SLOT_HDR_D,        /* 分组：关于（页面最底部） */
     SET_SLOT_ABOUT_A,      /* logo：PSVSend 大字 + 版本号 */
     SET_SLOT_ABOUT_B,      /* 适配说明行 */
@@ -123,6 +126,7 @@ static int slot_item(int slot)
     case SET_SLOT_SAVEDIR: return SET_ITEM_SAVEDIR;
     case SET_SLOT_CHECK: return SET_ITEM_CHECK;
     case SET_SLOT_AUTO:  return SET_ITEM_AUTO;
+    case SET_SLOT_LAB:   return SET_ITEM_LAB;
     }
     return -1;
 }
@@ -143,6 +147,7 @@ static int item_slot(int item)
     case SET_ITEM_RECV_SHA: return SET_SLOT_RECV_SHA;
     case SET_ITEM_CHECK:    return SET_SLOT_CHECK;
     case SET_ITEM_AUTO:     return SET_SLOT_AUTO;
+    case SET_ITEM_LAB:      return SET_SLOT_LAB;
     }
     return -1;
 }
@@ -493,6 +498,7 @@ static void set_row_activate(int item)
     else if (item == SET_ITEM_SAVEDIR) open_dir_pick(PAGE_SETTINGS, true, g_cfg.save_dir);
     else if (item == SET_ITEM_COLOR)   open_color_pick();
     else if (item == SET_ITEM_CHECK)   update_check_now();
+    else if (item == SET_ITEM_LAB)     open_lab();
     else                               set_drawer_open(item);
 }
 
@@ -577,6 +583,7 @@ void page_settings_render(void)
             case SET_SLOT_HDR_C: txt = tr("Controls"); break;
             case SET_SLOT_HDR_ST: txt = tr("Storage"); break;
             case SET_SLOT_HDR_UPD: txt = tr("Update"); break;
+            case SET_SLOT_HDR_LAB: txt = tr("Experimental"); break;
             case SET_SLOT_HDR_D: txt = tr("About"); break;
             default: break; /* 下方各自 case，绝不落到空绘制 */
             }
@@ -684,6 +691,10 @@ void page_settings_render(void)
             w_row(r, tr("Auto check"), tr(set_upd_mode[g_cfg.upd_auto]),
                   item == g_app.set_sel);
             break;
+        case SET_ITEM_LAB:
+            w_row(r, tr("Lab"), tr("Experimental features"),
+                  item == g_app.set_sel);
+            break;
         }
     }
     vita2d_disable_clipping();
@@ -723,16 +734,19 @@ void page_settings_render(void)
         uint8_t off = HDIR_HORZ;
         int it = g_app.set_sel;
         bool act = (it == SET_ITEM_HOSTNAME || it == SET_ITEM_SAVEDIR ||
-                    it == SET_ITEM_COLOR || it == SET_ITEM_CHECK);
+                    it == SET_ITEM_COLOR || it == SET_ITEM_CHECK ||
+                    it == SET_ITEM_LAB);
         int sl = item_slot(it);
         if (sl < 0 || slot_step(sl, -1) == sl) off |= HDIR_UP;
         if (sl < 0 || slot_step(sl, 1) == sl)  off |= HDIR_DOWN;
         segs[ns].key = HKEY_DPAD;        segs[ns].dir_off = off;
         segs[ns++].text = tr("Choose");
         segs[ns].key = HKEY_CONFIRM;
-        /* 动作行点了就执行，不算"改值"；OLED 下的外观行没有档位可开 → 画灰 */
+        /* 动作行点了就执行，不算"改值"；OLED 下的外观行没有档位可开 → 画灰。
+         * 实验室是"进子页"不是改值，文案用 Open。 */
         segs[ns].dim = !act && set_opt_count(it) <= 0;
-        segs[ns++].text = act ? tr("Change") : tr("Options");
+        segs[ns++].text = it == SET_ITEM_LAB ? tr("Open")
+                                             : (act ? tr("Change") : tr("Options"));
         segs[ns].key = HKEY_BACK;        segs[ns++].text = tr("Back");
     }
     w_page_footer_segs(segs, ns);

@@ -32,6 +32,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # 源码按依赖域分子目录（core/net/proto/app/ui），include 以 src/ 为根写
 # 相对全路径（如 "core/dlog.h"、"net/http.h"），故把 src 加入头文件搜索路径。
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
+# 第三方库以 third_party/ 为根（代码里写 "quirc/quirc.h"）
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
 # 给代码段(RX)末尾预留 SCE 元数据空间：vita-elf-create 要把模块/导入表塞在
 # 段0结尾与段1(RW)之间的空隙，代码大了会越界报 "segment 1 overlaps"。
@@ -47,6 +49,7 @@ add_executable(${PROJECT_NAME}
     src/app/api.c
     src/app/update.c
     src/app/ime.c
+    src/app/cam_bench.c
     src/core/config.c
     src/core/dlog.c
     src/core/i18n.c
@@ -65,10 +68,16 @@ add_executable(${PROJECT_NAME}
     src/ui/pages_recv.c
     src/ui/pages_settings.c
     src/ui/pages_verify.c
+    src/ui/pages_lab.c
     src/ui/widgets.c
     src/ui/hintbar.c
     src/ui/input.c
     src/ui/theme.c
+    # QR 解码（quirc v1.2，BSD；实验室的摄像头基准用）
+    third_party/quirc/quirc.c
+    third_party/quirc/decode.c
+    third_party/quirc/identify.c
+    third_party/quirc/version_db.c
 )
 target_link_libraries(${PROJECT_NAME}
     mbedtls mbedx509 mbedcrypto
@@ -78,7 +87,7 @@ target_link_libraries(${PROJECT_NAME}
     SceGxm_stub SceIme_stub SceIofilemgr_stub SceKernelThreadMgr_stub
     SceNet_stub SceNetCtl_stub
     ScePgf_stub ScePvf_stub SceSysmodule_stub SceTouch_stub
-    SceAppUtil_stub
+    SceAppUtil_stub SceCamera_stub SceSysmem_stub
 )
 
 vita_create_self(${PROJECT_NAME}.elf ${PROJECT_NAME})
