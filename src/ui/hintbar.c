@@ -396,8 +396,9 @@ static void draw_row(const HintSeg *s, int n, int y_text, float sc, int gap)
  *
  * 排版（默认单行）：
  *   按默认键序从前往后填，**整段**放不下就丢弃该段及之后的所有段（绝不裁字）。
- *   如果存在被丢弃的段，自动插入一条 R 段（按默认键序排，不固定在右端），
- *   文案「按住显示更多提示」——按 R 可临时展开。
+ *   存在被丢弃的段时自动插入一条 R 段（按默认键序排），文案「按住显示更多提示」。
+ *   页面若在"本来不溢出、但按住 R 有额外效果"（主页页头按钮展开文字），自己
+ *   给一条 HKEY_R 段即可，模块不会再重复插入。
  *
  * 展开（按住 R）：
  *   页脚 46 → 92px，所有段按原顺序分成两行；R 段文案变为「松开显示更少提示」。
@@ -408,23 +409,25 @@ void w_page_footer_segs(const HintSeg *segs, int n)
     HintSeg s[HINT_SEG_MAX];
     int i, j, m = 0, total = 0;
     const int avail = SCR_W - HINT_MARGIN * 2;
-    bool held, overflow;
+    bool held, overflow, has_r = false;
     int h;
     Rect f;
 
     if (n > HINT_SEG_MAX) n = HINT_SEG_MAX;
-    for (i = 0; i < n; i++)
+    for (i = 0; i < n; i++) {
         total += seg_w(&segs[i], 1.0f);      /* 总宽与顺序无关，先判是否溢出 */
+        if (segs[i].key == HKEY_R) has_r = true;
+    }
     overflow = n > 0 && total + HINT_GAP * (n - 1) > avail;
     held = ui_input_r_down();
-    if (overflow && n >= HINT_SEG_MAX) n--;  /* 给自动插入的 R 段留一格 */
+    if (overflow && !has_r && n >= HINT_SEG_MAX) n--;  /* 给自动插入的 R 段留一格 */
 
     for (i = 0; i < n; i++) {                /* 插入排序：段数很少，够用且稳定 */
         j = m++;
         while (j > 0 && seg_before(&segs[i], &s[j - 1])) { s[j] = s[j - 1]; j--; }
         s[j] = segs[i];
     }
-    if (overflow) {
+    if (overflow && !has_r) {
         s[m].key    = HKEY_R;
         s[m].key2   = HKEY_NONE;
         s[m].text   = tr(held ? "Less hints" : "More hints");

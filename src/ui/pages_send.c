@@ -403,12 +403,75 @@ static void try_send(int dev_idx)
  * 只触发动作、**不改焦点**：页头是全局入口，与左右栏无关；页脚提示条照旧只讲
  * 按键，两个入口各说各的。扫描按钮只在空闲时可点（扫描中画灰）——按不动比
  * "再按一下顺延下一轮"那套次级语义更好懂，那是给按键的。 */
+/* 按住 R 展开成文字：平时 40px 等宽图标，展开宽度按当前语言实测，右端锚定、
+ * 从右往左 20ms 错峰（设置 → 扫描 → 网页共享），收起反向。只在主页渲染；
+ * 从别的页面回来时帧间隔过大 → 直接落到目标态，不补一段动画。 */
+static const char *hdr_lbl_key[3] = { "Web share", "Scan", "Settings" };
+static float    hdr_exp;             /* 0=图标 1=文字 */
+static uint64_t hdr_exp_us;          /* 上次动画步进时刻 */
+static int      hdr_lbl_lang = -1;   /* 已测量的语言（切换语言后重量） */
+static int      hdr_lbl_w[3];        /* 展开目标宽（web/scan/settings） */
+
+static void hdr_measure(void)
+{
+    int i, lang = i18n_lang();
+    if (lang == hdr_lbl_lang) return;
+    for (i = 0; i < 3; i++) {
+        int tw = 0, w;
+        w_text_w(0.8f, tr(hdr_lbl_key[i]), &tw, NULL);
+        w = tw + 20;
+        if (w > 140) w = 140;            /* 未来语言兜底：超宽在绘制时裁尾 */
+        if (w < HDR_BTN_SZ) w = HDR_BTN_SZ;
+        hdr_lbl_w[i] = w;
+    }
+    hdr_lbl_lang = lang;
+}
+
+static void hdr_step(void)
+{
+    uint64_t now = (uint64_t)sceKernelGetSystemTimeWide();
+    uint64_t dt = hdr_exp_us ? now - hdr_exp_us : 16667;
+    hdr_exp_us = now;
+    if (dt > 200000) {                   /* 切页回来/长卡顿：不补动画 */
+        hdr_exp = ui_input_r_down() ? 1.0f : 0.0f;
+        return;
+    }
+    if (dt < 1000) dt = 1000;
+    if (ui_input_r_down()) {
+        hdr_exp += (float)dt / 220000.0f;
+        if (hdr_exp > 1.0f) hdr_exp = 1.0f;
+    } else {
+        hdr_exp -= (float)dt / 150000.0f;   /* 收起略快 */
+        if (hdr_exp < 0.0f) hdr_exp = 0.0f;
+    }
+}
+
+/* 单个按钮的展开进度（0=web 左 … 2=settings 右），先右后左错峰 + ease-out */
+static float hdr_p(int i)
+{
+    float p = (hdr_exp - (float)(2 - i) * 0.09f) / 0.82f;
+    if (p < 0.0f) p = 0.0f;
+    if (p > 1.0f) p = 1.0f;
+    return 1.0f - (1.0f - p) * (1.0f - p);
+}
+
 static void hdr_buttons(void)
 {
-    w_hdr_button(HDR_SLOT_L2, WID_HDR_WEB, HDRBTN_WEB, false);
-    w_hdr_button(HDR_SLOT_L, WID_HDR_SCAN, HDRBTN_SCAN,
-                 api_scan_active() || api_identity_pending());
-    w_hdr_button(HDR_SLOT_R, WID_HDR_SETTINGS, HDRBTN_SETTINGS, false);
+    static const HdrBtn kind[3] = { HDRBTN_WEB, HDRBTN_SCAN, HDRBTN_SETTINGS };
+    static const int wid[3] = { WID_HDR_WEB, WID_HDR_SCAN, WID_HDR_SETTINGS };
+    bool dim[3] = { false, api_scan_active() || api_identity_pending(), false };
+    int i, x = HDR_SLOT_R + HDR_BTN_SZ / 2;
+
+    hdr_measure();
+    hdr_step();
+    for (i = 2; i >= 0; i--) {
+        float p = hdr_p(i);
+        int w = HDR_BTN_SZ +
+                (int)((float)(hdr_lbl_w[i] - HDR_BTN_SZ) * p + 0.5f);
+        x -= w;
+        w_hdr_button_var(x, w, wid[i], kind[i], tr(hdr_lbl_key[i]), p, dim[i]);
+        x -= HDR_BTN_EDGE;
+    }
 }
 
 void page_devices_render(void)
@@ -428,10 +491,14 @@ void page_devices_render(void)
 
     /* 页脚只声明"本页有哪些键 + 文案 + 状态"，顺序交给 hintbar 排
      * （默认键序 + 固定靠左、可变靠右）。确认/三角两段随焦点栏变 → 可变段靠右。 */
-    HintSeg segs[7] = { 0 };
+    HintSeg segs[8] = { 0 };
     int ns = 0;
     segs[ns].key = HKEY_SELECT;       segs[ns++].text = tr("SELECT Settings");
     segs[ns].key = HKEY_START;        segs[ns++].text = tr("START Web share");
+    /* 主页按住 R 会展开页头按钮文字：这条 R 段由页面自己声明，不依赖页脚溢出
+     * （简/繁中文案短，页脚放得下，自动补的 R 永远不会出现）。 */
+    segs[ns].key = HKEY_R;
+    segs[ns++].text = tr(ui_input_r_down() ? "Less hints" : "More hints");
     /* 十字键两条：左右切栏（两栏恒可切），上下在焦点栏内移动选中
      * （选到该栏首/末项时对应臂画灰，读起来就是"到头了"） */
     segs[ns].key = HKEY_DPAD;         segs[ns].dir_off = HDIR_VERT;

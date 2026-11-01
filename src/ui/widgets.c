@@ -384,6 +384,40 @@ void w_hdr_button(int cx, int id, HdrBtn kind, bool dim)
         w_add(id, (Rect){ cx - HDR_BTN_HITW / 2, 0, HDR_BTN_HITW, HDR_H });
 }
 
+/* 可变宽版本：方框随展开宽度变宽，图标始终居中；过半分后换成文字。
+ * 文字按方框内宽居中，超出裁尾（未来语言兜底），绝不压到相邻按钮。 */
+void w_hdr_button_var(int x, int w, int id, HdrBtn kind, const char *label,
+                      float p, bool dim)
+{
+    int y   = (HDR_H - HDR_BTN_SZ) / 2;
+    int icy = y + HDR_BTN_SZ / 2;
+    uint32_t c = dim ? theme->border : theme->text_dim;
+
+    w_rect_outline((Rect){ x, y, w, HDR_BTN_SZ }, c);
+    if (p < 0.5f) {
+        int cx = x + w / 2;
+        switch (kind) {
+        case HDRBTN_BACK:     w_icon_back((float)cx, (float)icy, 8.5f, c);   break;
+        case HDRBTN_SCAN:     w_icon_search((float)cx, (float)icy, 8.0f, c); break;
+        case HDRBTN_SETTINGS: w_icon_gear((float)cx, (float)icy, 9.0f, c);   break;
+        case HDRBTN_WEB:      w_icon_globe((float)cx, (float)icy, 9.0f, c);  break;
+        }
+    } else {
+        int tw = 0, th = 0, maxw = w - 12, tx, cw;
+        w_text_w(0.8f, label, &tw, &th);
+        if (maxw < 0) maxw = 0;
+        if (tw > maxw) tw = maxw;
+        tx = x + (w - tw) / 2;
+        cw = x + w - 6 - tx;          /* 居中后右侧剩余，裁尾不超过内边距 */
+        if (cw > maxw) cw = maxw;
+        if (cw < 0) cw = 0;
+        w_text_clip((float)tx, (float)(y + (HDR_BTN_SZ - th) / 2), 0.8f, c,
+                    label, cw);
+    }
+    if (!dim)
+        w_add(id, (Rect){ x, 0, w, HDR_H });
+}
+
 /* w_row 实现（sub_c=0 用默认色；指定则覆盖——"检查更新"行发现新版时用 accent 强调）。
  * 右端值不再按写死的预留值让位：先量它自己的宽，主文本按"右值实测宽 + ROW_GAP"
  * 扣出可用宽；右值本身就长过整行时退化成"主文本让位为 0、右值左对齐裁尾"，

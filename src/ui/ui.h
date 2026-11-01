@@ -328,6 +328,10 @@ void w_page_header(const char *title);
  * 各页只挑槽位与图标）。dim=true 画灰且不注册热区（该动作当前按不动）。 */
 typedef enum { HDRBTN_BACK, HDRBTN_SCAN, HDRBTN_SETTINGS, HDRBTN_WEB } HdrBtn;
 void w_hdr_button(int cx, int id, HdrBtn kind, bool dim);
+/* 可变宽版本（主页按住 R 展开文字用）：方框左缘 x、宽 w；p = 展开进度 0..1，
+ * <0.5 画图标、>=0.5 画文字（0.8 号字，居中，超宽裁尾）。dim 语义同 w_hdr_button。 */
+void w_hdr_button_var(int x, int w, int id, HdrBtn kind, const char *label,
+                      float p, bool dim);
 void w_row(Rect r, const char *main_text, const char *sub_text, bool selected);
 /* 同 w_row，但右值文本颜色指定（0=默认：选中 accent_text / 未选 text_dim） */
 void w_row_c(Rect r, const char *main_text, const char *sub_text,
