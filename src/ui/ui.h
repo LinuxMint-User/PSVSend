@@ -33,6 +33,8 @@ struct vita2d_texture *ui_verify_icons(void);
 #define HDR_BTN_EDGE  16
 #define HDR_SLOT_R    (SCR_W - HDR_BTN_EDGE - HDR_BTN_SZ / 2)
 #define HDR_SLOT_L    (HDR_SLOT_R - HDR_BTN_SZ - HDR_BTN_EDGE)
+/* 主页第三个槽位（网页共享）：再往左一格。三按钮页 = L2 / L / R。 */
+#define HDR_SLOT_L2   (HDR_SLOT_L - HDR_BTN_SZ - HDR_BTN_EDGE)
 #define FOOTER_H      46            /* 页脚提示条高 */
 #define LIST_GAP_TOP  24            /* 页头下沿 → 列表顶 */
 #define LIST_GAP_BOT  6             /* 列表底 → 页脚留白 */
@@ -57,13 +59,18 @@ struct vita2d_texture *ui_verify_icons(void);
 typedef struct {
     bool confirm;   /* 确认（映射到 X 或 O，随布局设置） */
     bool back;      /* 返回（映射到另一键） */
+    bool start;     /* START（主页：网页共享） */
     bool up, down, left, right;
     bool menu;      /* SELECT（打开设置） */
     bool alt;       /* TRIANGLE（按下沿） */
     bool alt_long;  /* TRIANGLE 按住蓄满（长按事件；蓄力进度见 ui_input_alt_charge） */
+    bool back_long; /* 返回键按住蓄满（长按事件；蓄力进度见 ui_input_back_charge） */
     bool square;    /* SQUARE（接收页：模拟发送方取消请求） */
     bool tap;       /* 触摸单击（按住即抬起、无明显移动；屏幕坐标） */
     int  tap_x, tap_y;
+    bool touch_hold;              /* 本帧手指按住且未判定为滑动（蓄力中） */
+    int  touch_x, touch_y;        /* 按住起点（屏幕坐标；touch_hold 时有效） */
+    bool touch_long;              /* 触摸按住蓄满（长按事件；进度见 ui_input_touch_charge） */
     bool drag_start;              /* 触摸判定为"滑动"的首帧 */
     bool dragging;                /* 滑动进行中（本帧仍按住） */
     int  drag_x0, drag_y0;        /* 滑动起始点（屏幕坐标） */
@@ -120,6 +127,7 @@ typedef enum {
     PAGE_VERIFY,       /* 设备身份验证：两侧指纹拼接后的 128 hex（发送等待/接收确认页进入） */
     PAGE_LAB,          /* 实验室：设置页「实验」分组进入，实验性小工具列表 */
     PAGE_CAM_BENCH,    /* 摄像头基准：后摄采集 + QR 解码性能实测（实验室子页） */
+    PAGE_WEB,          /* 网页共享：浏览器经 http://IP:端口 下载/上传（官方 web share） */
     PAGE_COUNT
 } PageId;
 
@@ -209,6 +217,9 @@ void ui_input_resync(void);
 /* 三角键"按住蓄力"进度 0..1：蓄力 / 回落 / 满格判定都实现在 input.c（见 ALT_*
  * 常量），页面只读这个值画蓄力环，动作走 Input.alt_long。 */
 float ui_input_alt_charge(void);
+/* 返回键蓄力进度 / 触摸蓄力进度（0..1，同一套 0.7s 蓄满口径） */
+float ui_input_back_charge(void);
+float ui_input_touch_charge(void);
 /* 作废当前蓄力（如切栏导致该键语义变了）：进度清零，且松开前不再重新蓄力 */
 void ui_input_alt_reset(void);
 
@@ -246,6 +257,8 @@ void page_lab_render(void);
 void page_lab_input(const Input *in);
 void page_cam_bench_render(void);
 void page_cam_bench_input(const Input *in);
+void page_web_render(void);
+void page_web_input(const Input *in);
 
 /* ---------- 系统键盘（IME）改名事务（pages.c + app/ime.c） ---------- */
 bool page_ime_busy(void);   /* 改名事务进行中：主循环应跳过页面按键/触摸 */
@@ -302,7 +315,7 @@ void w_page_header(const char *title);
 
 /* 页头右上角触摸按钮：画方框 + 图标并注册热区（样式/位置口径只在 widgets.c 一处，
  * 各页只挑槽位与图标）。dim=true 画灰且不注册热区（该动作当前按不动）。 */
-typedef enum { HDRBTN_BACK, HDRBTN_SCAN, HDRBTN_SETTINGS } HdrBtn;
+typedef enum { HDRBTN_BACK, HDRBTN_SCAN, HDRBTN_SETTINGS, HDRBTN_WEB } HdrBtn;
 void w_hdr_button(int cx, int id, HdrBtn kind, bool dim);
 void w_row(Rect r, const char *main_text, const char *sub_text, bool selected);
 /* 同 w_row，但右值文本颜色指定（0=默认：选中 accent_text / 未选 text_dim） */

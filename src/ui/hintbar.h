@@ -50,7 +50,8 @@ typedef struct {
     uint8_t dir_off;    /* 方向键灰掉的方向（0 = 全亮） */
 } HintSeg;
 
-/* 底部按键提示条：用 HintSeg 描述（推荐，顺序由本模块排） */
+/* 底部按键提示条：用 HintSeg 描述（推荐，顺序由本模块排）。
+ * 一行装不下（段多 / 长语言）时自动折成两行，页脚高度不变。 */
 void w_page_footer_segs(const HintSeg *segs, int n);
 /* 底部提示条：单行纯文案（无键位图标） */
 void w_page_footer(const char *hint);
@@ -72,6 +73,8 @@ void w_icon_check(float cx, float cy, float r, uint32_t c);
  * 与上面几个同一套线宽口径，空心环靠主题背景色挖空 → 只能画在纯色底上。 */
 void w_icon_gear(float cx, float cy, float r, uint32_t c);
 void w_icon_search(float cx, float cy, float r, uint32_t c);
+/* 独立"🌐"图标（主页页头"网页共享"触摸按钮；r = 外圈半径） */
+void w_icon_globe(float cx, float cy, float r, uint32_t c);
 
 /* 独立"←"图标（页头"返回"触摸按钮；r = 箭尖到箭尾的一半长）
  * 与上面几个同一套线宽口径。 */

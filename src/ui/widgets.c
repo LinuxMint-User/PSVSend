@@ -378,6 +378,7 @@ void w_hdr_button(int cx, int id, HdrBtn kind, bool dim)
     case HDRBTN_BACK:     w_icon_back((float)cx, (float)icy, 8.5f, c);   break;
     case HDRBTN_SCAN:     w_icon_search((float)cx, (float)icy, 8.0f, c); break;
     case HDRBTN_SETTINGS: w_icon_gear((float)cx, (float)icy, 9.0f, c);   break;
+    case HDRBTN_WEB:      w_icon_globe((float)cx, (float)icy, 9.0f, c);  break;
     }
     if (!dim)
         w_add(id, (Rect){ cx - HDR_BTN_HITW / 2, 0, HDR_BTN_HITW, HDR_H });

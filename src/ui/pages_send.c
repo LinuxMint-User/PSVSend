@@ -401,6 +401,7 @@ static void try_send(int dev_idx)
  * "再按一下顺延下一轮"那套次级语义更好懂，那是给按键的。 */
 static void hdr_buttons(void)
 {
+    w_hdr_button(HDR_SLOT_L2, WID_HDR_WEB, HDRBTN_WEB, false);
     w_hdr_button(HDR_SLOT_L, WID_HDR_SCAN, HDRBTN_SCAN,
                  api_scan_active() || api_identity_pending());
     w_hdr_button(HDR_SLOT_R, WID_HDR_SETTINGS, HDRBTN_SETTINGS, false);
@@ -419,9 +420,10 @@ void page_devices_render(void)
 
     /* 页脚只声明"本页有哪些键 + 文案 + 状态"，顺序交给 hintbar 排
      * （默认键序 + 固定靠左、可变靠右）。确认/三角两段随焦点栏变 → 可变段靠右。 */
-    HintSeg segs[6] = { 0 };
+    HintSeg segs[7] = { 0 };
     int ns = 0;
     segs[ns].key = HKEY_SELECT;       segs[ns++].text = tr("SELECT Settings");
+    segs[ns].key = HKEY_START;        segs[ns++].text = tr("START Web share");
     /* 十字键两条：左右切栏（两栏恒可切），上下在焦点栏内移动选中
      * （选到该栏首/末项时对应臂画灰，读起来就是"到头了"） */
     segs[ns].key = HKEY_DPAD;         segs[ns].dir_off = HDIR_VERT;
@@ -494,6 +496,8 @@ void page_devices_input(const Input *in)
             g_app.page = PAGE_SETTINGS;
         } else if (id == WID_HDR_SCAN) {
             api_scan_trigger();   /* 不切焦点：页头是全局入口，与左右栏无关 */
+        } else if (id == WID_HDR_WEB) {
+            open_web(g_app.picked_count > 0);   /* 页头只打开页面；有已选才自动开分享 */
         }
         return;
     }
@@ -537,6 +541,8 @@ void page_devices_input(const Input *in)
         settings_open();
         g_app.page = PAGE_SETTINGS;
     }
+    /* START：网页共享。已选文件 >0 时直接开「下载分享」，否则只进页面选模式。 */
+    if (in->start) open_web(g_app.picked_count > 0);
 }
 
 /* ================= 文件浏览 ================= */

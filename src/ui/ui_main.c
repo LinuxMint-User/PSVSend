@@ -536,6 +536,7 @@ static void render_page(void)
     case PAGE_VERIFY:        page_verify_render(); break;
     case PAGE_LAB:           page_lab_render(); break;
     case PAGE_CAM_BENCH:     page_cam_bench_render(); break;
+    case PAGE_WEB:           page_web_render(); break;
     default: break;
     }
 }
@@ -555,6 +556,7 @@ static void input_page(const Input *in)
     case PAGE_VERIFY:        page_verify_input(in); break;
     case PAGE_LAB:           page_lab_input(in); break;
     case PAGE_CAM_BENCH:     page_cam_bench_input(in); break;
+    case PAGE_WEB:           page_web_input(in); break;
     default: break;
     }
 }
@@ -612,8 +614,10 @@ void ui_run(void)
                 ui_input_resync();       /* 冻结期结束：先对齐边沿，别把"还在按着的键"当新按下 */
             ui_input_poll(&in);
             if (in.tap || in.up || in.down || in.left || in.right ||
-                in.confirm || in.back || in.menu || in.alt || in.alt_long ||
-                in.square || in.drag_start || in.dragging)
+                in.confirm || in.back || in.menu || in.start ||
+                in.alt || in.alt_long || in.square ||
+                in.back_long || in.touch_long || in.touch_hold ||
+                in.drag_start || in.dragging)
                 input_page(&in);
         }
         ime_was_busy = page_ime_busy();

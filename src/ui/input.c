@@ -30,6 +30,18 @@ static uint64_t rep_last[4];    /* 上次触发时刻 */
 static float alt_charge;        /* 当前蓄力进度 0..1（页面画环用） */
 static bool  alt_locked;        /* 本次按住不再蓄力（已触发 / 换栏作废），松开才解 */
 
+/* 返回键蓄力：与三角同一套口径（ALT_* 常量），供"长按停止共享"这类防误触动作。
+ * 页面读 ui_input_back_charge() 画页脚环，动作走 Input.back_long。 */
+static float back_charge;
+static bool  back_locked;
+
+/* 触摸蓄力：手指按住不动 0.7s 蓄满发 Input.touch_long；滑动或抬手作废。
+ * 蓄满的那次手势抬起不再合成 tap——否则动作（如停止共享）执行后，抬手又会
+ * 在新页面上点一次。 */
+static float touch_charge;
+static bool  touch_locked;
+static bool  touch_fired;
+
 /* 触摸拖动状态机：
  *   按下            → 记录起点
  *   位移 < 阈值 抬起 → tap（单击）
@@ -92,6 +104,12 @@ static void touch_poll(Input *in, SceTouchData *touch)
     bool down = touch->reportNum > 0;
     int cx = 0, cy = 0;
 
+    /* 抬手后蓄力回落（与三角同口径）：页面看到环逐渐泄掉 */
+    if (!down && touch_charge > 0.0f) {
+        touch_charge -= (float)ALT_FRAME_US / (float)ALT_REL_US;
+        if (touch_charge < 0.0f) touch_charge = 0.0f;
+    }
+
     if (t_ignore) {
         /* 冻结（系统键盘打开）前就一直按着的手：抬起前不产生任何动作。
          * 否则解冻首帧会把它算成"刚按下"并在抬起时合成一次 tap。 */
@@ -114,6 +132,9 @@ static void touch_poll(Input *in, SceTouchData *touch)
             t_lastx = cx; t_lasty = cy;
             t_have_last = true;
             t_drag = false;
+            touch_charge = 0.0f;
+            touch_locked = false;
+            touch_fired = false;
         } else {
             t_lastx = cx; t_lasty = cy;
             if (!t_drag) {
@@ -134,11 +155,26 @@ static void touch_poll(Input *in, SceTouchData *touch)
                 in->drag_x0 = t_x0; in->drag_y0 = t_y0;
                 in->drag_x = cx;   in->drag_y = cy;
                 in->drag_dx = cx - t_x0; in->drag_dy = cy - t_y0;
+                touch_charge = 0.0f;    /* 滑动即作废本次蓄力 */
+                touch_locked = true;
+            } else {
+                /* 按住不动：蓄力（页面据此画环 / 判长按） */
+                in->touch_hold = true;
+                in->touch_x = t_x0; in->touch_y = t_y0;
+                if (!touch_locked) {
+                    touch_charge += (float)ALT_FRAME_US / (float)ALT_HOLD_US;
+                    if (touch_charge >= 1.0f) {
+                        touch_charge = 0.0f;
+                        touch_locked = true;
+                        touch_fired = true;      /* 本次手势抬起不再合成 tap */
+                        in->touch_long = true;
+                    }
+                }
             }
         }
     } else if (t_down) {
         /* 手指抬起 */
-        if (!t_drag) {
+        if (!t_drag && !touch_fired) {
             int ex = t_have_last ? t_lastx : t_x0;
             int ey = t_have_last ? t_lasty : t_y0;
             int dx = ex - t_x0, dy = ey - t_y0;
@@ -153,6 +189,8 @@ static void touch_poll(Input *in, SceTouchData *touch)
         t_down = false;
         t_drag = false;
         t_have_last = false;
+        touch_locked = false;
+        touch_fired = false;
     }
     t_down = down;
 }
@@ -172,6 +210,7 @@ void ui_input_poll(Input *in)
         /* 沿触发动作：确认/返回/菜单/功能键按住不重复 */
         in->confirm = (b & g_confirm_key) && !(prev_buttons & g_confirm_key);
         in->back    = (b & g_back_key) && !(prev_buttons & g_back_key);
+        in->start   = (b & SCE_CTRL_START) && !(prev_buttons & SCE_CTRL_START);
         in->menu    = (b & SCE_CTRL_SELECT) && !(prev_buttons & SCE_CTRL_SELECT);
         in->alt     = (b & SCE_CTRL_TRIANGLE) && !(prev_buttons & SCE_CTRL_TRIANGLE);
         in->square  = (b & SCE_CTRL_SQUARE) && !(prev_buttons & SCE_CTRL_SQUARE);
@@ -195,6 +234,23 @@ void ui_input_poll(Input *in)
             if (alt_charge > 0.0f) {
                 alt_charge -= (float)ALT_FRAME_US / (float)ALT_REL_US;
                 if (alt_charge < 0.0f) alt_charge = 0.0f;
+            }
+        }
+        /* 返回键蓄力：与三角同口径（满格一次 back_long，松开回落） */
+        if (b & g_back_key) {
+            if (!back_locked) {
+                back_charge += (float)ALT_FRAME_US / (float)ALT_HOLD_US;
+                if (back_charge >= 1.0f) {
+                    back_charge = 0.0f;
+                    back_locked = true;
+                    in->back_long = true;
+                }
+            }
+        } else {
+            back_locked = false;
+            if (back_charge > 0.0f) {
+                back_charge -= (float)ALT_FRAME_US / (float)ALT_REL_US;
+                if (back_charge < 0.0f) back_charge = 0.0f;
             }
         }
         prev_buttons = b;
@@ -227,6 +283,11 @@ void ui_input_resync(void)
         rep_press[i] = rep_last[i] = now;
     alt_charge = 0.0f;   /* 冻结期没推进过蓄力：解冻不继承，避免凭空蓄满 */
     alt_locked = false;
+    back_charge = 0.0f;
+    back_locked = false;
+    touch_charge = 0.0f;
+    touch_locked = false;
+    touch_fired = false;
 
     t_drag = false;
     if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) >= 0 &&
@@ -250,6 +311,17 @@ void ui_input_init(void)
 float ui_input_alt_charge(void)
 {
     return alt_charge;
+}
+
+/* 返回键 / 触摸蓄力进度：同一套口径（0.7s 蓄满、1s 回落） */
+float ui_input_back_charge(void)
+{
+    return back_charge;
+}
+
+float ui_input_touch_charge(void)
+{
+    return touch_charge;
 }
 
 /* 作废当前蓄力：清零并上锁，直到三角松开前都不再重新蓄力。

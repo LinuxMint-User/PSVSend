@@ -59,6 +59,7 @@ add_executable(${PROJECT_NAME}
     src/net/identity.c
     src/net/net.c
     src/net/scan.c
+    src/net/web.c
     src/proto/receive.c
     src/proto/transfer.c
     src/ui/ui_main.c
@@ -69,6 +70,7 @@ add_executable(${PROJECT_NAME}
     src/ui/pages_settings.c
     src/ui/pages_verify.c
     src/ui/pages_lab.c
+    src/ui/pages_web.c
     src/ui/widgets.c
     src/ui/hintbar.c
     src/ui/input.c

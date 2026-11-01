@@ -91,6 +91,27 @@ void w_icon_gear(float cx, float cy, float r, uint32_t c)
     vita2d_draw_fill_circle(cx, cy, r - 2.5f, theme->bg);
 }
 
+/* 地球：外圈 + 赤道 + 两条经线（窄椭圆的两半）。线宽与齿轮/放大镜同一口径。 */
+void w_icon_globe(float cx, float cy, float r, uint32_t c)
+{
+    float rx = r * 0.45f;
+    int k, i;
+    vita2d_draw_fill_circle(cx, cy, r, c);
+    vita2d_draw_fill_circle(cx, cy, r - 2.2f, theme->bg);
+    thick_seg(cx - r + 1.2f, cy, cx + r - 1.2f, cy, c);      /* 赤道 */
+    for (k = -1; k <= 1; k += 2) {                            /* 左右经线 */
+        float px = cx, py = cy - r + 1.2f;
+        for (i = 1; i <= 8; i++) {
+            float t = 3.14159265f * (float)i / 8.0f;
+            float x = cx + (float)k * rx * sinf(t);
+            float y = cy - (r - 1.2f) * cosf(t);
+            thick_seg(px, py, x, y, c);
+            px = x;
+            py = y;
+        }
+    }
+}
+
 static void w_icon(HintIcon ic, float cx, float cy, uint32_t c, uint8_t dir_off)
 {
     switch (ic) {
@@ -247,42 +268,23 @@ static int seg_icon_w(const HintSeg *s)
     return icon_of(s->key2) != HICON_NONE ? 57 : 26;
 }
 
-/* 底部按键提示条：页面给的段先排成默认键序再绘制。
- * 段的 key2 非 HKEY_NONE 时表示"两个键同一个动作"，画成「key / key2 文案」：
- * 两个键都显示出来（告知两条路子都能走），动作文案只写一次，避免同一句话写两遍；
- * 段内两个键之间也按同一默认键序排（○ 恒在 ✗ 前）。
- * 排版有右边界：段的起点出屏就不再画；文字超宽则裁尾（w_text_clip）——此前
- * 只管把 x 往右推，段数多/文案长（长语言）时尾段会被推出屏幕、整段看不见。 */
-void w_page_footer_segs(const HintSeg *segs, int n)
+/* 段宽 = 图标宽 + 文字宽（文字按 sc 缩放）。
+ * 量宽与绘制两处都要用，抽成一处保证口径一致。 */
+static int seg_w(const HintSeg *s, float sc)
 {
-    HintSeg s[HINT_SEG_MAX];
-    int i, j, m = 0, total = 0, gap = HINT_GAP;
-    if (n > HINT_SEG_MAX) n = HINT_SEG_MAX;
-    for (i = 0; i < n; i++) {                /* 插入排序：段数很少，够用且稳定 */
-        j = m++;
-        while (j > 0 && seg_before(&segs[i], &s[j - 1])) { s[j] = s[j - 1]; j--; }
-        s[j] = segs[i];
-    }
+    int tw = 0;
+    if (s->text && s->text[0]) w_text_w(sc, s->text, &tw, NULL);
+    return seg_icon_w(s) + tw;
+}
 
-    Rect f = { 0, SCR_H - FOOTER_H, SCR_W, FOOTER_H };
-    w_rect(f, theme->bg);
-    w_rect((Rect){ 0, f.y, SCR_W, 2 }, theme->border);
-    /* 先量总宽（段宽 = 图标宽 + 文字宽）：装不下就先把段间距压到最小，仍装不下由
-     * 下面的绘制循环裁尾兜底。 */
-    for (i = 0; i < m; i++) {
-        int tw = 0;
-        if (s[i].text && s[i].text[0]) w_text_w(1.0f, s[i].text, &tw, NULL);
-        total += seg_icon_w(&s[i]) + tw;
-    }
-    if (HINT_MARGIN * 2 + total + HINT_GAP * (m > 0 ? m - 1 : 0) > SCR_W)
-        gap = HINT_GAP_MIN;
-
+/* 画一行提示：y_text = 文字顶（图标中心自动取 y_text + 8，与旧版 f.y+12 / f.y+20
+ * 的对应关系一致），sc = 文字缩放。超出右边界时本行剩余段不再画 / 文字裁尾。 */
+static void draw_row(const HintSeg *s, int n, int y_text, float sc, int gap)
+{
+    int i;
     int x = HINT_MARGIN;
-    /* 图标中心对准文字的字形视觉中线：1.0 号字 20px、升部 0.81em，文字顶在
-     * y+12（= f.y+12）→ 基线 f.y+28.2，满格字形视觉中心 ≈ f.y+20.1
-     * （拉丁大写略低约 1px，取 20 折中）。 */
-    int cy = f.y + 20;
-    for (i = 0; i < m; i++) {
+    int cy = y_text + 8;
+    for (i = 0; i < n; i++) {
         HintIcon ic = icon_of(s[i].key);
         int adv = seg_icon_w(&s[i]);
         int room = SCR_W - HINT_MARGIN - x;   /* 本段可用宽（图标 + 文字） */
@@ -305,26 +307,72 @@ void w_page_footer_segs(const HintSeg *segs, int n)
             if (ic2 != HICON_NONE) {
                 /* 第二个键：与第一个隔开，中间一个小号暗淡的 "/" 表示"或" */
                 int sw = 0;
-                w_text_w(0.9f, "/", &sw, NULL);
+                float ss = sc * 0.9f;   /* "/" 比正文再小一档 */
+                w_text_w(ss, "/", &sw, NULL);
                 w_icon(ic2, x + 42, cy, ic_c, s[i].dir_off);
-                w_text(x + 26 - sw / 2, f.y + 12, 0.9f, tx_c, "/");
+                w_text(x + 26 - sw / 2, y_text, ss, tx_c, "/");
             }
         }
         if (s[i].text && s[i].text[0]) {
             int tw = 0, th = 0, avail = room - adv;
-            w_text_w(1.0f, s[i].text, &tw, &th);
+            w_text_w(sc, s[i].text, &tw, &th);
             if (tw > avail) {                 /* 超出右边界：裁尾，宁可少几个字也不出屏 */
                 if (avail > 0)
-                    w_text_clip(x + adv, f.y + 12, 1.0f, tx_c, s[i].text, avail);
+                    w_text_clip(x + adv, y_text, sc, tx_c, s[i].text, avail);
                 x += room;
             } else {
-                w_text(x + adv, f.y + 12, 1.0f, tx_c, "%s", s[i].text);
+                w_text(x + adv, y_text, sc, tx_c, "%s", s[i].text);
                 x += adv + tw;
             }
         } else {
             x += adv;
         }
         x += gap;
+    }
+}
+
+/* 底部按键提示条：页面给的段先排成默认键序再绘制。
+ * 段的 key2 非 HKEY_NONE 时表示"两个键同一个动作"，画成「key / key2 文案」：
+ * 两个键都显示出来（告知两条路子都能走），动作文案只写一次，避免同一句话写两遍；
+ * 段内两个键之间也按同一默认键序排（○ 恒在 ✗ 前）。
+ * 排版：一行装得下（正常段距）就画一行；装不下**自动折成两行**（文字降一档到
+ * 0.9、段距收到最小），页脚高度与列表可视区都不变——此前只压缩段距兜底，段多 /
+ * 长语言时末尾会被裁字，故改为折行。两行按"两行宽度最接近"选断点。 */
+void w_page_footer_segs(const HintSeg *segs, int n)
+{
+    HintSeg s[HINT_SEG_MAX];
+    int w[HINT_SEG_MAX];
+    int i, j, m = 0, total = 0;
+    const int avail = SCR_W - HINT_MARGIN * 2;
+    Rect f = { 0, SCR_H - FOOTER_H, SCR_W, FOOTER_H };
+    if (n > HINT_SEG_MAX) n = HINT_SEG_MAX;
+    for (i = 0; i < n; i++) {                /* 插入排序：段数很少，够用且稳定 */
+        j = m++;
+        while (j > 0 && seg_before(&segs[i], &s[j - 1])) { s[j] = s[j - 1]; j--; }
+        s[j] = segs[i];
+    }
+
+    w_rect(f, theme->bg);
+    w_rect((Rect){ 0, f.y, SCR_W, 2 }, theme->border);
+
+    for (i = 0; i < m; i++) { w[i] = seg_w(&s[i], 1.0f); total += w[i]; }
+    if (m > 0 && total + HINT_GAP * (m - 1) > avail) {
+        int best = 1, best_d = 0x7fffffff, pre = 0, tot2 = 0;
+        for (i = 0; i < m; i++) { w[i] = seg_w(&s[i], 0.9f); tot2 += w[i]; }
+        for (i = 1; i < m; i++) {
+            int a, b, d;
+            pre += w[i - 1];
+            a = pre + HINT_GAP_MIN * (i - 1);
+            b = tot2 - pre + HINT_GAP_MIN * (m - i - 1);
+            d = a > b ? a - b : b - a;
+            if (d < best_d) { best_d = d; best = i; }
+        }
+        /* 两行文字分别贴顶 3px / 24px：0.9 号（18px）文字 3..22 / 24..43，
+         * 图标中心 11 / 32（22px 图标 0..22 / 21..43），都落在 46px 页脚内。 */
+        draw_row(s, best, f.y + 3, 0.9f, HINT_GAP_MIN);
+        draw_row(s + best, m - best, f.y + 24, 0.9f, HINT_GAP_MIN);
+    } else {
+        draw_row(s, m, f.y + 12, 1.0f, HINT_GAP);
     }
     /* 一次性设置：本帧消费完即清（页面要画就每帧设一次） */
     g_charge_key = HKEY_NONE;

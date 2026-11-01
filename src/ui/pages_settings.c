@@ -27,6 +27,7 @@ enum {
     SET_ITEM_LANG,         /* 显示：界面语言 */
     SET_ITEM_KEY,          /* 操作：确认键布局 */
     SET_ITEM_PANE,         /* 操作：主页两栏布局（设备在左 / 文件在左） */
+    SET_ITEM_WEB,          /* 操作：网页共享（动作行→浏览器经 http://IP:端口 互传） */
     SET_ITEM_PARALLEL,     /* 操作：并发上传数（发送侧同时上传的文件数 1-6） */
     SET_ITEM_SEND_SHA,     /* 操作：发送前计算 sha256（关掉即与旧版一致） */
     SET_ITEM_RECV_SHA,     /* 操作：接收时校验对端 sha256（关掉=兼容逃生舱） */
@@ -50,6 +51,7 @@ enum {
     SET_SLOT_HDR_C,        /* 分组：操作 */
     SET_SLOT_KEY,
     SET_SLOT_PANE,
+    SET_SLOT_WEB,          /* 操作：网页共享（动作行） */
     SET_SLOT_PARALLEL,
     SET_SLOT_SEND_SHA,     /* 操作：发送前计算 sha256 */
     SET_SLOT_RECV_SHA,     /* 操作：接收时校验 sha256（与发送项对称） */
@@ -120,6 +122,7 @@ static int slot_item(int slot)
     case SET_SLOT_LANG:  return SET_ITEM_LANG;
     case SET_SLOT_KEY:   return SET_ITEM_KEY;
     case SET_SLOT_PANE:  return SET_ITEM_PANE;
+    case SET_SLOT_WEB:   return SET_ITEM_WEB;
     case SET_SLOT_PARALLEL: return SET_ITEM_PARALLEL;
     case SET_SLOT_SEND_SHA: return SET_ITEM_SEND_SHA;
     case SET_SLOT_RECV_SHA: return SET_ITEM_RECV_SHA;
@@ -142,6 +145,7 @@ static int item_slot(int item)
     case SET_ITEM_LANG:     return SET_SLOT_LANG;
     case SET_ITEM_KEY:      return SET_SLOT_KEY;
     case SET_ITEM_PANE:     return SET_SLOT_PANE;
+    case SET_ITEM_WEB:      return SET_SLOT_WEB;
     case SET_ITEM_PARALLEL: return SET_SLOT_PARALLEL;
     case SET_ITEM_SEND_SHA: return SET_SLOT_SEND_SHA;
     case SET_ITEM_RECV_SHA: return SET_SLOT_RECV_SHA;
@@ -499,6 +503,7 @@ static void set_row_activate(int item)
     else if (item == SET_ITEM_COLOR)   open_color_pick();
     else if (item == SET_ITEM_CHECK)   update_check_now();
     else if (item == SET_ITEM_LAB)     open_lab();
+    else if (item == SET_ITEM_WEB)     open_web_settings();
     else                               set_drawer_open(item);
 }
 
@@ -665,6 +670,9 @@ void page_settings_render(void)
             break;
         case SET_ITEM_PANE:
             w_row(r, tr("Layout"), pane_v, item == g_app.set_sel);
+            break;
+        case SET_ITEM_WEB:
+            w_row(r, tr("Web share"), tr("Open"), item == g_app.set_sel);
             break;
         case SET_ITEM_PARALLEL:
             /* 并发上传数：只看数字即可（1 = 一次传一个文件） */
