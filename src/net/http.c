@@ -1,7 +1,7 @@
 /* http.c 实现 —— 见 http.h。
  * accept 线程只做 accept + 分发：每连接开一个 worker 线程并发处理（上限
- * HTTP_MAX_CONN，满员时新连接立即关闭——宁可见效地拒绝，也不让客户端在 TCP
- * 队列里干等到超时）；worker 处理完关 fd 自清，收大文件 body 是"流式边读边
+ * HTTP_MAX_CONN，满员时先等一小会儿空槽再关闭——下载器多任务并发会瞬时超限，
+ * 立即拒绝会被它算成连接失败）；worker 处理完关 fd 自清，收大文件 body 是"流式边读边
  * 转给 receive 模块"，其余请求头+体都很小读进内存即可。http_stop 关监听让
  * accept 退出后，会对仍存活的 worker 做有预算的 join，等不到就换代弃管。
  * Vita 的 SceNet socket 收/发在暂无数据时会立刻返回 EWOULDBLOCK(0x80410123)，
@@ -16,7 +16,9 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <psp2/net/net.h>
+#include <psp2/io/fcntl.h>
 #include <psp2/kernel/cpu.h>
 #include <psp2/kernel/threadmgr/thread.h>
 #include <psp2/kernel/threadmgr/mutex.h>
@@ -32,6 +34,7 @@
 #include "core/json_util.h"
 #include "net/http.h"
 #include "net/identity.h"
+#include "net/web.h"
 #include "core/dlog.h"
 
 #define HTTP_RECV_TIMEOUT_S 3
@@ -49,7 +52,11 @@
  *    压到 ~2MiB/s（明文与 TLS 都中招）。
  * 1ms 的开销只是少量唤醒，换来的是"有数据就立刻搬"。 */
 #define NET_POLL_US         1000
-#define HTTP_MAX_CONN       8       /* 并发连接 worker 上限（满员立即关新连接） */
+#define HTTP_MAX_CONN       64      /* 并发连接 worker 上限。要容得下两个下载器任务并留出
+                                     * 余量：支持 Range 后 Gopeed 每个任务默认开 16 条连接，
+                                     * 两文件同时下就是 32 条；若上限正好 32，此时网页 /
+                                     * prepare-download 这类前端请求就抢不到槽（偶发 1.5s
+                                     * 后被拒）。64 = 32 条下载 + 32 条给前端与其它对端。 */
 #define HTTP_CONN_STACK     0x40000 /* 每连接 worker 栈：与旧 accept 线程同规格
                                      * （handle_conn 内 buf+prepare 体/回执 ~100KB） */
 
@@ -87,11 +94,13 @@ static const char *reason_of(int code)
     switch (code) {
     case 200: return "OK";
     case 204: return "No Content";
+    case 206: return "Partial Content";
     case 400: return "Bad Request";
     case 401: return "Unauthorized";
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 409: return "Conflict";
+    case 410: return "Gone";
     case 422: return "Unprocessable Entity";
     case 429: return "Too Many Requests";
     case 500: return "Internal Server Error";
@@ -600,6 +609,19 @@ static void conn_close(Conn *c)
     c->fd = -1;
 }
 
+/* 半截响应被迫中断时用：让随后的 close 发 RST 而不是 FIN。
+ * 只发 FIN 时，部分浏览器 / 下载器会把"连接结束"当成"文件收完"，把截断的文件
+ * 存成完整文件（PSV 退出共享页打断正在进行的下载就是这条路径）。设
+ * SO_LINGER{on, 0} 后 close 直接 RST，客户端必然报下载失败。 */
+static void conn_abort(Conn *c)
+{
+    SceNetLinger lg;
+    if (c->fd < 0) return;
+    lg.l_onoff = 1;
+    lg.l_linger = 0;
+    sceNetSetsockopt(c->fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_LINGER, &lg, sizeof lg);
+}
+
 /* ---------- upload 大文件的流式读回调（receive 模块轮询调用） ---------- */
 typedef struct {
     Conn *conn;         /* 连接：读经 conn_read（换代/中止/TLS 由它统一感知） */
@@ -705,6 +727,83 @@ static void http_respond(Conn *c, int code, const char *reason,
              code, reason, blen);
     conn_write(c, hdr, (int)strlen(hdr));
     conn_write(c, body, blen);
+}
+
+/* 通用响应头（网页 / 文件流用）：能指定 Content-Type 与额外头。
+ * clen 是确切字节数——调用方随后必须恰好写这么多（浏览器按它判完成）。 */
+static void http_respond_ct(Conn *c, int code, const char *reason,
+                            const char *ctype, const char *extra,
+                            SceLong64 clen)
+{
+    /* 要容得下最长的文件名（ASCII 回退 + RFC 5987 百分号编码约 700 字节）
+     * 与 Range 相关头；此前 768 会截掉结尾的 \r\n\r\n 让响应头不完整。 */
+    char hdr[1400];
+    snprintf(hdr, sizeof hdr,
+             "HTTP/1.1 %d %s\r\n"
+             "Content-Type: %s\r\n"
+             "Content-Length: %lld\r\n"
+             "%s"
+             "Cache-Control: no-store\r\n"
+             "Connection: close\r\n\r\n",
+             code, reason, ctype, (long long)clen, extra ? extra : "");
+    conn_write(c, hdr, (int)strlen(hdr));
+}
+
+/* URL query 取参数（%XX 解码；web 入口的 pin / sessionId / fileId 都是 ASCII） */
+static void qparam(const char *q, const char *key, char *out, int cap)
+{
+    int kl = (int)strlen(key), o = 0;
+    if (cap <= 0) return;
+    out[0] = 0;
+    if (!q) return;
+    while (*q) {
+        const char *amp = strchr(q, '&');
+        int len = amp ? (int)(amp - q) : (int)strlen(q);
+        if (len > kl && q[kl] == '=' && strncmp(q, key, (size_t)kl) == 0) {
+            const char *p = q + kl + 1, *end = q + len;
+            while (p < end && o < cap - 1) {
+                if (*p == '%' && p + 2 < end) {
+                    int hi = p[1], lo = p[2];
+                    hi = (hi >= '0' && hi <= '9') ? hi - '0'
+                       : (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10
+                       : (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : -1;
+                    lo = (lo >= '0' && lo <= '9') ? lo - '0'
+                       : (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10
+                       : (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : -1;
+                    if (hi >= 0 && lo >= 0) {
+                        out[o++] = (char)(hi << 4 | lo);
+                        p += 3;
+                        continue;
+                    }
+                }
+                out[o++] = *p++;
+            }
+            out[o] = 0;
+            return;
+        }
+        if (!amp) break;
+        q = amp + 1;
+    }
+}
+
+/* RFC 5987 的 filename*：只保留 unreserved 字符，其余按 UTF-8 字节 %XX */
+static void pct_encode(const char *in, char *out, int cap)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    int o = 0;
+    unsigned char ch;
+    while ((ch = (unsigned char)*in++) != 0 && o < cap - 4) {
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
+            ch == '.' || ch == '~') {
+            out[o++] = (char)ch;
+        } else {
+            out[o++] = '%';
+            out[o++] = hex[ch >> 4];
+            out[o++] = hex[ch & 0xF];
+        }
+    }
+    out[o] = 0;
 }
 
 static int hexv(char c)
@@ -918,6 +1017,25 @@ static void h_prepare(HttpReq *r)
         http_respond(r->cn, 400, "Bad Request", "");
         return;
     }
+    /* Web 网页上传：浏览器在 prepare 的 query 里带 pin（官方 web share 口径）。
+     * 普通 LocalSend 发送方不带 pin，走原路径——网页共享开着也不影响正常收件。 */
+    {
+        char pin[16] = "";
+        qparam(r->query, "pin", pin, sizeof pin);
+        if (pin[0]) {
+            int wc = web_check_pin(pin, r->ip);
+            if (wc != 200) {
+                dlog("http: prepare web pin -> %d from %s", wc, r->ip);
+                http_respond(r->cn, wc, reason_of(wc), "");
+                return;
+            }
+            {
+                char ua[192] = "";
+                hdr_copy(r->buf, r->he, "user-agent", ua, sizeof ua);
+                web_upload_note(r->ip, ua);
+            }
+        }
+    }
     if (!recv_ops_ready()) {
         http_respond(r->cn, 500, "Internal Server Error", "");
         return;
@@ -976,6 +1094,190 @@ static void h_cancel(HttpReq *r)
 {
     int code = recv_ops_ready() ? g_recv->cancel(r->query, r->ip) : 500;
     http_respond(r->cn, code, reason_of(code), "");
+}
+
+/* ---------- Web 网页端（net/web.c；官方 web share 口径） ----------
+ * GET  /                          网页：下载清单 / 网页上传
+ * POST /prepare-download?pin=     校验 PIN → 清单 + sessionId
+ * GET  /download?sessionId=&fileId=  流式回文件（64 位 Content-Length） */
+
+/* GET / —— 浏览器打开的共享页；共享未开启时回 403 页 */
+static void h_web_page(HttpReq *r)
+{
+    char ua[192] = "";
+    int len = 0, m = web_mode();
+    const char *p = web_page(&len);
+    hdr_copy(r->buf, r->he, "user-agent", ua, sizeof ua);
+    web_note_client(r->ip, ua);
+    http_respond_ct(r->cn, m == WEB_MODE_NONE ? 403 : 200,
+                    m == WEB_MODE_NONE ? "Forbidden" : "OK",
+                    "text/html; charset=utf-8", NULL, len);
+    conn_write(r->cn, p, len);
+}
+
+/* GET/POST /heartbeat —— 网页保活（页面每 2 秒一次，关页即停）。独立路径，
+ * 不属于 LocalSend 协议，也不进 requests 计数；失败一律 204（前端不看结果）。
+ * 不打日志：每 2 秒一条会把 log.txt 刷满。 */
+static void h_heartbeat(HttpReq *r)
+{
+    web_heartbeat(r->query, r->ip);
+    http_respond_ct(r->cn, 204, "No Content", "text/plain", NULL, 0);
+}
+
+/* POST /prepare-download —— 下载清单（PSV 只给 fileName / size，不暴露路径） */
+static void h_prepare_download(HttpReq *r)
+{
+    char files[16384];
+    char sid[40] = "";
+    char ua[192] = "";
+    char info[512];
+    char out[17600];
+    int code;
+
+    hdr_copy(r->buf, r->he, "user-agent", ua, sizeof ua);
+    web_note_client(r->ip, ua);
+    code = web_prepare_download(r->query, r->ip, sid, sizeof sid,
+                                files, sizeof files);
+    if (code != 200) {
+        dlog("http: prepare-download -> %d from %s", code, r->ip);
+        http_respond(r->cn, code, reason_of(code), "");
+        return;
+    }
+    member_info_json(info, sizeof info);
+    snprintf(out, sizeof out, "{\"info\":%s,\"sessionId\":\"%s\",\"files\":%s}",
+             info, sid, files);
+    http_respond(r->cn, 200, "OK", out);
+}
+
+/* 解析单段 Range（bytes=a-b / a- / -N）。返回 1 = 206 部分内容，0 = 整段 200。
+ * 多段 Range 不支持（按整段回 200，规范允许）；越界同样退回整段，不折腾 416。
+ *
+ * 为什么要支持 Range：Gopeed 这类下载器只有在"Acept-Ranges: bytes + 206"的
+ * 多连接路径上才会把"传输被中断"判成失败；无 Range 时它走单连接预取路径，
+ * 断线只被当作 transient（1.9.3 的 fetcher 里甚至没置 failed），最后仍判完成。 */
+static int parse_range(const char *h, SceOff size, SceOff *start, SceOff *total)
+{
+    const char *p = h;
+    SceOff a = 0, b = -1;
+    int na = 0, nb = 0;
+    if (!h || !h[0] || size <= 0) return 0;
+    if (strncmp(p, "bytes=", 6) != 0) return 0;
+    p += 6;
+    if (strchr(p, ',')) return 0;             /* 多段：整段回 */
+    while (*p >= '0' && *p <= '9') {
+        a = a * 10 + (*p - '0');
+        p++;
+        na++;
+    }
+    if (*p != '-') return 0;
+    p++;
+    if (!na) {                                /* bytes=-N：最后 N 字节 */
+        SceOff k = 0;
+        while (*p >= '0' && *p <= '9') {
+            k = k * 10 + (*p - '0');
+            p++;
+        }
+        if (k <= 0) return 0;
+        if (k > size) k = size;
+        a = size - k;
+        b = size - 1;
+    } else {
+        while (*p >= '0' && *p <= '9') {
+            b = (b < 0 ? 0 : b) * 10 + (*p - '0');
+            p++;
+            nb++;
+        }
+        if (!nb) b = size - 1;                /* bytes=a-：到文件末尾 */
+    }
+    if (a >= size || b < a) return 0;
+    if (b >= size) b = size - 1;
+    *start = a;
+    *total = b - a + 1;
+    return 1;
+}
+
+/* GET /download —— 流式回文件。Content-Length 必须精确等于本次响应的字节数，
+ * 断了浏览器就当下载失败（退出共享页时就是这么停的）。支持单段 Range（206），
+ * 既让下载器能续传，也让它们走"会正确判定中断"的多连接路径（见 parse_range）。 */
+static void h_download(HttpReq *r)
+{
+    int idx = -1, code, gen, i;
+    SceOff size = 0, got = 0, start = 0, total = 0;
+    int partial = 0;
+    char rng[64] = "";
+    char cr[96] = "";
+    char name[128] = "";
+    char ascii[160], enc[640], disp[1024];
+    const char *path;
+    unsigned char *buf;
+    SceUID fd;
+
+    code = web_resolve_download(r->query, r->ip, &idx, name, sizeof name, &size);
+    if (code != 200) {
+        dlog("http: download -> %d from %s", code, r->ip);
+        http_respond(r->cn, code, reason_of(code), "");
+        return;
+    }
+    hdr_copy(r->buf, r->he, "range", rng, sizeof rng);
+    partial = parse_range(rng, size, &start, &total);
+    if (!partial) total = size;
+    path = web_entry_path(idx);
+    fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        dlog("http: download open fail 0x%08X (%s)", (unsigned)fd, path);
+        http_respond(r->cn, 500, "Internal Server Error", "");
+        return;
+    }
+    if (start > 0 && sceIoLseek(fd, start, SCE_SEEK_SET) < 0) {
+        sceIoClose(fd);
+        http_respond(r->cn, 500, "Internal Server Error", "");
+        return;
+    }
+    /* 中文名的两条文件名：ASCII 回退（给老浏览器）+ RFC 5987 UTF-8 百分号编码 */
+    for (i = 0; name[i] && i < (int)sizeof ascii - 1; i++) {
+        unsigned char ch = (unsigned char)name[i];
+        ascii[i] = (ch < 0x20 || ch >= 0x7F || ch == '"' || ch == '\\') ? '_' : (char)ch;
+    }
+    ascii[i] = 0;
+    pct_encode(name, enc, sizeof enc);
+    snprintf(disp, sizeof disp,
+             "Content-Disposition: attachment; filename=\"%s\"; "
+             "filename*=UTF-8''%s\r\n"
+             "Accept-Ranges: bytes\r\n", ascii, enc);
+    if (partial) {
+        snprintf(cr, sizeof cr, "Content-Range: bytes %lld-%lld/%lld\r\n",
+                 (long long)start, (long long)(start + total - 1), (long long)size);
+        strncat(disp, cr, sizeof disp - strlen(disp) - 1);
+    }
+
+    dlog("http: download f%d %lld+%lld/%lld bytes to %s",
+         idx, (long long)start, (long long)total, (long long)size, r->ip);
+    http_respond_ct(r->cn, partial ? 206 : 200,
+                    partial ? "Partial Content" : "OK",
+                    "application/octet-stream", disp, total);
+
+    buf = malloc(65536);
+    if (!buf) {
+        sceIoClose(fd);
+        conn_abort(r->cn);            /* 头已发：只能 RST 断开，别让客户端当下载完成 */
+        return;
+    }
+    gen = web_download_begin(idx, total);
+    while (got < total) {
+        int want = (total - got) > 65536 ? 65536 : (int)(total - got);
+        int rd = sceIoRead(fd, buf, (unsigned)want);
+        if (rd <= 0) break;
+        if (conn_write(r->cn, (const char *)buf, rd) != 0) break;
+        got += rd;
+        web_download_progress(gen, got);
+        if ((unsigned)gen != web_download_gen()) break;   /* 用户退出共享页 */
+    }
+    /* Content-Length 已按本次响应长度发出：没发完就不能让连接"正常"结束，否则客户端
+     * 会把截断的文件当完整文件（PSV 中途退出共享页时 PC 侧曾显示"下载完成"）。 */
+    if (got < total) conn_abort(r->cn);
+    web_download_end(gen);
+    free(buf);
+    sceIoClose(fd);
 }
 
 /* 解析 HTTP 请求并应答一个连接（在独立 worker 线程跑），返回后由 worker 关 fd */
@@ -1091,9 +1393,10 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
     llen = n - (he + 4);
     if (llen < 0) llen = 0;
 
-    if (method[0] && route[0])
-        dlog("http: %s %s from %s", method, route, rip);
-    else
+    if (method[0] && route[0]) {
+        if (strcmp(route, "/heartbeat") != 0)   /* 每 2 秒一条，不打日志 */
+            dlog("http: %s %s from %s", method, route, rip);
+    } else
         dlog("http: unparsed req from %s", rip);
 
     /* 按路由分派：每个 handler 只管自己那条路由的语义与应答 */
@@ -1114,6 +1417,20 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
         if (strcmp(method, "GET") == 0 &&
             strcmp(route, "/api/localsend/v2/info") == 0)
             h_info(&r);
+        else if (strcmp(method, "GET") == 0 &&
+                 (strcmp(route, "/") == 0 || strcmp(route, "/index.html") == 0))
+            h_web_page(&r);
+        else if (strcmp(route, "/heartbeat") == 0)
+            h_heartbeat(&r);
+        else if (strcmp(method, "GET") == 0 &&
+                 strcmp(route, "/favicon.ico") == 0)
+            http_respond_ct(cn, 204, "No Content", "text/plain", NULL, 0);
+        else if (strcmp(method, "POST") == 0 &&
+                 strcmp(route, "/api/localsend/v2/prepare-download") == 0)
+            h_prepare_download(&r);
+        else if (strcmp(method, "GET") == 0 &&
+                 strcmp(route, "/api/localsend/v2/download") == 0)
+            h_download(&r);
         else if (strcmp(method, "POST") == 0 &&
                  strcmp(route, "/api/localsend/v2/register") == 0)
             h_register(&r);
@@ -1136,9 +1453,10 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
  * 每个已接受连接由一个 worker 线程独占处理到关 fd；并发连接之间、与
  * receive 模块的交互由 receive 侧互斥锁串行（见 receive.c 头注），连接
  * 本身天然互不干扰：
- *  - 槽满（HTTP_MAX_CONN 个 worker 还活着）→ 新连接立即关闭：宁可见效地
- *    拒绝，也不让客户端在 TCP 队列里干等到超时——"忙时第二个发送方立刻
- *    拿 409"就是这个门卫实现的；
+ *  - 槽满（HTTP_MAX_CONN 个 worker 还活着）→ 先等最多 1.5s 再拒（见
+ *    spawn_conn）：下载器为一个任务会并发开十几条连接，瞬时超限很常见，
+ *    立刻关连接会让它把这条连接算失败、重试仍满 → 整个任务报错；真等不到
+ *    空槽才关闭——"忙时第二个发送方立刻拿 409"仍是这个门卫的兜底；
  *  - worker 自找本槽（sceKernelGetThreadId 匹配）取 fd/ip/代次，处理完关
  *    fd、清槽、线程自删（ExitDeleteThread，无固定 join 者，避免泄漏）；
  *  - 换代（http_stop/restart）后旧 worker 在收头/收体轮询里感知 gen 变化
@@ -1239,10 +1557,25 @@ static int spawn_conn(int c, const char *ip)
     conn_lock();
     for (i = 0; i < HTTP_MAX_CONN; i++)
         if (g_conns[i].tid <= 0) break;     /* <=0 = 空槽（含零初始的未用槽） */
-    if (i >= HTTP_MAX_CONN) {        /* 满员：礼貌拒绝 */
+    if (i >= HTTP_MAX_CONN) {
+        /* 满员先等一小会儿再拒：下载器为一个任务会开十几条 Range 连接，多任务
+         * 并发时会短暂超过上限；立刻关连接会让它把这条连接算作失败，而它重试
+         * 几次仍是满员 → 整个任务报错（表现为"第二个文件经常要重下"）。
+         * 等待期间必须放锁，否则占着连接锁睡 50ms，worker 退出时登记不回来。 */
+        int waited;
         conn_unlock();
-        dlog("http: conn from %s refused: %d workers busy", ip, HTTP_MAX_CONN);
-        return 0;
+        for (waited = 0; waited < 30; waited++) {
+            sceKernelDelayThread(50 * 1000);
+            conn_lock();
+            for (i = 0; i < HTTP_MAX_CONN; i++)
+                if (g_conns[i].tid <= 0) break;
+            if (i < HTTP_MAX_CONN) break;
+            conn_unlock();
+        }
+        if (i >= HTTP_MAX_CONN) {        /* 真满了：礼貌拒绝 */
+            dlog("http: conn from %s refused: %d workers busy", ip, HTTP_MAX_CONN);
+            return 0;
+        }
     }
     g_conns[i].fd = c;
     g_conns[i].gen = g_gen;
@@ -1383,9 +1716,11 @@ int http_start(void)
         dlog("http: no bindable port");
         return -1;
     }
-    if (sceNetListen(s, 8) < 0) {   /* 连接交给独立 worker 并发处理，backlog 8
-                                     * 兜底瞬时并发（超 HTTP_MAX_CONN 的连接会
-                                     * 在 accept 时被立即关闭——礼貌拒绝） */
+    if (sceNetListen(s, HTTP_MAX_CONN) < 0) {   /* 连接交给独立 worker 并发处理。
+                                     * backlog 与 worker 上限同宽：满员时 accept
+                                     * 线程会在 spawn_conn 里等空槽（最多 1.5s），
+                                     * 这期间新连接只能排在内核队列里——队列太浅
+                                     * 会把下载器成批打开的连接直接丢掉。 */
         sceNetSocketClose(s);
         dlog("http: listen fail");
         return -2;

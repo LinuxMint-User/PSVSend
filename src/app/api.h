@@ -6,6 +6,7 @@
 
 #include <stdbool.h>
 #include "net/device.h"        /* Device / DEVICE_MAX（类型住 net 层，见 device.h） */
+#include "net/web.h"           /* WebEntry / WebSnap / WEB_MODE_*：网页共享契约 */
 #include "proto/transfer.h"    /* XferFile / XferInfo / XFER_MAX_FILES：发送契约数据类型 */
 #include "proto/receive.h"     /* RecvPending / RecvStatus / RECV_ST_*：接收契约数据类型 */
 
@@ -95,5 +96,15 @@ void api_recv_abort(void);
 int  api_recv_status_pull(RecvStatus *out);
 /* 会话结束展示完毕，清场回空闲 */
 void api_recv_clear(void);
+
+/* ---- UI 门面：Web 网页端（net/web.c） ----
+ * 浏览器经明文 http://IP:端口 打开共享页；两种模式互斥（下载分享 / 网页接收）。
+ * UI 只负责生成 PIN、启停、展示快照；路由与鉴权住在 net 层。 */
+void api_web_new_pin(void);                              /* 进共享页时生成新 PIN */
+void api_web_start_download(const WebEntry *files, int n); /* 分享已选文件（n≤64） */
+void api_web_start_upload(void);                         /* 浏览器 → PSV（保留确认页） */
+void api_web_stop(void);                                 /* 停止：会话与 PIN 一并作废 */
+int  api_web_mode(void);
+void api_web_snapshot(WebSnap *out);                     /* 每帧可调（锁内拷贝） */
 
 #endif

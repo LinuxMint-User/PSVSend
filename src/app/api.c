@@ -15,6 +15,7 @@
 #include "core/config.h"
 #include "net/net.h"
 #include "net/http.h"
+#include "net/web.h"
 #include "net/discovery.h"
 #include "net/scan.h"
 #include "proto/transfer.h"
@@ -265,6 +266,7 @@ void api_start(void)
 
     http_set_register_cb(discovery_peer_registered);   /* 对方 register → 设备表 */
     http_set_recv_ops(recv_http_ops());   /* 接收侧路由实现注册给 http 层（依赖倒置） */
+    web_init();                          /* Web 共享：建锁（会话/统计全在 net/web.c） */
     recv_init();                         /* 接收模块：建锁 + 清扫残留 *.psvsend.tmp */
 
     r = net_start();
@@ -434,3 +436,14 @@ void api_recv_clear(void)
 {
     recv_clear();
 }
+
+/* ---- UI 门面：Web 网页端（薄转发，见 net/web.h） ---- */
+void api_web_new_pin(void) { web_new_pin(); }
+void api_web_start_download(const WebEntry *files, int n)
+{
+    web_start_download(files, n);
+}
+void api_web_start_upload(void) { web_start_upload(); }
+void api_web_stop(void)         { web_stop(); }
+int  api_web_mode(void)         { return web_mode(); }
+void api_web_snapshot(WebSnap *out) { web_snapshot(out); }
