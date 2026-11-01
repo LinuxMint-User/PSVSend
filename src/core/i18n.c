@@ -93,6 +93,8 @@ static const TrEntry s_tr[] = {
     { "SELECT Settings", "SELECT 设置", "SELECT 設定", "SELECT 設定", "SELECT 設定" },
     { "START Web share", "START 网页共享", "START 網頁共享", "START 網頁共享",
       "START Web 共有" },
+    { "More hints", "更多提示", "更多提示", "更多提示", "ヒントを増やす" },
+    { "Less hints", "更少提示", "更少提示", "更少提示", "ヒントを減らす" },
 
     /* ---- 发送主页两栏（设备栏 / 已选文件栏） ---- */
     { "Devices (%d)", "设备（%d）", "裝置（%d）", "裝置（%d）", "デバイス（%d）" },

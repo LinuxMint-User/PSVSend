@@ -60,6 +60,7 @@ typedef struct {
     bool confirm;   /* 确认（映射到 X 或 O，随布局设置） */
     bool back;      /* 返回（映射到另一键） */
     bool start;     /* START（主页：网页共享） */
+    bool l, r;      /* L/R 肩键（按下沿；目前仅供页面自行绑定） */
     bool up, down, left, right;
     bool menu;      /* SELECT（打开设置） */
     bool alt;       /* TRIANGLE（按下沿） */
@@ -220,6 +221,8 @@ float ui_input_alt_charge(void);
 /* 返回键蓄力进度 / 触摸蓄力进度（0..1，同一套 0.7s 蓄满口径） */
 float ui_input_back_charge(void);
 float ui_input_touch_charge(void);
+/* R 肩键当前是否按住（非沿事件；页脚"按住展开"用） */
+bool ui_input_r_down(void);
 /* 作废当前蓄力（如切栏导致该键语义变了）：进度清零，且松开前不再重新蓄力 */
 void ui_input_alt_reset(void);
 

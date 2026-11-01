@@ -11,6 +11,7 @@ int g_confirm_key = SCE_CTRL_CROSS;
 int g_back_key    = SCE_CTRL_CIRCLE;
 
 static uint32_t prev_buttons = 0;
+static bool r_down;               /* R 肩键按住状态（页脚展开用） */
 
 /* 方向键长按重复状态（up/down/left/right） */
 static uint64_t rep_press[4];   /* 按下时刻（微秒） */
@@ -211,6 +212,9 @@ void ui_input_poll(Input *in)
         in->confirm = (b & g_confirm_key) && !(prev_buttons & g_confirm_key);
         in->back    = (b & g_back_key) && !(prev_buttons & g_back_key);
         in->start   = (b & SCE_CTRL_START) && !(prev_buttons & SCE_CTRL_START);
+        in->l       = (b & SCE_CTRL_LTRIGGER) && !(prev_buttons & SCE_CTRL_LTRIGGER);
+        in->r       = (b & SCE_CTRL_RTRIGGER) && !(prev_buttons & SCE_CTRL_RTRIGGER);
+        r_down      = (b & SCE_CTRL_RTRIGGER) != 0;
         in->menu    = (b & SCE_CTRL_SELECT) && !(prev_buttons & SCE_CTRL_SELECT);
         in->alt     = (b & SCE_CTRL_TRIANGLE) && !(prev_buttons & SCE_CTRL_TRIANGLE);
         in->square  = (b & SCE_CTRL_SQUARE) && !(prev_buttons & SCE_CTRL_SQUARE);
@@ -322,6 +326,11 @@ float ui_input_back_charge(void)
 float ui_input_touch_charge(void)
 {
     return touch_charge;
+}
+
+bool ui_input_r_down(void)
+{
+    return r_down;
 }
 
 /* 作废当前蓄力：清零并上锁，直到三角松开前都不再重新蓄力。

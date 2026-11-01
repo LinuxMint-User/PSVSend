@@ -9,9 +9,11 @@
 #include <stddef.h>
 #include <math.h>
 #include <vita2d.h>
+#include <psp2/kernel/processmgr.h>
 #include "ui/ui.h"
 #include "ui/hintbar.h"
 #include "ui/theme.h"
+#include "core/i18n.h"
 
 #define HINT_SEG_MAX 8   /* 排序缓冲区上限：一页最多几段提示 */
 
@@ -22,6 +24,8 @@ typedef enum {
     HICON_CIRCLE,    /* O 键 */
     HICON_TRIANGLE,  /* 三角键 */
     HICON_SQUARE,    /* 方块键 */
+    HICON_L,         /* L 肩键（带字母的肩键形） */
+    HICON_R,         /* R 肩键 */
     HICON_DPAD       /* 方向键（十字）：按 dir_off 分亮臂/灰臂 */
 } HintIcon;
 
@@ -134,6 +138,18 @@ static void w_icon(HintIcon ic, float cx, float cy, uint32_t c, uint8_t dir_off)
         w_rect((Rect){ (int)cx - 9, (int)cy - 9, 18, 18 }, c);
         w_rect((Rect){ (int)cx - 6, (int)cy - 6, 12, 12 }, theme->bg);
         break;
+    case HICON_L:
+    case HICON_R: {
+        /* 肩键：24x16 的空心梯形/圆角块 + 字母。内部用主题背景色挖空，
+         * 与 □ 图标同一手法，只能画在纯色底（页脚）上。 */
+        const char *ch = ic == HICON_L ? "L" : "R";
+        int tw = 0, th = 0;
+        w_rect((Rect){ (int)cx - 12, (int)cy - 8, 24, 16 }, c);
+        w_rect((Rect){ (int)cx - 10, (int)cy - 6, 20, 12 }, theme->bg);
+        w_text_w(0.7f, ch, &tw, &th);
+        w_text(cx - tw / 2.0f, cy - th / 2.0f, 0.7f, c, "%s", ch);
+        break;
+    }
     case HICON_DPAD: {
         /* 旋转 45° 的空心菱形（描边），在四条边中点附近切开成四份、各占一个角，
          * 中心留空。切缝从中点向两侧各让出 s，四份之间才有明显空隙。
@@ -200,6 +216,8 @@ static HintIcon icon_of(HintKey k)
     switch (k) {
     case HKEY_START:                       /* 无符号图标，靠文案说明（同 SELECT） */
     case HKEY_SELECT:   return HICON_NONE;
+    case HKEY_L:        return HICON_L;
+    case HKEY_R:        return HICON_R;
     case HKEY_DPAD:     return HICON_DPAD;
     case HKEY_CONFIRM:  return g_app.confirm_layout == 0 ? HICON_CROSS : HICON_CIRCLE;
     case HKEY_BACK:     return g_app.confirm_layout == 0 ? HICON_CIRCLE : HICON_CROSS;
@@ -209,7 +227,7 @@ static HintIcon icon_of(HintKey k)
     }
 }
 
-/* 默认键序：SELECT、START、方向键、○、✗、□、△。
+/* 默认键序：SELECT、START、L、R、方向键、○、✗、□、△。
  * ○/✗ 两项按**图标符号**定位（○ 在 ✗ 前），因此键位布局切换时图标位置不跳；
  * 反过来说，美式布局下"返回(○)"会排在"确认(✗)"之前——这是该口径的直接结果。 */
 static int rank_of(HintKey k)
@@ -217,12 +235,14 @@ static int rank_of(HintKey k)
     switch (k) {
     case HKEY_SELECT:   return 0;
     case HKEY_START:    return 1;
-    case HKEY_DPAD:     return 2;
+    case HKEY_L:        return 2;
+    case HKEY_R:        return 3;
+    case HKEY_DPAD:     return 4;
     case HKEY_CONFIRM:
-    case HKEY_BACK:     return icon_of(k) == HICON_CIRCLE ? 3 : 4;
-    case HKEY_SQUARE:   return 5;
-    case HKEY_TRIANGLE: return 6;
-    default:            return 7;            /* HKEY_NONE：无键段，排最后 */
+    case HKEY_BACK:     return icon_of(k) == HICON_CIRCLE ? 5 : 6;
+    case HKEY_SQUARE:   return 7;
+    case HKEY_TRIANGLE: return 8;
+    default:            return 9;            /* HKEY_NONE：无键段，排最后 */
     }
 }
 
@@ -255,10 +275,36 @@ void w_page_footer(const char *hint)
     w_text(28, f.y + 12, 1.0f, theme->text_dim, "%s", hint);
 }
 
-/* 提示条左右留白（左端起点 / 右端边界）、段间距（充裕时 / 压缩后） */
+/* 提示条左右留白（左端起点 / 右端边界）、段间距 */
 #define HINT_MARGIN   28
 #define HINT_GAP      24
-#define HINT_GAP_MIN  12
+
+/* 按住 R 展开：页脚 46 → 92px，第二行从屏幕下沿滑入。动画与设置页选项面板
+ * 同一口径（按真实时间线性推进，150ms 走完，每帧至少 1px 保证收敛）。
+ * 展开只影响页脚自身的绘制区域（覆盖列表底部），不改列表布局常量。 */
+#define FOOTER_EXPAND_MS 150
+static float    expand_p;      /* 0..1 展开进度 */
+static uint64_t expand_t;      /* 上次步进时刻（微秒；0 = 尚未起步） */
+
+static void expand_step(float target)
+{
+    uint64_t now = (uint64_t)sceKernelGetSystemTimeWide();
+    float step;
+    if (!expand_t) expand_t = now;
+    step = (float)(now - expand_t) / ((float)FOOTER_EXPAND_MS * 1000.0f);
+    if (step < 1.0f / 60.0f) step = 1.0f / 60.0f;
+    expand_t = now;
+    if (expand_p < target) {
+        expand_p += step;
+        if (expand_p > target) expand_p = target;
+    } else if (expand_p > target) {
+        expand_p -= step;
+        if (expand_p < target) expand_p = target;
+    }
+}
+
+/* 一行能**完整**放下的段数：从前往后累加，放不下的整段丢弃（绝不裁字）。 */
+static int fit_count(const HintSeg *s, int n, int gap);
 
 /* 段的图标部分宽度：无图标 0、单键 26、合并段（双键）57。
  * 量宽与绘制两处都要用，抽成一处保证口径一致。 */
@@ -275,6 +321,18 @@ static int seg_w(const HintSeg *s, float sc)
     int tw = 0;
     if (s->text && s->text[0]) w_text_w(sc, s->text, &tw, NULL);
     return seg_icon_w(s) + tw;
+}
+
+/* 一行能**完整**放下的段数：从前往后累加，放不下的整段丢弃（绝不裁字）。 */
+static int fit_count(const HintSeg *s, int n, int gap)
+{
+    int i, x = HINT_MARGIN;
+    for (i = 0; i < n; i++) {
+        int need = seg_w(&s[i], 1.0f);
+        if (x + need > SCR_W - HINT_MARGIN) break;
+        x += need + gap;
+    }
+    return i;
 }
 
 /* 画一行提示：y_text = 文字顶（图标中心自动取 y_text + 8，与旧版 f.y+12 / f.y+20
@@ -335,44 +393,65 @@ static void draw_row(const HintSeg *s, int n, int y_text, float sc, int gap)
  * 段的 key2 非 HKEY_NONE 时表示"两个键同一个动作"，画成「key / key2 文案」：
  * 两个键都显示出来（告知两条路子都能走），动作文案只写一次，避免同一句话写两遍；
  * 段内两个键之间也按同一默认键序排（○ 恒在 ✗ 前）。
- * 排版：一行装得下（正常段距）就画一行；装不下**自动折成两行**（文字降一档到
- * 0.9、段距收到最小），页脚高度与列表可视区都不变——此前只压缩段距兜底，段多 /
- * 长语言时末尾会被裁字，故改为折行。两行按"两行宽度最接近"选断点。 */
+ *
+ * 排版（默认单行）：
+ *   按默认键序从前往后填，**整段**放不下就丢弃该段及之后的所有段（绝不裁字）。
+ *   如果存在被丢弃的段，自动插入一条 R 段（按默认键序排，不固定在右端），
+ *   文案「按住显示更多提示」——按 R 可临时展开。
+ *
+ * 展开（按住 R）：
+ *   页脚 46 → 92px，所有段按原顺序分成两行；R 段文案变为「松开显示更少提示」。
+ *   动画口径与设置页选项面板相同（150ms、按真实时间步进）。页脚向上生长覆盖
+ *   列表底部，列表布局常量不变；松开立即收回。 */
 void w_page_footer_segs(const HintSeg *segs, int n)
 {
     HintSeg s[HINT_SEG_MAX];
-    int w[HINT_SEG_MAX];
     int i, j, m = 0, total = 0;
     const int avail = SCR_W - HINT_MARGIN * 2;
-    Rect f = { 0, SCR_H - FOOTER_H, SCR_W, FOOTER_H };
+    bool held, overflow;
+    int h;
+    Rect f;
+
     if (n > HINT_SEG_MAX) n = HINT_SEG_MAX;
+    for (i = 0; i < n; i++)
+        total += seg_w(&segs[i], 1.0f);      /* 总宽与顺序无关，先判是否溢出 */
+    overflow = n > 0 && total + HINT_GAP * (n - 1) > avail;
+    held = ui_input_r_down();
+    if (overflow && n >= HINT_SEG_MAX) n--;  /* 给自动插入的 R 段留一格 */
+
     for (i = 0; i < n; i++) {                /* 插入排序：段数很少，够用且稳定 */
         j = m++;
         while (j > 0 && seg_before(&segs[i], &s[j - 1])) { s[j] = s[j - 1]; j--; }
         s[j] = segs[i];
     }
+    if (overflow) {
+        s[m].key    = HKEY_R;
+        s[m].key2   = HKEY_NONE;
+        s[m].text   = tr(held ? "Less hints" : "More hints");
+        s[m].dim    = false;
+        s[m].varies = false;
+        s[m].dir_off = 0;
+        j = m++;
+        while (j > 0 && seg_before(&s[j], &s[j - 1])) {
+            HintSeg t = s[j]; s[j] = s[j - 1]; s[j - 1] = t;
+            j--;
+        }
+    }
 
+    expand_step(overflow && held ? 1.0f : 0.0f);
+    h = FOOTER_H + (int)((float)FOOTER_H * expand_p + 0.5f);
+    f = (Rect){ 0, SCR_H - h, SCR_W, h };
     w_rect(f, theme->bg);
     w_rect((Rect){ 0, f.y, SCR_W, 2 }, theme->border);
 
-    for (i = 0; i < m; i++) { w[i] = seg_w(&s[i], 1.0f); total += w[i]; }
-    if (m > 0 && total + HINT_GAP * (m - 1) > avail) {
-        int best = 1, best_d = 0x7fffffff, pre = 0, tot2 = 0;
-        for (i = 0; i < m; i++) { w[i] = seg_w(&s[i], 0.9f); tot2 += w[i]; }
-        for (i = 1; i < m; i++) {
-            int a, b, d;
-            pre += w[i - 1];
-            a = pre + HINT_GAP_MIN * (i - 1);
-            b = tot2 - pre + HINT_GAP_MIN * (m - i - 1);
-            d = a > b ? a - b : b - a;
-            if (d < best_d) { best_d = d; best = i; }
-        }
-        /* 两行文字分别贴顶 3px / 24px：0.9 号（18px）文字 3..22 / 24..43，
-         * 图标中心 11 / 32（22px 图标 0..22 / 21..43），都落在 46px 页脚内。 */
-        draw_row(s, best, f.y + 3, 0.9f, HINT_GAP_MIN);
-        draw_row(s + best, m - best, f.y + 24, 0.9f, HINT_GAP_MIN);
+    if (expand_p <= 0.0f) {
+        draw_row(s, fit_count(s, m, HINT_GAP), f.y + 12, 1.0f, HINT_GAP);
     } else {
-        draw_row(s, m, f.y + 12, 1.0f, HINT_GAP);
+        /* 两行：第一行填满，余下进第二行（第二行 y 固定，展开时从屏幕下沿滑入） */
+        int n1 = fit_count(s, m, HINT_GAP);
+        draw_row(s, n1, f.y + 12, 1.0f, HINT_GAP);
+        draw_row(s + n1, fit_count(s + n1, m - n1, HINT_GAP),
+                 f.y + 50, 1.0f, HINT_GAP);
     }
     /* 一次性设置：本帧消费完即清（页面要画就每帧设一次） */
     g_charge_key = HKEY_NONE;
