@@ -15,7 +15,7 @@
 #include "ui/theme.h"
 #include "core/i18n.h"
 
-#define HINT_SEG_MAX 8   /* 排序缓冲区上限：一页最多几段提示 */
+#define HINT_SEG_MAX 10  /* 排序缓冲区上限：一页最多几段提示（主页 9 段） */
 
 /* 提示条里用到的按键图形。页面不直接引用，只经 HintKey 推出（见 icon_of）。 */
 typedef enum {
@@ -93,6 +93,36 @@ void w_icon_gear(float cx, float cy, float r, uint32_t c)
     }
     vita2d_draw_fill_circle(cx, cy, r, c);
     vita2d_draw_fill_circle(cx, cy, r - 2.5f, theme->bg);
+}
+
+/* "QR"图标：三个定位角（左上 / 右上 / 左下）+ 右下三个散点。
+ * 定位角 = 方框描边 + 中心实心块；挖空用主题背景色，与其它图标同一手法。
+ * 散点故意只放三个，避免被读成第四个定位角。 */
+void w_icon_qr(float cx, float cy, float r, uint32_t c)
+{
+    int x = (int)(cx - r + 0.5f), y = (int)(cy - r + 0.5f);
+    int s = (int)(r * 2.0f + 0.5f);
+    int f = s * 9 / 20;               /* 定位角边长 */
+    int b = f / 4;                    /* 描边宽 */
+    int gap = s - 2 * f;
+    int px[3], py[3], i;
+
+    if (b < 2) b = 2;
+    if (gap < 2) gap = 2;
+    px[0] = x;              py[0] = y;
+    px[1] = x + f + gap;    py[1] = y;
+    px[2] = x;              py[2] = y + f + gap;
+    for (i = 0; i < 3; i++) {
+        w_rect((Rect){ px[i], py[i], f, f }, c);
+        w_rect((Rect){ px[i] + b, py[i] + b, f - 2 * b, f - 2 * b }, theme->bg);
+        w_rect((Rect){ px[i] + f / 2 - 1, py[i] + f / 2 - 1, 2, 2 }, c);
+    }
+    {
+        int dx = x + f + gap, dy = y + f + gap;
+        w_rect((Rect){ dx, dy, 2, 2 }, c);
+        w_rect((Rect){ dx + 4, dy, 2, 2 }, c);
+        w_rect((Rect){ dx, dy + 4, 2, 2 }, c);
+    }
 }
 
 /* 地球：外圈 + 赤道 + 两条经线（窄椭圆的两半）。线宽与齿轮/放大镜同一口径。 */

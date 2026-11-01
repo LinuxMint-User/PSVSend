@@ -59,6 +59,7 @@ static void cfg_defaults(void)
     g_cfg.max_parallel = PARALLEL_DEFAULT;  /* 发送侧并发上传数：默认 3 */
     g_cfg.send_sha = 1;                /* 发送前算 sha256：默认开（与官方一致） */
     g_cfg.recv_sha = 1;                /* 接收校验 sha256：默认开（与官方一致） */
+    g_cfg.qr_scan = 1;                 /* 主页扫码入口：默认开 */
     g_cfg.lang = 0;                    /* 语言偏好默认跟随系统 */
     g_cfg.known_n = 0;
     g_cfg.upd_auto = 2;                /* 自动检查更新：默认每周 */
@@ -110,6 +111,7 @@ void config_init(void)
             if (json_get_int(buf, "maxParallel", &v)) g_cfg.max_parallel = (int)v;
             if (json_get_int(buf, "sendSha", &v)) g_cfg.send_sha = (int)v ? 1 : 0;
             if (json_get_int(buf, "recvSha", &v)) g_cfg.recv_sha = (int)v ? 1 : 0;
+            if (json_get_int(buf, "qrScan", &v)) g_cfg.qr_scan = (int)v ? 1 : 0;
             if (json_get_int(buf, "lang", &v)) g_cfg.lang = (int)v;
             if (json_get_int(buf, "updateAuto", &v)) g_cfg.upd_auto = (int)v;
             if (json_get_int(buf, "updateLast", &v)) g_cfg.upd_last = v;
@@ -145,6 +147,7 @@ void config_init(void)
         g_cfg.max_parallel = PARALLEL_DEFAULT;
     if (g_cfg.send_sha != 0 && g_cfg.send_sha != 1) g_cfg.send_sha = 1;
     if (g_cfg.recv_sha != 0 && g_cfg.recv_sha != 1) g_cfg.recv_sha = 1;
+    if (g_cfg.qr_scan != 0 && g_cfg.qr_scan != 1) g_cfg.qr_scan = 1;
     if (g_cfg.custom_h < 0 || g_cfg.custom_h > 359) g_cfg.custom_h = 210;
     if (g_cfg.custom_s < 0 || g_cfg.custom_s > 100) g_cfg.custom_s = 65;
     if (g_cfg.custom_v < 0 || g_cfg.custom_v > 100) g_cfg.custom_v = 90;
@@ -206,6 +209,7 @@ static void config_write_locked(void)
                    "  \"maxParallel\": %d,\n"
                    "  \"sendSha\": %d,\n"
                    "  \"recvSha\": %d,\n"
+                   "  \"qrScan\": %d,\n"
                    "  \"lang\": %d,\n"
                    "  \"updateAuto\": %d,\n"
                    "  \"updateLast\": %lld,\n"
@@ -215,8 +219,8 @@ static void config_write_locked(void)
                    a, f, g_cfg.port, g_cfg.theme_id, g_cfg.light_mode,
                    g_cfg.custom_h, g_cfg.custom_s, g_cfg.custom_v,
                    g_cfg.confirm_layout, g_cfg.pane_swap, g_cfg.max_parallel,
-                   g_cfg.send_sha, g_cfg.recv_sha, g_cfg.lang, g_cfg.upd_auto,
-                   g_cfg.upd_last, d, k);
+                   g_cfg.send_sha, g_cfg.recv_sha, g_cfg.qr_scan, g_cfg.lang,
+                   g_cfg.upd_auto, g_cfg.upd_last, d, k);
     if (len < 0 || len >= (int)sizeof out) {
         dlog("cfg: json overflow (%d)", len);
         return;

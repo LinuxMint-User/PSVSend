@@ -377,6 +377,7 @@ void w_hdr_button(int cx, int id, HdrBtn kind, bool dim)
     switch (kind) {
     case HDRBTN_BACK:     w_icon_back((float)cx, (float)icy, 8.5f, c);   break;
     case HDRBTN_SCAN:     w_icon_search((float)cx, (float)icy, 8.0f, c); break;
+    case HDRBTN_QR:       w_icon_qr((float)cx, (float)icy, 9.0f, c);     break;
     case HDRBTN_SETTINGS: w_icon_gear((float)cx, (float)icy, 9.0f, c);   break;
     case HDRBTN_WEB:      w_icon_globe((float)cx, (float)icy, 9.0f, c);  break;
     }
@@ -399,6 +400,7 @@ void w_hdr_button_var(int x, int w, int id, HdrBtn kind, const char *label,
         switch (kind) {
         case HDRBTN_BACK:     w_icon_back((float)cx, (float)icy, 8.5f, c);   break;
         case HDRBTN_SCAN:     w_icon_search((float)cx, (float)icy, 8.0f, c); break;
+        case HDRBTN_QR:       w_icon_qr((float)cx, (float)icy, 9.0f, c);     break;
         case HDRBTN_SETTINGS: w_icon_gear((float)cx, (float)icy, 9.0f, c);   break;
         case HDRBTN_WEB:      w_icon_globe((float)cx, (float)icy, 9.0f, c);  break;
         }

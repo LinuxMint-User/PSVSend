@@ -26,15 +26,12 @@ struct vita2d_texture *ui_verify_icons(void);
  * 行内字号档。页面不再各写一份数值；要调间距只改这里。 */
 #define HDR_H         52            /* 页头高（底沿 2px 分隔线） */
 /* 页头右上角触摸按钮（触摸补齐）：方框 + 图标，热区比方框宽一圈且顶满页头高。
- * 最右槽贴屏幕右缘 HDR_BTN_EDGE，左槽与它隔同样的距离；单按钮页用 HDR_SLOT_R，
- * 主页两按钮 = HDR_SLOT_L（扫描）+ HDR_SLOT_R（设置）。 */
+ * 最右槽贴屏幕右缘 HDR_BTN_EDGE；单按钮页用 HDR_SLOT_R，多按钮页（主页）由
+ * 页面从右往左依次排（按钮展开时右端锚定，见 pages_send.c 的 hdr_buttons）。 */
 #define HDR_BTN_SZ    40            /* 方框边长 */
 #define HDR_BTN_HITW  52            /* 触摸热区宽 */
 #define HDR_BTN_EDGE  16
 #define HDR_SLOT_R    (SCR_W - HDR_BTN_EDGE - HDR_BTN_SZ / 2)
-#define HDR_SLOT_L    (HDR_SLOT_R - HDR_BTN_SZ - HDR_BTN_EDGE)
-/* 主页第三个槽位（网页共享）：再往左一格。三按钮页 = L2 / L / R。 */
-#define HDR_SLOT_L2   (HDR_SLOT_L - HDR_BTN_SZ - HDR_BTN_EDGE)
 #define FOOTER_H      46            /* 页脚提示条高 */
 #define LIST_GAP_TOP  24            /* 页头下沿 → 列表顶 */
 #define LIST_GAP_BOT  6             /* 列表底 → 页脚留白 */
@@ -133,7 +130,7 @@ typedef enum {
     PAGE_VERIFY,       /* 设备身份验证：两侧指纹拼接后的 128 hex（发送等待/接收确认页进入） */
     PAGE_LAB,          /* 实验室：设置页「实验」分组进入，实验性小工具列表 */
     PAGE_CAM_BENCH,    /* 摄像头基准：后摄采集 + QR 解码性能实测（实验室子页） */
-    PAGE_LAB_SCAN,     /* 扫码取景：按住 R 识别屏幕上的分享二维码（实验室子页） */
+    PAGE_SCAN,         /* 扫码取景：按住 R 识别屏幕上的分享二维码（主页 L / 页头按钮进入） */
     PAGE_WEB,          /* 网页共享：浏览器经 http://IP:端口 下载/上传（官方 web share） */
     PAGE_COUNT
 } PageId;
@@ -266,8 +263,8 @@ void page_lab_render(void);
 void page_lab_input(const Input *in);
 void page_cam_bench_render(void);
 void page_cam_bench_input(const Input *in);
-void page_lab_scan_render(void);
-void page_lab_scan_input(const Input *in);
+void page_scan_render(void);
+void page_scan_input(const Input *in);
 void page_web_render(void);
 void page_web_input(const Input *in);
 
@@ -326,7 +323,7 @@ void w_page_header(const char *title);
 
 /* 页头右上角触摸按钮：画方框 + 图标并注册热区（样式/位置口径只在 widgets.c 一处，
  * 各页只挑槽位与图标）。dim=true 画灰且不注册热区（该动作当前按不动）。 */
-typedef enum { HDRBTN_BACK, HDRBTN_SCAN, HDRBTN_SETTINGS, HDRBTN_WEB } HdrBtn;
+typedef enum { HDRBTN_BACK, HDRBTN_SCAN, HDRBTN_QR, HDRBTN_SETTINGS, HDRBTN_WEB } HdrBtn;
 void w_hdr_button(int cx, int id, HdrBtn kind, bool dim);
 /* 可变宽版本（主页按住 R 展开文字用）：方框左缘 x、宽 w；p = 展开进度 0..1，
  * <0.5 画图标、>=0.5 画文字（0.8 号字，居中，超宽裁尾）。dim 语义同 w_hdr_button。 */

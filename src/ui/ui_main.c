@@ -537,7 +537,7 @@ static void render_page(void)
     case PAGE_VERIFY:        page_verify_render(); break;
     case PAGE_LAB:           page_lab_render(); break;
     case PAGE_CAM_BENCH:     page_cam_bench_render(); break;
-    case PAGE_LAB_SCAN:      page_lab_scan_render(); break;
+    case PAGE_SCAN:          page_scan_render(); break;
     case PAGE_WEB:           page_web_render(); break;
     default: break;
     }
@@ -558,7 +558,7 @@ static void input_page(const Input *in)
     case PAGE_VERIFY:        page_verify_input(in); break;
     case PAGE_LAB:           page_lab_input(in); break;
     case PAGE_CAM_BENCH:     page_cam_bench_input(in); break;
-    case PAGE_LAB_SCAN:      page_lab_scan_input(in); break;
+    case PAGE_SCAN:          page_scan_input(in); break;
     case PAGE_WEB:           page_web_input(in); break;
     default: break;
     }
@@ -597,7 +597,7 @@ void ui_run(void)
          * 一直占着摄像头/CPU；正常返回路径在页面里已经停过，这里是兜底。 */
         if (g_app.page != PAGE_CAM_BENCH && cam_bench_running())
             cam_bench_stop();
-        if (g_app.page != PAGE_LAB_SCAN && cam_scan_running())
+        if (g_app.page != PAGE_SCAN && cam_scan_running())
             cam_scan_stop();
         update_tick();       /* 自动检查更新：到周期且网络就绪时后台触发 */
         page_ime_pump();     /* 系统键盘改名事务：帧间打开挂起键盘 / 轮询收尾
@@ -620,7 +620,7 @@ void ui_run(void)
                 ui_input_resync();       /* 冻结期结束：先对齐边沿，别把"还在按着的键"当新按下 */
             ui_input_poll(&in);
             if (in.tap || in.up || in.down || in.left || in.right ||
-                in.confirm || in.back || in.menu || in.start ||
+                in.confirm || in.back || in.menu || in.start || in.l || in.r ||
                 in.alt || in.alt_long || in.square ||
                 in.back_long || in.touch_long || in.touch_hold ||
                 in.drag_start || in.dragging || in.drag_end)

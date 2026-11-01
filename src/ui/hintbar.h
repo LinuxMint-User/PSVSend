@@ -81,6 +81,8 @@ void w_icon_gear(float cx, float cy, float r, uint32_t c);
 void w_icon_search(float cx, float cy, float r, uint32_t c);
 /* 独立"🌐"图标（主页页头"网页共享"触摸按钮；r = 外圈半径） */
 void w_icon_globe(float cx, float cy, float r, uint32_t c);
+/* 独立"▣"二维码图标（主页页头"扫码"触摸按钮；r = 外框半边长） */
+void w_icon_qr(float cx, float cy, float r, uint32_t c);
 
 /* 独立"←"图标（页头"返回"触摸按钮；r = 箭尖到箭尾的一半长）
  * 与上面几个同一套线宽口径。 */

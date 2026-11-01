@@ -39,10 +39,12 @@
 #define WID_PICKS_BASE  0x2000                /* + 已选文件行下标 */
 #define WID_PICKX_BASE  0x3000                /* + 已选文件行尾"✕"下标 */
 #define WID_FILES_PICK  0x8002                /* 空文件栏的"选择文件"按钮 */
-/* 主页页头的两个触摸按钮（触摸补齐）：此前进设置只有 SELECT、扫描只有 △，
- * 触摸用户无路可走（无设备时设备栏更是没有任何可点之物）。 */
+/* 主页页头的触摸按钮（触摸补齐）：此前进设置只有 SELECT、扫描只有 △，
+ * 触摸用户无路可走（无设备时设备栏更是没有任何可点之物）。扫码入口可关，
+ * 关掉时页头只画其余按钮。 */
 #define WID_HDR_SCAN     0x8201               /* 页头右侧偏左：触发扫描（扫描中不注册） */
 #define WID_HDR_SETTINGS 0x8202               /* 页头最右角：进设置页 */
+#define WID_HDR_QR       0x820D               /* 主页页头最左：进扫码取景页 */
 /* 各页页头最右角的"返回"按钮（触摸补齐）：这些页原本只有 ✗/方块键能退，
  * 触摸进来就出不去。动作一律沿用该页 ✗/方块键的既有语义，不自创。 */
 #define WID_HDR_BACK_SET 0x8203               /* 设置页：回主页 */
@@ -54,7 +56,7 @@
 #define WID_HDR_BACK_CB  0x8209               /* 摄像头基准页：停止并回实验室 */
 #define WID_HDR_WEB      0x820A               /* 主页页头最左：进网页共享页（不自动启动） */
 #define WID_HDR_BACK_WEB 0x820B               /* 网页共享页：停止并回主页/设置页 */
-#define WID_HDR_BACK_SCAN 0x820C              /* 扫码取景页：停相机并回实验室 */
+#define WID_HDR_BACK_SCAN 0x820C              /* 扫码取景页：停相机并回主页 */
 
 /* ---------- 各页共用的小工具 ---------- */
 
@@ -257,7 +259,8 @@ void open_dir_pick(PageId origin, bool persist, const char *start_dir); /* pages
 void open_color_pick(void);         /* pages_settings.c：进自定义色盘页（实时预览、确认落盘） */
 void open_verify(const char *peer_fp, const char *alias); /* pages_verify.c：进身份验证页 */
 void open_lab(void);                /* pages_lab.c：进实验室页（会先停字体预读） */
-void lab_scan_leave_for_recv(void); /* pages_lab.c：扫码页被接收确认页顶掉时停相机/清冻结态 */
+void open_scan(void);               /* pages_lab.c：进扫码取景页（启动相机） */
+void scan_leave_for_recv(void);     /* pages_lab.c：扫码页被接收确认页顶掉时停相机/清冻结态 */
 void open_web(bool start_download); /* pages_web.c：进网页共享页；true=直接用已选文件开分享 */
 void ask_ime_host(void);            /* pages_recv.c：打开系统键盘改本机设备名（设置页主机名行用） */
 void ask_ime_pin(void);             /* pages_recv.c：发送等待页对方要求 PIN → 弹键盘输入 */

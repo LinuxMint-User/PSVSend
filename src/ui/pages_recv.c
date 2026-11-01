@@ -74,11 +74,6 @@ void return_from_recv(void)
     case PAGE_FILES:
         g_app.page = PAGE_FILES;
         break;
-    case PAGE_LAB_SCAN:
-        /* 扫码拉起的接收流程收尾：相机已停，回实验室列表（不回取景页——
-         * 用户此时要的是一次干净的结束，重新取景需再按一次） */
-        g_app.page = PAGE_LAB;
-        break;
     default:
         break;                       /* 设备页：goto_devices 已经落在这里 */
     }
@@ -834,7 +829,7 @@ static void open_recv_request(const RecvPending *rp)
     ui_font_preload_end();
     /* 从扫码取景页被顶上来：先停相机、清冻结态（页面本身不再渲染，兜底停相机
      * 在 ui_main，但这里要让下次回到取景页是干净状态） */
-    if (g_app.page == PAGE_LAB_SCAN) lab_scan_leave_for_recv();
+    if (g_app.page == PAGE_SCAN) scan_leave_for_recv();
     recv_back = g_app.page;             /* 问"从哪儿来"：收尾时回到这一页 */
     g_app.page = PAGE_RECV_CONFIRM;
 }
@@ -878,7 +873,7 @@ void pages_tick(void)
     case PAGE_SETTINGS:
     case PAGE_WEB:          /* 网页共享页：浏览器上传也要能弹确认页（此前被这里
                              * 挡住，用户必须先退出共享页才看得到请求） */
-    case PAGE_LAB_SCAN:     /* 扫码取景页：扫到的分享清单与普通接收请求一样弹确认页
+    case PAGE_SCAN:         /* 扫码取景页：扫到的分享清单与普通接收请求一样弹确认页
                              * （open_recv_request 会先停相机） */
         break;
     default:

@@ -19,6 +19,7 @@
 #include "ui/pages_internal.h"
 #include "ui/theme.h"
 #include "core/i18n.h"
+#include "core/config.h"
 #include "core/json_util.h"
 #include "app/api.h"
 
@@ -146,8 +147,14 @@ static const char *tip_key[] = {
     "Web share: open the address in a phone browser",
     "Rename files and pick a folder before receiving",
     "Settings: theme, language, save folder",
+    "Press L to scan a QR code",
 };
-#define TIP_N   ((int)(sizeof tip_key / sizeof tip_key[0]))
+/* 扫码入口关闭时不播那条提示（其余提示条数不变） */
+static int tip_count(void)
+{
+    return g_cfg.qr_scan ? (int)(sizeof tip_key / sizeof tip_key[0])
+                         : (int)(sizeof tip_key / sizeof tip_key[0]) - 1;
+}
 #define TIP_US  (8 * 1000000ull)
 static int      tip_idx;
 static uint64_t tip_next_us;
@@ -164,9 +171,10 @@ static void tips_render(uint64_t now)
     if (!tip_next_us) {
         tip_next_us = now + TIP_US;
     } else if (now >= tip_next_us) {
-        tip_idx = (tip_idx + 1) % TIP_N;
+        tip_idx = (tip_idx + 1) % tip_count();
         tip_next_us = now + TIP_US;
     }
+    if (tip_idx >= tip_count()) tip_idx = 0;   /* 开关在设置页被关掉后回落 */
     w_text_clip(28, STRIP_Y, 0.9f, theme->text_dim, tr(tip_key[tip_idx]),
                 SCR_W - 56);
 }
@@ -445,19 +453,28 @@ static void try_send(int dev_idx)
  * 按键，两个入口各说各的。扫描按钮只在空闲时可点（扫描中画灰）——按不动比
  * "再按一下顺延下一轮"那套次级语义更好懂，那是给按键的。 */
 /* 按住 R 展开成文字：平时 40px 等宽图标，展开宽度按当前语言实测，右端锚定、
- * 从右往左 20ms 错峰（设置 → 扫描 → 网页共享），收起反向。只在主页渲染；
+ * 从右往左 20ms 错峰（设置 → 扫描 → 网页共享 → 扫码），收起反向。只在主页渲染；
  * 从别的页面回来时帧间隔过大 → 直接落到目标态，不补一段动画。 */
-static const char *hdr_lbl_key[3] = { "Web share", "Scan", "Settings" };
+#define HDR_N 4
+/* 从左到右：扫码 / 网页共享 / 网络扫描 / 设置。扫码入口可在设置里关掉，
+ * 关掉时只画后三个（第一个下标 1），布局与动画照旧右端锚定。 */
+static const char *hdr_lbl_key[HDR_N] = { "Scan QR", "Web share", "Scan", "Settings" };
+static const HdrBtn hdr_kind[HDR_N] = {
+    HDRBTN_QR, HDRBTN_WEB, HDRBTN_SCAN, HDRBTN_SETTINGS
+};
+static const int hdr_wid[HDR_N] = {
+    WID_HDR_QR, WID_HDR_WEB, WID_HDR_SCAN, WID_HDR_SETTINGS
+};
 static float    hdr_exp;             /* 0=图标 1=文字 */
 static uint64_t hdr_exp_us;          /* 上次动画步进时刻 */
 static int      hdr_lbl_lang = -1;   /* 已测量的语言（切换语言后重量） */
-static int      hdr_lbl_w[3];        /* 展开目标宽（web/scan/settings） */
+static int      hdr_lbl_w[HDR_N];    /* 展开目标宽 */
 
 static void hdr_measure(void)
 {
     int i, lang = i18n_lang();
     if (lang == hdr_lbl_lang) return;
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < HDR_N; i++) {
         int tw = 0, w;
         w_text_w(0.8f, tr(hdr_lbl_key[i]), &tw, NULL);
         w = tw + 20;
@@ -487,10 +504,14 @@ static void hdr_step(void)
     }
 }
 
-/* 单个按钮的展开进度（0=web 左 … 2=settings 右），先右后左错峰 + ease-out */
-static float hdr_p(int i)
+/* 单个按钮的展开进度：from_right = 距最右按钮的格数（0=最右），
+ * 先右后左错峰 + ease-out；n = 本次实际显示的按钮数。 */
+static float hdr_p(int from_right, int n)
 {
-    float p = (hdr_exp - (float)(2 - i) * 0.09f) / 0.82f;
+    float span = 1.0f - (float)(n - 1) * 0.09f;
+    float p;
+    if (span < 0.01f) span = 0.01f;
+    p = (hdr_exp - (float)from_right * 0.09f) / span;
     if (p < 0.0f) p = 0.0f;
     if (p > 1.0f) p = 1.0f;
     return 1.0f - (1.0f - p) * (1.0f - p);
@@ -498,19 +519,21 @@ static float hdr_p(int i)
 
 static void hdr_buttons(void)
 {
-    static const HdrBtn kind[3] = { HDRBTN_WEB, HDRBTN_SCAN, HDRBTN_SETTINGS };
-    static const int wid[3] = { WID_HDR_WEB, WID_HDR_SCAN, WID_HDR_SETTINGS };
-    bool dim[3] = { false, api_scan_active() || api_identity_pending(), false };
+    bool dim[HDR_N] = { false, false,
+                        api_scan_active() || api_identity_pending(), false };
+    int first = g_cfg.qr_scan ? 0 : 1;     /* 关闭扫码入口时首按钮是网页共享 */
+    int n = HDR_N - first;
     int i, x = HDR_SLOT_R + HDR_BTN_SZ / 2;
 
     hdr_measure();
     hdr_step();
-    for (i = 2; i >= 0; i--) {
-        float p = hdr_p(i);
+    for (i = HDR_N - 1; i >= first; i--) {
+        float p = hdr_p(HDR_N - 1 - i, n);
         int w = HDR_BTN_SZ +
                 (int)((float)(hdr_lbl_w[i] - HDR_BTN_SZ) * p + 0.5f);
         x -= w;
-        w_hdr_button_var(x, w, wid[i], kind[i], tr(hdr_lbl_key[i]), p, dim[i]);
+        w_hdr_button_var(x, w, hdr_wid[i], hdr_kind[i], tr(hdr_lbl_key[i]), p,
+                         dim[i]);
         x -= HDR_BTN_EDGE;
     }
 }
@@ -532,10 +555,14 @@ void page_devices_render(void)
 
     /* 页脚只声明"本页有哪些键 + 文案 + 状态"，顺序交给 hintbar 排
      * （默认键序 + 固定靠左、可变靠右）。确认/三角两段随焦点栏变 → 可变段靠右。 */
-    HintSeg segs[8] = { 0 };
+    HintSeg segs[10] = { 0 };       /* 9 段（含扫码 L 段），页脚模块上限 10 */
     int ns = 0;
     segs[ns].key = HKEY_SELECT;       segs[ns++].text = tr("SELECT Settings");
     segs[ns].key = HKEY_START;        segs[ns++].text = tr("START Web share");
+    /* 扫码入口：设置里关掉后页脚不再出现 L 段（功能随之不可用） */
+    if (g_cfg.qr_scan) {
+        segs[ns].key = HKEY_L;        segs[ns++].text = tr("Scan QR");
+    }
     /* 主页按住 R 会展开页头按钮文字：这条 R 段由页面自己声明，不依赖页脚溢出
      * （简/繁中文案短，页脚放得下，自动补的 R 永远不会出现）。 */
     segs[ns].key = HKEY_R;
@@ -622,11 +649,18 @@ void page_devices_input(const Input *in)
         } else if (id == WID_HDR_SETTINGS) {
             settings_open();
             g_app.page = PAGE_SETTINGS;
+        } else if (id == WID_HDR_QR) {
+            open_scan();          /* 不切焦点：页头是全局入口，与左右栏无关 */
         } else if (id == WID_HDR_SCAN) {
             api_scan_trigger();   /* 不切焦点：页头是全局入口，与左右栏无关 */
         } else if (id == WID_HDR_WEB) {
             open_web(g_app.picked_count > 0);   /* 页头只打开页面；有已选才自动开分享 */
         }
+        return;
+    }
+    /* L 肩键：进扫码取景（设置里关掉扫码入口后不响应） */
+    if (in->l) {
+        if (g_cfg.qr_scan) open_scan();
         return;
     }
     /* 十字键：←/→ 切栏，↑/↓ 在焦点栏内移动 */

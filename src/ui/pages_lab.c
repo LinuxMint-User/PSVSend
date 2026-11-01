@@ -1,8 +1,8 @@
-/* 页面：实验室（PAGE_LAB）+ 摄像头基准（PAGE_CAM_BENCH）+ 扫码取景（PAGE_LAB_SCAN）。
+/* 页面：实验室（PAGE_LAB）+ 摄像头基准（PAGE_CAM_BENCH）+ 扫码取景（PAGE_SCAN）。
  *
- * 入口在设置页「实验」分组 → 「实验室」。这里放的是正式功能之外的实验性
- * 小工具，长期保留、手动触发：后摄采集 + QR 解码基准（测吞吐），以及
- * 扫码取景（对准别人屏幕上的分享二维码，识别后确认）。 */
+ * 实验室入口在设置页「实验」分组，只放正式功能之外的实验性小工具：后摄采集 +
+ * QR 解码基准（测吞吐）。扫码取景已转正，入口在主页（肩键 L / 页头扫码按钮），
+ * 代码仍与相机基准放在同一文件（共用页面布局与相机生命周期工具）。 */
 #include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -19,8 +19,7 @@
 
 /* 实验室页行 id（后续实验项按 +1 排） */
 #define WID_LAB_CAM        0xA001
-#define WID_LAB_SCAN       0xA002
-#define LAB_ROWS           2
+#define LAB_ROWS           1
 /* 摄像头基准页 */
 #define WID_CB_RES         0xA101   /* 分辨率行：点一下切档（运行中不响应） */
 #define WID_CB_START       0xA102   /* 开始 / 停止按钮 */
@@ -30,10 +29,8 @@
 /* 基准页没有跨页状态，分辨率档位只在本页记住（不落盘：实验项，没必要污染配置） */
 static int cb_res;
 
-/* 实验室列表选中行（0=基准 1=扫码取景） */
+/* 实验室列表选中行（0=基准） */
 static int lab_sel;
-
-static void scan_enter(void);      /* 定义在本文件末尾的扫码取景页 */
 
 /* ================= 实验室列表 ================= */
 
@@ -56,11 +53,6 @@ static void lab_open_cam_bench(void)
     g_app.page = PAGE_CAM_BENCH;
 }
 
-static void lab_open_scan(void)
-{
-    scan_enter();
-}
-
 void page_lab_render(void)
 {
     const char *sum = cam_bench_summary();
@@ -78,21 +70,17 @@ void page_lab_render(void)
         uint32_t dc = on ? theme->accent_text : theme->text_dim;
         char sub[160];
 
-        if (i == 0) {
-            if (cam_bench_running())
-                snprintf(sub, sizeof sub, "%s", tr("Running"));
-            else if (sum)
-                snprintf(sub, sizeof sub, "%s", sum);
-            else
-                snprintf(sub, sizeof sub, "%s", tr("Not run"));
-        } else {
-            snprintf(sub, sizeof sub, "%s", tr("Viewfinder test: read a share QR"));
-        }
+        if (cam_bench_running())
+            snprintf(sub, sizeof sub, "%s", tr("Running"));
+        else if (sum)
+            snprintf(sub, sizeof sub, "%s", sum);
+        else
+            snprintf(sub, sizeof sub, "%s", tr("Not run"));
 
         w_rect(r, bg);
         row_geom(r, ROW_2LINE, 0, &g);
         w_text_clip(g.x_text, g.y_main, g.main_sc, tc,
-                    tr(i == 0 ? "Camera benchmark" : "Scan a QR code"), g.w_text);
+                    tr("Camera benchmark"), g.w_text);
         w_text_clip(g.x_text, g.y_sub, g.sub_sc, dc, sub, g.w_text);
         add_row_hit(WID_LAB_CAM + i, r.y);
     }
@@ -100,9 +88,6 @@ void page_lab_render(void)
     {
         HintSeg segs[4] = { 0 };
         int ns = 0;
-        segs[ns].key = HKEY_DPAD;
-        segs[ns].dir_off = HDIR_VERT;
-        segs[ns++].text = tr("Switch");
         segs[ns].key = HKEY_CONFIRM; segs[ns++].text = tr("Open");
         segs[ns].key = HKEY_BACK;    segs[ns++].text = tr("Back");
         w_page_footer_segs(segs, ns);
@@ -115,16 +100,11 @@ void page_lab_input(const Input *in)
         int id = w_hit(in->tap_x, in->tap_y);
         if (id == WID_HDR_BACK_LAB) { lab_leave(); return; }
         if (id == WID_LAB_CAM)  { lab_sel = 0; lab_open_cam_bench(); return; }
-        if (id == WID_LAB_SCAN) { lab_sel = 1; lab_open_scan(); return; }
         return;
     }
-    if (in->up || in->down || in->left || in->right) {
-        lab_sel = lab_sel ? 0 : 1;
-        return;
-    }
+    /* 只有一行，方向键不改变选中（保持 0） */
     if (in->confirm) {
-        if (lab_sel == 0) lab_open_cam_bench();
-        else              lab_open_scan();
+        lab_open_cam_bench();
         return;
     }
     if (in->back) lab_leave();
@@ -500,7 +480,7 @@ static void scan_frame_mark(int cx, int cy)
     w_rect((Rect){ cx + hw - t, cy + hh - arm, t, arm }, c);
 }
 
-static void scan_enter(void)
+void open_scan(void)
 {
     scan_phase = SCAN_VIEW;
     scan_sel = 0;
@@ -509,7 +489,7 @@ static void scan_enter(void)
     memset(&scan_link, 0, sizeof scan_link);
     cam_scan_clear_hit();
     cam_scan_start();
-    g_app.page = PAGE_LAB_SCAN;
+    g_app.page = PAGE_SCAN;
 }
 
 /* 离开扫码页：相机停掉；还在连分享的话把连接请求一并取消（否则它拿到清单后
@@ -523,12 +503,12 @@ static void scan_leave(void)
     cam_scan_stop();
     scan_phase = SCAN_VIEW;
     scan_err = 0;
-    g_app.page = PAGE_LAB;
+    g_app.page = PAGE_DEVICES;           /* 扫码从主页进入，退出回主页 */
 }
 
 /* 被接收确认页顶掉（pages_recv.c 调）：相机/冻结态清干净，但页面切换交给它。
- * 之后确认页收尾会按 recv_back 回实验室列表（见 return_from_recv）。 */
-void lab_scan_leave_for_recv(void)
+ * 之后确认页收尾会按 recv_back 回主页（goto_devices）。 */
+void scan_leave_for_recv(void)
 {
     cam_scan_stop();
     scan_phase = SCAN_VIEW;
@@ -583,7 +563,7 @@ static const char *scan_err_text(int e)
     }
 }
 
-void page_lab_scan_render(void)
+void page_scan_render(void)
 {
     Rect card = { SCAN_CARD_X, SCAN_CARD_Y, SCAN_CARD_W, SCAN_CARD_H };
     Rect prev = { SCAN_PREV_X, SCAN_PREV_Y, SCAN_PREV_W, SCAN_PREV_H };
@@ -643,7 +623,7 @@ void page_lab_scan_render(void)
                    "0x%08X", (unsigned)scan_snap.err);
         else
             w_text(SCAN_PREV_X + 14, SCAN_PREV_Y + 34, 0.8f, theme->text_dim, "%s",
-                   tr("Point at a QR code, 3-5 cm away"));
+                   tr("Point at a QR code"));
         if (scan_snap.state != CAM_SCAN_ERROR)
             scan_frame_mark(SCAN_PREV_X + SCAN_PREV_W / 2,
                             SCAN_PREV_Y + SCAN_PREV_H / 2);
@@ -717,7 +697,7 @@ void page_lab_scan_render(void)
         HintSeg segs[4] = { 0 };
         int ns = 0;
         if (scan_phase == SCAN_VIEW) {
-            segs[ns].key = HKEY_R; segs[ns++].text = tr("Scan");
+            segs[ns].key = HKEY_R; segs[ns++].text = tr("Hold to scan");
             segs[ns].key = HKEY_BACK; segs[ns++].text = tr("Back");
         } else if (scan_phase == SCAN_PICK) {
             if (scan_snap.n > 1) {
@@ -744,7 +724,7 @@ void page_lab_scan_render(void)
     }
 }
 
-void page_lab_scan_input(const Input *in)
+void page_scan_input(const Input *in)
 {
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
