@@ -137,6 +137,40 @@ static void dev_sync(void)
  * "请先选择文件"是短时警告，独占整行、优先于上述两条。 */
 #define STRIP_Y 56
 
+/* 细条空闲轮播：只有"没东西可显示"（无身份生成、无临时警告、无选中项）时才轮到，
+ * 8 秒一条；离开空闲态重置到第一条，回来不会接着半截。扫描中不轮播（进度已在
+ * 设备栏标题行，细条再动会分心）。 */
+static const char *tip_key[] = {
+    "Hold R for button labels",
+    "Long-press △ to clear selected files",
+    "Web share: open the address in a phone browser",
+    "Rename files and pick a folder before receiving",
+    "Settings: theme, language, save folder",
+};
+#define TIP_N   ((int)(sizeof tip_key / sizeof tip_key[0]))
+#define TIP_US  (8 * 1000000ull)
+static int      tip_idx;
+static uint64_t tip_next_us;
+
+static void tips_reset(void)
+{
+    tip_idx = 0;
+    tip_next_us = 0;
+}
+
+static void tips_render(uint64_t now)
+{
+    if (api_scan_active()) { tips_reset(); return; }
+    if (!tip_next_us) {
+        tip_next_us = now + TIP_US;
+    } else if (now >= tip_next_us) {
+        tip_idx = (tip_idx + 1) % TIP_N;
+        tip_next_us = now + TIP_US;
+    }
+    w_text_clip(28, STRIP_Y, 0.9f, theme->text_dim, tr(tip_key[tip_idx]),
+                SCR_W - 56);
+}
+
 static void dev_strip(void)
 {
     uint64_t now = (uint64_t)sceKernelGetSystemTimeWide();
@@ -145,32 +179,39 @@ static void dev_strip(void)
     /* 首启：后台正在生成 per-device 证书（2~9s），http/发现暂缓启动。
      * 这条优先于其它提示，就绪后自动消失。 */
     if (api_identity_pending()) {
+        tips_reset();
         w_text(28, STRIP_Y, 0.9f, theme->text_dim, "%s",
                tr("Generating device identity (first run)..."));
         return;
     }
 
     if (dev_hint_us && now < dev_hint_us) {
+        tips_reset();
         w_text(28, STRIP_Y, 0.9f, theme->warn, "%s", tr("Select files first"));
         return;
     }
     dev_hint_us = 0;
 
     if (g_app.pane_focus == 1) {
-        if (g_app.picked_count <= 0) return;
-        i = g_app.picked_sel;
-        if (i < 0 || i >= g_app.picked_count) i = 0;
-        w_text_lead(28, STRIP_Y, 0.9f, theme->text_dim,
-                    g_app.picked[i].path, SCR_W - 56);
-    } else {
+        if (g_app.picked_count > 0) {
+            i = g_app.picked_sel;
+            if (i < 0 || i >= g_app.picked_count) i = 0;
+            w_text_lead(28, STRIP_Y, 0.9f, theme->text_dim,
+                        g_app.picked[i].path, SCR_W - 56);
+            tips_reset();
+            return;
+        }
+    } else if (g_app.dev_count > 0) {
         char addr[48];
-        if (g_app.dev_count <= 0) return;
         i = g_app.dev_sel;
         if (i < 0 || i >= g_app.dev_count) i = 0;
         snprintf(addr, sizeof addr, "%s://%s:%d",
                  g_app.dev_proto[i], g_app.dev_ip[i], g_app.dev_port[i]);
         w_text_clip(28, STRIP_Y, 0.9f, theme->text_dim, addr, SCR_W - 56);
+        tips_reset();
+        return;
     }
+    tips_render(now);
 }
 
 /* 设备栏：有设备画列表（alias + 型号/类型），否则画网络/扫描状态 */
