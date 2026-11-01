@@ -47,9 +47,12 @@ static struct {
      * 上退出共享再重开——而页面上并没有任何提示说这件事。 */
     struct { char ip[16]; int fail; uint64_t until_us; } bad[WEB_MAX_SESS * 2];
 
-    char  client_ip[16];
-    char  client_ua[64];
-    char  client_browser[32];         /* UA 解析出的短标签（Chrome 131 …） */
+    struct {                          /* 连接来源：同一 IP 合并，多台设备各占一条 */
+        char ip[16];
+        char browser[32];
+        uint64_t at;
+    } cli[WEB_MAX_CLIENTS];
+    int   ncli;
     int   requests;
 
     int   cur;                        /* 当前下载文件下标（-1=无） */
@@ -138,7 +141,8 @@ void web_start_download(const WebEntry *files, int n)
     }
     W.nsess = 0;
     memset(W.bad, 0, sizeof W.bad);
-    W.client_ip[0] = W.client_ua[0] = W.client_browser[0] = 0;
+    memset(W.cli, 0, sizeof W.cli);
+    W.ncli = 0;
     W.requests = 0;
     W.cur = -1;
     W.cur_sess = -1;
@@ -163,7 +167,8 @@ void web_start_upload(void)
     W.total = 0;
     W.nsess = 0;
     memset(W.bad, 0, sizeof W.bad);
-    W.client_ip[0] = W.client_ua[0] = W.client_browser[0] = 0;
+    memset(W.cli, 0, sizeof W.cli);
+    W.ncli = 0;
     W.requests = 0;
     W.cur = -1;
     W.cur_sess = -1;
@@ -215,8 +220,8 @@ void web_snapshot(WebSnap *out)
     lock();
     memset(out, 0, sizeof *out);
     now = now_us();
-    /* 只把"最近还有请求"的会话算在线：浏览器关页 / 断开后 at 不再刷新，
-     * 30 秒后会话数与连接来源自然归零（会话记录本身保留，刷新回来仍免 PIN）。 */
+    /* 只把"最近还有心跳"的会话算在线：浏览器关页 / 断开后 at 不再刷新，
+     * 7 秒后会话数与连接来源自然归零（会话记录本身保留，刷新回来仍免 PIN）。 */
     for (i = 0; i < W.nsess; i++)
         if (now - W.sess[i].at < WEB_SESS_TTL_US) live++;
     out->mode = W.mode;
@@ -225,12 +230,18 @@ void web_snapshot(WebSnap *out)
     out->port = http_port();
     out->file_count = W.n;
     out->total_bytes = W.total;
-    /* 连接来源同样看"最近有没有活动"：只开过页面（还没输 PIN）也算，方便在
-     * 运行页上看到是谁连上了；离开后一起变回"等待浏览器"。 */
-    if (live > 0 || (W.last_us && now - W.last_us < WEB_SESS_TTL_US)) {
-        snprintf(out->client_ip, sizeof out->client_ip, "%s", W.client_ip);
-        snprintf(out->client_ua, sizeof out->client_ua, "%s", W.client_ua);
-        snprintf(out->client_browser, sizeof out->client_browser, "%s", W.client_browser);
+    /* 连接来源：按"到达顺序"输出，不按活动时间排序——心跳每 2 秒刷新一次 at，
+     * 按时间排会让列表反复跳位。这里只过滤掉超过 TTL 没活动的条目。 */
+    {
+        int n = 0;
+        for (i = 0; i < W.ncli && n < WEB_MAX_CLIENTS; i++) {
+            if (now - W.cli[i].at >= WEB_SESS_TTL_US) continue;
+            snprintf(out->clients[n].ip, sizeof out->clients[n].ip, "%s", W.cli[i].ip);
+            snprintf(out->clients[n].browser, sizeof out->clients[n].browser,
+                     "%s", W.cli[i].browser);
+            n++;
+        }
+        out->client_count = n;
     }
     out->sessions = live;
     out->requests = W.requests;
@@ -372,11 +383,32 @@ static void ua_label(const char *ua, char *out, int cap)
 
 void web_note_client(const char *ip, const char *ua)
 {
+    char ipbuf[16], label[32];
+    int i, slot = -1;
     web_init();
+    snprintf(ipbuf, sizeof ipbuf, "%s", ip ? ip : "");
+    ua_label(ua, label, sizeof label);
     lock();
-    snprintf(W.client_ip, sizeof W.client_ip, "%s", ip ? ip : "");
-    snprintf(W.client_ua, sizeof W.client_ua, "%s", ua ? ua : "");
-    ua_label(ua, W.client_browser, sizeof W.client_browser);
+    /* 同一 IP 只留一条（同一台设备换浏览器 / 刷新只更新标签，位置不动），多台设备各占
+     * 一条、按到达顺序排列；槽满时把最久没活动的挤掉，新设备排到末尾。 */
+    for (i = 0; i < W.ncli; i++) {
+        if (strcmp(W.cli[i].ip, ipbuf) == 0) { slot = i; break; }
+    }
+    if (slot < 0) {
+        if (W.ncli < WEB_MAX_CLIENTS) {
+            slot = W.ncli++;
+        } else {
+            int oldest = 0;
+            for (i = 1; i < W.ncli; i++)
+                if (W.cli[i].at < W.cli[oldest].at) oldest = i;
+            /* 前移腾位：其它条目相对顺序不变，新条目固定落在末尾 */
+            for (i = oldest; i + 1 < W.ncli; i++) W.cli[i] = W.cli[i + 1];
+            slot = W.ncli - 1;
+        }
+    }
+    snprintf(W.cli[slot].ip, sizeof W.cli[slot].ip, "%s", ipbuf);
+    snprintf(W.cli[slot].browser, sizeof W.cli[slot].browser, "%s", label);
+    W.cli[slot].at = now_us();
     W.requests++;
     W.last_us = now_us();
     unlock();
@@ -398,6 +430,13 @@ void web_heartbeat(const char *query, const char *ip)
     lock();
     if (W.mode == WEB_MODE_NONE) { unlock(); return; }
     W.last_us = now_us();
+    /* 心跳也续"连接来源"的在线时间：否则页面开着不看不动（只剩心跳）会被 7 秒 TTL
+     * 判成离线，而心跳本来就是为了表达"页面还开着"。没有 UA，只按 IP 匹配。 */
+    for (i = 0; i < W.ncli; i++)
+        if (strcmp(W.cli[i].ip, ip ? ip : "") == 0) {
+            W.cli[i].at = W.last_us;
+            break;
+        }
     query_get(query, "sessionId", q_sid, sizeof q_sid);
     if (q_sid[0]) {
         for (i = 0; i < W.nsess; i++) {

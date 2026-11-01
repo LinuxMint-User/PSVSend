@@ -147,6 +147,14 @@ static void web_stat(int y, const char *label, const char *value)
 #define WEB_STOP_ARC_R 68       /* 蓄力弧半径：环与实心圆之间的空隙 */
 #define WEB_STOP_DISC  54       /* 实心圆半径 */
 
+/* "连接来源"多行布局：值列与 web_stat 对齐；最后一行底边（按 20px 行高算）必须留在
+ * 按钮右侧"长按停止"文案（y = WEB_STOP_CY - 7）之上 4px，避免设备多时压字。 */
+#define WEB_CLIENT_X   220
+#define WEB_CLIENT_Y0  282
+#define WEB_CLIENT_DY  22
+#define WEB_CLIENT_MAX (((WEB_STOP_CY - 7 - 4 - 20) - WEB_CLIENT_Y0) / WEB_CLIENT_DY + 1)
+#define WEB_CARD_R     (24 + SCR_W - 48)   /* 卡片右边界 */
+
 static bool web_stop_hit(int x, int y)
 {
     int dx = x - WEB_STOP_CX, dy = y - WEB_STOP_CY;
@@ -217,24 +225,39 @@ static void render_running(const WebSnap *s)
     w_text(48, 170, 0.9f, theme->text_dim, "%s", tr("PIN"));
     w_text(48, 192, 2.2f, theme->accent, "%s", s->pin[0] ? s->pin : "----");
 
-    /* 模式 */
-    web_stat(246, tr("Mode"),
+    /* 模式 / 会话数 */
+    web_stat(234, tr("Mode"),
              s->mode == WEB_MODE_DOWNLOAD ? tr("Share files") : tr("Receive files"));
+    snprintf(buf, sizeof buf, "%d", s->sessions);
+    web_stat(258, tr("Sessions"), buf);
 
     /* 来源：IP + 浏览器短标签（如 "192.168.1.5  Chrome 131"）。UA 原文太长，
-     * 由 net/web.c 解析成"名字 + 主版本号"，与官方客户端的显示口径一致。 */
-    if (s->client_ip[0]) {
-        if (s->client_browser[0])
-            snprintf(buf, sizeof buf, "%s  %s", s->client_ip, s->client_browser);
-        else
-            snprintf(buf, sizeof buf, "%s", s->client_ip);
-        web_stat(274, tr("Connected from"), buf);
+     * 由 net/web.c 解析成"名字 + 主版本号"，与官方客户端的显示口径一致。
+     * 多台设备同时连时按到达顺序逐行列出（心跳只续时间、不改变顺序）；行数受
+     * WEB_CLIENT_MAX 限制，保证最后一行压不到按钮右侧的"长按停止"，超出的用 "+N" 提示。
+     * 文本按卡片右边界裁剪，长 IP + 长浏览器名不会画出屏幕。 */
+    if (s->client_count > 0) {
+        int i, n = s->client_count;
+        int maxw = WEB_CARD_R - WEB_CLIENT_X - 24;
+        if (n > WEB_CLIENT_MAX) n = WEB_CLIENT_MAX;
+        for (i = 0; i < n; i++) {
+            char line[64];
+            int off = snprintf(line, sizeof line, "%s%s%s", s->clients[i].ip,
+                               s->clients[i].browser[0] ? "  " : "",
+                               s->clients[i].browser);
+            if (i == n - 1 && s->client_count > n && off > 0 &&
+                off < (int)sizeof line)
+                snprintf(line + off, sizeof line - (size_t)off, "  +%d",
+                         s->client_count - n);
+            if (i == 0)
+                w_text(48, WEB_CLIENT_Y0, 1.0f, theme->text_dim,
+                       "%s", tr("Connected from"));
+            w_text_clip(WEB_CLIENT_X, WEB_CLIENT_Y0 + i * WEB_CLIENT_DY, 1.0f,
+                        theme->text, line, maxw);
+        }
     } else {
-        web_stat(274, tr("Connected from"), tr("Waiting for a browser"));
+        web_stat(WEB_CLIENT_Y0, tr("Connected from"), tr("Waiting for a browser"));
     }
-
-    snprintf(buf, sizeof buf, "%d", s->sessions);
-    web_stat(302, tr("Sessions"), buf);
 
     draw_stop_button();
 

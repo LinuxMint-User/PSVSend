@@ -19,6 +19,7 @@
 
 #define WEB_MAX_FILES 64        /* 分享清单上限（与 UI 的 MAX_PICKED 同口径） */
 #define WEB_MAX_SESS  4         /* 并发下载会话上限（多台设备各一条） */
+#define WEB_MAX_CLIENTS 4       /* 运行页"连接来源"最多列出的浏览器数（同 IP 只留一条） */
 #define WEB_PIN_LEN   4
 
 typedef enum {
@@ -34,6 +35,12 @@ typedef struct {
     SceOff size;
 } WebEntry;
 
+/* 运行页"连接来源"的一行：IP + UA 解析出的短标签 */
+typedef struct {
+    char ip[16];
+    char browser[32];            /* 如 "Chrome 131"；解析失败为空 */
+} WebClient;
+
 /* UI 渲染用快照（锁内拷贝） */
 typedef struct {
     int    mode;                  /* WebMode */
@@ -42,10 +49,10 @@ typedef struct {
     int    port;                  /* HTTP 端口（URL 用） */
     int    file_count;
     SceOff total_bytes;
-    /* 最近一次浏览器访问（PSV 页面上显示"谁连进来了"） */
-    char   client_ip[16];
-    char   client_ua[64];        /* 原始 UA（截断；保留给排查用） */
-    char   client_browser[32];   /* 解析成短标签，如 "Chrome 131" / "Firefox 132" */
+    /* 最近访问的浏览器（按最近活动倒序；同一 IP 合并成一条，多开浏览器只更新标签）。
+     * 之前只留"最后一次"，多台设备同时下载时页面上只会看到最后一台。 */
+    int    client_count;
+    WebClient clients[WEB_MAX_CLIENTS];
     int    sessions;              /* 已建立下载会话数 */
     int    requests;              /* 本次运行累计请求数 */
     /* 当前/最近一次下载 */
