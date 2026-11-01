@@ -140,11 +140,12 @@ static void web_stat(int y, const char *label, const char *value)
 
 /* 停止共享按钮：会话数下方、页脚上方（左列）。外环 + 间隙蓄力弧 + 实心圆标签；
  * 触摸与返回键都按住 0.7s 才触发（替代原来的确认弹窗，防误触）。 */
-#define WEB_STOP_CX    90
-#define WEB_STOP_CY    392
-#define WEB_STOP_R     34       /* 外环半径（也是触摸命中半径） */
-#define WEB_STOP_ARC_R 28       /* 蓄力弧半径：环与实心圆之间的空隙 */
-#define WEB_STOP_DISC  22       /* 实心圆半径 */
+#define WEB_STOP_CX    126
+#define WEB_STOP_CY    406
+#define WEB_STOP_R     78       /* 外环半径（也是触摸命中半径）：左列能放下的上限，
+                                 * 再大就会顶到会话数行或页脚 */
+#define WEB_STOP_ARC_R 68       /* 蓄力弧半径：环与实心圆之间的空隙 */
+#define WEB_STOP_DISC  54       /* 实心圆半径 */
 
 static bool web_stop_hit(int x, int y)
 {
@@ -184,17 +185,17 @@ static void draw_stop_button(void)
     int tw = 0;
 
     web_stop_arc(WEB_STOP_R, 1.0f, theme->border, 0.0f);
-    web_stop_arc(WEB_STOP_ARC_R, 1.0f, theme->border, 2.0f);
+    web_stop_arc(WEB_STOP_ARC_R, 1.0f, theme->border, 4.0f);
     if (pct > 0.0f)
-        web_stop_arc(WEB_STOP_ARC_R, pct, theme->accent, 2.0f);
+        web_stop_arc(WEB_STOP_ARC_R, pct, theme->accent, 4.0f);
     vita2d_draw_fill_circle(WEB_STOP_CX, WEB_STOP_CY, WEB_STOP_DISC, theme->bg);
 
-    w_text_w(0.8f, tr("Stop"), &tw, NULL);
-    w_text(WEB_STOP_CX - tw / 2.0f, WEB_STOP_CY - 8, 0.8f, theme->text,
+    w_text_w(1.0f, tr("Stop"), &tw, NULL);
+    w_text(WEB_STOP_CX - tw / 2.0f, WEB_STOP_CY - 10, 1.0f, theme->text,
            "%s", tr("Stop"));
-    w_text_w(0.65f, tr("Hold to stop"), &tw, NULL);
-    w_text(WEB_STOP_CX - tw / 2.0f, 436, 0.65f, theme->text_dim,
-           "%s", tr("Hold to stop"));
+    /* 文案放右侧：指腹按住圆心时不会挡字，也不用和下方断网警告抢行 */
+    w_text(WEB_STOP_CX + WEB_STOP_R + 18, WEB_STOP_CY - 7, 0.75f,
+           theme->text_dim, "%s", tr("Hold to stop"));
 }
 
 static void render_running(const WebSnap *s)
@@ -217,7 +218,7 @@ static void render_running(const WebSnap *s)
     w_text(48, 192, 2.2f, theme->accent, "%s", s->pin[0] ? s->pin : "----");
 
     /* 模式 */
-    web_stat(250, tr("Mode"),
+    web_stat(246, tr("Mode"),
              s->mode == WEB_MODE_DOWNLOAD ? tr("Share files") : tr("Receive files"));
 
     /* 来源：IP + 浏览器短标签（如 "192.168.1.5  Chrome 131"）。UA 原文太长，
@@ -227,19 +228,20 @@ static void render_running(const WebSnap *s)
             snprintf(buf, sizeof buf, "%s  %s", s->client_ip, s->client_browser);
         else
             snprintf(buf, sizeof buf, "%s", s->client_ip);
-        web_stat(280, tr("Connected from"), buf);
+        web_stat(274, tr("Connected from"), buf);
     } else {
-        web_stat(280, tr("Connected from"), tr("Waiting for a browser"));
+        web_stat(274, tr("Connected from"), tr("Waiting for a browser"));
     }
 
     snprintf(buf, sizeof buf, "%d", s->sessions);
-    web_stat(322, tr("Sessions"), buf);
+    web_stat(302, tr("Sessions"), buf);
 
     draw_stop_button();
 
     /* 断网：只警告，不停会话（恢复后浏览器刷新即可继续） */
     if (!api_link_up())
-        w_text(48, 462, 0.9f, theme->warn, "%s", tr("Wi-Fi link is down."));
+        w_text(WEB_STOP_CX + WEB_STOP_R + 18, 448, 0.8f, theme->warn,
+               "%s", tr("Wi-Fi link is down."));
 
     {
         HintSeg segs[1] = { 0 };
