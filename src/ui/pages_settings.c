@@ -27,7 +27,6 @@ enum {
     SET_ITEM_LANG,         /* 显示：界面语言 */
     SET_ITEM_KEY,          /* 操作：确认键布局 */
     SET_ITEM_PANE,         /* 操作：主页两栏布局（设备在左 / 文件在左） */
-    SET_ITEM_WEB,          /* 操作：网页共享（动作行→浏览器经 http://IP:端口 互传） */
     SET_ITEM_PARALLEL,     /* 操作：并发上传数（发送侧同时上传的文件数 1-6） */
     SET_ITEM_SEND_SHA,     /* 操作：发送前计算 sha256（关掉即与旧版一致） */
     SET_ITEM_RECV_SHA,     /* 操作：接收时校验对端 sha256（关掉=兼容逃生舱） */
@@ -41,7 +40,11 @@ enum {
 
 /* 渲染行槽（顺序即页面顺序）：HDR=分组标题 ITEM=设置项 */
 enum {
-    SET_SLOT_HDR_A = 0,    /* 分组：设备 */
+    /* 关于放最上面且只占一行：不可聚焦的只读内容，放页尾时方向键永远滚不到，
+     * 不手动滑动就完全看不到（版本号/构建号是"刷没刷对固件"的第一眼依据）。
+     * 一行 = PSVSend + 版本(构建号) + 协议 + 仓库；太挤就裁尾。 */
+    SET_SLOT_ABOUT = 0,    /* 关于：单行只读信息 */
+    SET_SLOT_HDR_A,        /* 分组：设备 */
     SET_SLOT_HOST,
     SET_SLOT_HDR_B,        /* 分组：显示 */
     SET_SLOT_THEME,
@@ -51,7 +54,6 @@ enum {
     SET_SLOT_HDR_C,        /* 分组：操作 */
     SET_SLOT_KEY,
     SET_SLOT_PANE,
-    SET_SLOT_WEB,          /* 操作：网页共享（动作行） */
     SET_SLOT_PARALLEL,
     SET_SLOT_SEND_SHA,     /* 操作：发送前计算 sha256 */
     SET_SLOT_RECV_SHA,     /* 操作：接收时校验 sha256（与发送项对称） */
@@ -62,16 +64,10 @@ enum {
     SET_SLOT_AUTO,
     SET_SLOT_HDR_LAB,      /* 分组：实验 */
     SET_SLOT_LAB,
-    SET_SLOT_HDR_D,        /* 分组：关于（页面最底部） */
-    SET_SLOT_ABOUT_A,      /* logo：PSVSend 大字 + 版本号 */
-    SET_SLOT_ABOUT_B,      /* 适配说明行 */
-    SET_SLOT_ABOUT_C,      /* 项目仓库地址行（只读提示） */
     SET_SLOT_N
 };
 #define SET_HDR_H   44        /* 分组标题行高（含上方留白） */
 /* 设置项行步进/行高走 ui.h 公共常量（ROW_STRIDE / ROW_H），本页不再另立一套 */
-#define SET_LOGO_H  60        /* 关于组 logo 行（大字，底部再留白） */
-#define SET_ADAPT_H 40        /* 关于组适配说明行 */
 
 /* ---------- 值行选项面板（抽屉式改值）----------
  * 值行不再"点左右半屏 / 确认键循环"，而是点行（或焦点行按确认）从右侧滑出选项面板：
@@ -90,6 +86,7 @@ enum {
 
 static int set_scroll = 0;        /* 设置页内容偏移 */
 static int set_press_scroll = 0;
+static ScrollGlide set_glide;     /* 设置页触摸惯性 */
 static int set_drawer_item = -1;  /* 面板正在编辑的值行 item（-1 = 没开面板） */
 static int set_drawer_vis  = -1;  /* 渲染用：滑出过程中仍要画内容，收起到底才清 */
 static int set_drawer_cur  = 0;   /* 面板内光标档位 */
@@ -104,6 +101,7 @@ void settings_open(void)
     g_app.set_sel = SET_ITEM_HOSTNAME;
     set_scroll = 0;
     set_press_scroll = 0;
+    glide_reset(&set_glide);
     set_drawer_item = -1;      /* 选项面板：关着进页面（宽度直接归零，不做滑出） */
     set_drawer_vis  = -1;
     set_drawer_cur  = 0;
@@ -122,7 +120,6 @@ static int slot_item(int slot)
     case SET_SLOT_LANG:  return SET_ITEM_LANG;
     case SET_SLOT_KEY:   return SET_ITEM_KEY;
     case SET_SLOT_PANE:  return SET_ITEM_PANE;
-    case SET_SLOT_WEB:   return SET_ITEM_WEB;
     case SET_SLOT_PARALLEL: return SET_ITEM_PARALLEL;
     case SET_SLOT_SEND_SHA: return SET_ITEM_SEND_SHA;
     case SET_SLOT_RECV_SHA: return SET_ITEM_RECV_SHA;
@@ -145,7 +142,6 @@ static int item_slot(int item)
     case SET_ITEM_LANG:     return SET_SLOT_LANG;
     case SET_ITEM_KEY:      return SET_SLOT_KEY;
     case SET_ITEM_PANE:     return SET_SLOT_PANE;
-    case SET_ITEM_WEB:      return SET_SLOT_WEB;
     case SET_ITEM_PARALLEL: return SET_SLOT_PARALLEL;
     case SET_ITEM_SEND_SHA: return SET_SLOT_SEND_SHA;
     case SET_ITEM_RECV_SHA: return SET_SLOT_RECV_SHA;
@@ -166,10 +162,7 @@ static bool slot_visible(int slot)
 
 static int set_row_h(int slot)
 {
-    if (!slot_visible(slot))     return 0;
-    if (slot == SET_SLOT_ABOUT_A) return SET_LOGO_H;
-    if (slot == SET_SLOT_ABOUT_B) return SET_ADAPT_H;
-    if (slot == SET_SLOT_ABOUT_C) return SET_ADAPT_H;
+    if (!slot_visible(slot)) return 0;
     return slot_item(slot) >= 0 ? ROW_STRIDE : SET_HDR_H;
 }
 
@@ -503,7 +496,6 @@ static void set_row_activate(int item)
     else if (item == SET_ITEM_COLOR)   open_color_pick();
     else if (item == SET_ITEM_CHECK)   update_check_now();
     else if (item == SET_ITEM_LAB)     open_lab();
-    else if (item == SET_ITEM_WEB)     open_web_settings();
     else                               set_drawer_open(item);
 }
 
@@ -535,6 +527,11 @@ void page_settings_render(void)
     int slot, shrink;
 
     set_drawer_step();                 /* 面板宽度动画（打开/收起都走这里） */
+    {
+        int m = set_content_h() - LIST_VIEW_H;
+        if (m < 0) m = 0;
+        set_scroll = glide_step(&set_glide, set_scroll, m);
+    }
     shrink = set_drawer_w * SET_PANEL_SHRINK / SET_PANEL_W;
 
     w_page_header(tr("Settings"));
@@ -589,25 +586,25 @@ void page_settings_render(void)
             case SET_SLOT_HDR_ST: txt = tr("Storage"); break;
             case SET_SLOT_HDR_UPD: txt = tr("Update"); break;
             case SET_SLOT_HDR_LAB: txt = tr("Experimental"); break;
-            case SET_SLOT_HDR_D: txt = tr("About"); break;
             default: break; /* 下方各自 case，绝不落到空绘制 */
             }
             if (txt)
                 w_text(28, top + 12, 1.05f, theme->text_dim, "%s", txt);
-            if (slot == SET_SLOT_ABOUT_A) {
-                /* 文字 logo：PSVSend 主色大字 + 右侧版本号 */
-                int lw = 0, lh = 0;
-                w_text_w(1.3f, "PSVSend", &lw, &lh);
-                w_text(28, top + 16, 1.3f, theme->accent, "PSVSend");
-                w_text(28 + lw + 16, top + 20, 1.0f, theme->text_dim,
-                       "v" PSVSEND_APP_VERSION " (" PSVSEND_BUILD_TAG ")");
+            if (slot == SET_SLOT_ABOUT) {
+                /* 关于只占一行：主色 PSVSend + 版本/构建号 + 协议 + 仓库，
+                 * 一段话读完；窄语言/字体下超宽就裁尾，不换行占两行。 */
+                int lw = 0, lh = 0, y;
+                char rest[192];
+                w_text_w(1.0f, "PSVSend", &lw, &lh);
+                y = top + (SET_HDR_H - lh) / 2;
+                w_text(28, y, 1.0f, theme->accent, "PSVSend");
+                snprintf(rest, sizeof rest,
+                         "v" PSVSEND_APP_VERSION " (" PSVSEND_BUILD_TAG
+                         ")  ·  LocalSend v1.15+  ·  "
+                         "github.com/LinuxMint-User/PSVSend");
+                w_text_clip(28 + lw + 10, y + 2, 0.9f, theme->text_dim, rest,
+                            SCR_W - 28 - (28 + lw + 10));
             }
-            if (slot == SET_SLOT_ABOUT_B)
-                w_text(28, top + 12, 0.9f, theme->text_dim, "%s",
-                       tr("LocalSend client v1.15+ compatible (protocol v2.0)"));
-            if (slot == SET_SLOT_ABOUT_C)
-                w_text(28, top + 12, 0.9f, theme->text_dim, "%s",
-                       "github.com/LinuxMint-User/PSVSend");
             continue;
         }
         /* 行宽随面板动画收窄（912 → 576）：面板展开时右侧让出空间给选项面板 */
@@ -670,9 +667,6 @@ void page_settings_render(void)
             break;
         case SET_ITEM_PANE:
             w_row(r, tr("Layout"), pane_v, item == g_app.set_sel);
-            break;
-        case SET_ITEM_WEB:
-            w_row(r, tr("Web share"), tr("Open"), item == g_app.set_sel);
             break;
         case SET_ITEM_PARALLEL:
             /* 并发上传数：只看数字即可（1 = 一次传一个文件） */
@@ -772,6 +766,7 @@ void page_settings_input(const Input *in)
 {
     /* 面板态：拖动滚动冻结、列表焦点不动，其余按键一律吞掉，只认面板内的动作 */
     if (set_drawer_item >= 0) {
+        glide_stop(&set_glide);   /* 面板态列表冻结：别让惯性在面板底下继续滚 */
         if (in->tap) {
             int id = w_hit(in->tap_x, in->tap_y);
             if (id >= WID_SET_OPT(0) && id < WID_SET_OPT(SET_OPT_MAX))
@@ -795,6 +790,7 @@ void page_settings_input(const Input *in)
     if (in->drag_start || in->dragging) {
         int m = set_content_h() - LIST_VIEW_H;
         if (m < 0) m = 0;
+        glide_stop(&set_glide);
         if (in->drag_start) set_press_scroll = set_scroll;
         int ns = set_press_scroll - in->drag_dy;
         if (ns < 0) ns = 0;
@@ -802,6 +798,11 @@ void page_settings_input(const Input *in)
         set_scroll = ns;
         return;
     }
+    if (in->drag_end) {
+        glide_release(&set_glide, in);   /* 甩手下一次 render 起滑行 */
+        return;
+    }
+    glide_stop(&set_glide);              /* 点按 / 按键 / 新手势：打断滑行 */
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id == WID_HDR_BACK_SET) { settings_leave(); return; }
@@ -837,6 +838,7 @@ static int    dpick_dirs[MAX_FILES];  /* files[] 中目录行下标（渲染/焦
 static int    dpick_dcount = 0;
 static int    dpick_scroll = 0;
 static int    dpick_press_scroll = 0;
+static ScrollGlide dpick_glide;
 
 /* 从 files[] 重建目录行索引（文件浏览列表可能混有文件，只给目录当候选） */
 static void dpick_build(void)
@@ -856,6 +858,7 @@ void open_dir_pick(PageId origin, bool persist, const char *start_dir)
     g_app.cur_dir[sizeof g_app.cur_dir - 1] = 0;
     g_app.file_sel = 0;
     dpick_scroll = 0;
+    glide_reset(&dpick_glide);
     files_load();
     dpick_build();
     /* 光标跳过首行 ".."（与文件页同口径，省得每次进选择页都先往下按一下） */
@@ -870,6 +873,7 @@ static void dpick_enter(int dn)
     enter_dir(g_app.files[dpick_dirs[dn]].name);
     dpick_build();
     dpick_scroll = 0;
+    glide_reset(&dpick_glide);
 }
 
 /* 退出目录选择、一个目录都不改，回来源页（方块键与页头"返回"触摸按钮共用） */
@@ -888,6 +892,7 @@ static void dpick_up(void)
     parent_dir();
     dpick_build();
     dpick_scroll = 0;
+    glide_reset(&dpick_glide);
 }
 
 /* 确认当前目录：persist=写 config saveDir 并落盘；否则只写内存 recv_dir */
@@ -909,6 +914,8 @@ void page_dir_pick_render(void)
     w_page_header(tr("Choose folder"));
     w_hdr_button(HDR_SLOT_R, WID_HDR_BACK_DP, HDRBTN_BACK, false);
     w_text_lead(28, 56, 1.0f, theme->text_dim, g_app.cur_dir, SCR_W - 56);
+    dpick_scroll = glide_step(&dpick_glide, dpick_scroll,
+                              list_max_scroll(dpick_dcount));
     if (dpick_dcount > 0) {
         clamp_scroll(&dpick_scroll, dpick_dcount);
         vita2d_enable_clipping();
@@ -955,10 +962,16 @@ void page_dir_pick_render(void)
 void page_dir_pick_input(const Input *in)
 {
     if (dpick_dcount > 0 && (in->drag_start || in->dragging)) {
+        glide_stop(&dpick_glide);
         list_drag(in, dpick_dcount, &dpick_scroll, &dpick_press_scroll,
                   &g_app.file_sel);
         return;                     /* 拖动期间不处理其它触摸动作 */
     }
+    if (in->drag_end) {
+        if (dpick_dcount > 0) glide_release(&dpick_glide, in);
+        return;
+    }
+    glide_stop(&dpick_glide);
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id == WID_DIRPICK_SAVE) { dpick_save(); return; }

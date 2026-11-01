@@ -12,6 +12,7 @@
 #define PSVSEND_UI_PAGES_INTERNAL_H
 
 #include <vita2d.h>
+#include <psp2/kernel/processmgr.h>   /* sceKernelGetSystemTimeWide（惯性滚动计时） */
 #include "ui/ui.h"
 
 /* ---------- 布局常量 ----------
@@ -72,6 +73,81 @@ static inline void clamp_scroll(int *st, int count)
     int m = list_max_scroll(count);
     if (*st < 0) *st = 0;
     if (*st > m) *st = m;
+}
+
+/* ---------- 触摸惯性滚动 ----------
+ * 输入层在抬手帧给出 in->drag_end + in->fling_vy（手指竖直速度，向下为正）。
+ * 各页在 input 的拖动分支里 glide_stop，抬手帧 glide_release，其它任何输入
+ * glide_stop；render 每帧 glide_step 推进。滚动轴与手指相反（scroll = press -
+ * drag_dy），所以速度取反。按真实帧间隔衰减（帧率无关），碰边硬停、不回弹。 */
+#define GLIDE_START_V  150      /* px/s：抬手速度低于此不启动（慢拖停住即停） */
+#define GLIDE_MAX_V    2600     /* px/s：上限，别一甩飞出几屏 */
+#define GLIDE_STOP_V   60       /* px/s：衰减到此值收尾 */
+#define GLIDE_TAU_US   140000   /* 速度衰减时间常数（约 0.3s 停住） */
+
+typedef struct {
+    float    v;          /* 当前滚动速度（px/s，正 = scroll 增大 / 内容上移） */
+    bool     active;
+    uint64_t last_us;    /* 上一次积分时刻 */
+} ScrollGlide;
+
+static inline void glide_stop(ScrollGlide *g)
+{
+    g->active = false;
+    g->v = 0.0f;
+}
+
+static inline void glide_reset(ScrollGlide *g)
+{
+    glide_stop(g);
+    g->last_us = 0;
+}
+
+/* 抬手帧：把手指速度转成滚动速度；太慢就当作普通拖动结束 */
+static inline void glide_release(ScrollGlide *g, const Input *in)
+{
+    int v = -in->fling_vy;
+    if (v > GLIDE_MAX_V)  v = GLIDE_MAX_V;
+    if (v < -GLIDE_MAX_V) v = -GLIDE_MAX_V;
+    if (v > GLIDE_START_V || v < -GLIDE_START_V) {
+        g->v = (float)v;
+        g->active = true;
+        g->last_us = (uint64_t)sceKernelGetSystemTimeWide();
+    } else {
+        glide_stop(g);
+    }
+}
+
+/* 每帧推进（render 里、绘制前调用）。返回新的 scroll。 */
+static inline int glide_step(ScrollGlide *g, int scroll, int max)
+{
+    uint64_t now, dt;
+    float d;
+
+    if (!g->active) return scroll;
+    now = (uint64_t)sceKernelGetSystemTimeWide();
+    if (g->last_us == 0) { g->last_us = now; return scroll; }
+    dt = now - g->last_us;
+    g->last_us = now;
+    /* 页面已离开 / 主循环长卡顿：这段时间不该补滑，直接收尾 */
+    if (dt > 200000) { glide_stop(g); return scroll; }
+    if (dt > 40000) dt = 40000;       /* 单帧卡顿最多追 40ms，别一下滑飞 */
+    if (dt < 1000) return scroll;     /* 同帧重复调用 */
+
+    d = g->v * (float)dt / 1000000.0f;
+    scroll += (int)d;
+    g->v *= 1.0f - (float)dt / (float)GLIDE_TAU_US;
+
+    if (scroll <= 0) {                 /* 顶部：硬停 */
+        scroll = 0;
+        glide_stop(g);
+    } else if (scroll >= max) {        /* 底部：硬停 */
+        scroll = max;
+        glide_stop(g);
+    } else if (g->v > -GLIDE_STOP_V && g->v < GLIDE_STOP_V) {
+        glide_stop(g);
+    }
+    return scroll;
 }
 
 /* 让选中行保持完整可见（键盘导航用；最小滚动量） */
@@ -183,7 +259,6 @@ void open_verify(const char *peer_fp, const char *alias); /* pages_verify.c：�
 void open_lab(void);                /* pages_lab.c：进实验室页（会先停字体预读） */
 void lab_scan_leave_for_recv(void); /* pages_lab.c：扫码页被接收确认页顶掉时停相机/清冻结态 */
 void open_web(bool start_download); /* pages_web.c：进网页共享页；true=直接用已选文件开分享 */
-void open_web_settings(void);       /* pages_web.c：从设置页进，返回设置页 */
 void ask_ime_host(void);            /* pages_recv.c：打开系统键盘改本机设备名（设置页主机名行用） */
 void ask_ime_pin(void);             /* pages_recv.c：发送等待页对方要求 PIN → 弹键盘输入 */
 void settings_open(void);           /* pages_settings.c：进设置页（焦点回首项、滚动归顶） */

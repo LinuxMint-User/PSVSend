@@ -56,6 +56,9 @@ static bool   t_ignore;          /* 冻结前就在按的那只手：抬起前�
 static int    t_x0, t_y0;        /* 按下起点（屏幕坐标） */
 static int    t_lastx, t_lasty;  /* 最近一次触摸点 */
 static bool   t_have_last;       /* 是否已有坐标可参考（抬起时用于距离判断） */
+static uint64_t t_last_us;       /* 上一次触摸采样时刻（速度积分用） */
+static float    t_vy;            /* 手指竖直速度（px/s，向下为正，带平滑） */
+static uint64_t t_move_us;       /* 最近一次确实发生位移的时刻（抬手前停住就不甩） */
 
 static void update_keys(void)
 {
@@ -100,7 +103,7 @@ static bool touch_to_screen(int px, int py, int *sx, int *sy)
     return false;
 }
 
-static void touch_poll(Input *in, SceTouchData *touch)
+static void touch_poll(Input *in, SceTouchData *touch, uint64_t now)
 {
     bool down = touch->reportNum > 0;
     int cx = 0, cy = 0;
@@ -133,11 +136,17 @@ static void touch_poll(Input *in, SceTouchData *touch)
             t_lastx = cx; t_lasty = cy;
             t_have_last = true;
             t_drag = false;
+            t_vy = 0.0f;
+            t_last_us = now;
+            t_move_us = now;
             touch_charge = 0.0f;
             touch_locked = false;
             touch_fired = false;
         } else {
+            int prev_y = t_lasty;
+            uint64_t dt = now - t_last_us;
             t_lastx = cx; t_lasty = cy;
+            t_last_us = now;
             if (!t_drag) {
                 int dx = cx - t_x0, dy = cy - t_y0;
                 if (dx < 0) dx = -dx;
@@ -150,6 +159,13 @@ static void touch_poll(Input *in, SceTouchData *touch)
                 }
             }
             if (t_drag) {
+                /* 速度：本帧位移 / 帧间隔，指数平滑压掉采样抖动。
+                 * 抬手帧把它交给页面做惯性；停住不动时 inst=0，平滑值自然衰减。 */
+                if (dt >= 1000 && dt <= 60000) {
+                    float inst = (float)(cy - prev_y) * 1000000.0f / (float)dt;
+                    t_vy = t_vy * 0.65f + inst * 0.35f;
+                    if (cy != prev_y) t_move_us = now;
+                }
                 in->dragging = true;
                 /* 起点在拖动全程都要带上：输入结构每 poll 都清零，
                  * 只在 drag_start 帧赋值会让后续帧读到 0（分栏判定失效）。 */
@@ -175,7 +191,17 @@ static void touch_poll(Input *in, SceTouchData *touch)
         }
     } else if (t_down) {
         /* 手指抬起 */
-        if (!t_drag && !touch_fired) {
+        if (t_drag) {
+            /* 抬手速度交给页面做惯性滚动。最后一个采样点若已停住超过 120ms
+             * （拖着拖着停住再抬起），不算"甩"，避免手已停而列表还在滑。 */
+            uint64_t quiet = now - t_move_us;
+            in->drag_end = true;
+            in->fling_vy = quiet > 120000 ? 0 : (int)t_vy;
+            /* 抬手帧也带上起点/终点：主页两栏要靠起点判断这次甩的是哪一栏 */
+            in->drag_x0 = t_x0; in->drag_y0 = t_y0;
+            in->drag_x = t_lastx; in->drag_y = t_lasty;
+            in->drag_dx = t_lastx - t_x0; in->drag_dy = t_lasty - t_y0;
+        } else if (!touch_fired) {
             int ex = t_have_last ? t_lastx : t_x0;
             int ey = t_have_last ? t_lasty : t_y0;
             int dx = ex - t_x0, dy = ey - t_y0;
@@ -192,6 +218,7 @@ static void touch_poll(Input *in, SceTouchData *touch)
         t_have_last = false;
         touch_locked = false;
         touch_fired = false;
+        t_vy = 0.0f;
     }
     t_down = down;
 }
@@ -261,7 +288,7 @@ void ui_input_poll(Input *in)
     }
 
     if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) >= 0)
-        touch_poll(in, &touch);
+        touch_poll(in, &touch, now);
     else
         t_down = false;   /* 读取失败视为抬手，避免状态卡住 */
 }
@@ -294,6 +321,7 @@ void ui_input_resync(void)
     touch_fired = false;
 
     t_drag = false;
+    t_vy = 0.0f;
     if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) >= 0 &&
         touch.reportNum > 0) {
         t_down = true;       /* 手指还在屏上：整只手的这次手势作废（等抬起） */

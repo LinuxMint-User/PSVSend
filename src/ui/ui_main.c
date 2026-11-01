@@ -623,7 +623,7 @@ void ui_run(void)
                 in.confirm || in.back || in.menu || in.start ||
                 in.alt || in.alt_long || in.square ||
                 in.back_long || in.touch_long || in.touch_hold ||
-                in.drag_start || in.dragging)
+                in.drag_start || in.dragging || in.drag_end)
                 input_page(&in);
         }
         ime_was_busy = page_ime_busy();

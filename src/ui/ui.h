@@ -77,6 +77,11 @@ typedef struct {
     int  drag_x0, drag_y0;        /* 滑动起始点（屏幕坐标） */
     int  drag_x,  drag_y;         /* 当前触摸点（屏幕坐标） */
     int  drag_dx, drag_dy;        /* 距起始点的累计位移 */
+    /* 惯性滚动：滑动在本帧抬起（只在这一帧置位，不是每帧都有）。
+     * fling_vy 是抬手时手指的竖直速度（px/s，向下为正）；滚动轴与手指相反，
+     * 页面用 glide_release() 取反后做滑行。抬手前手指已停住 → 速度为 0。 */
+    bool drag_end;
+    int  fling_vy;
 } Input;
 
 /* ---------- 控件：注册命中区域供触摸 ---------- */

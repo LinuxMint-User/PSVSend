@@ -28,6 +28,9 @@ static int pick_scroll = 0;        /* 主页已选文件栏内容像素偏移 */
 static int pick_press_scroll = 0;
 static int file_scroll = 0;        /* 文件选择页（目录列表）内容像素偏移 */
 static int file_press_scroll = 0;
+static ScrollGlide dev_glide;      /* 主页设备栏触摸惯性 */
+static ScrollGlide pick_glide;     /* 主页已选文件栏触摸惯性 */
+static ScrollGlide file_glide;     /* 文件选择页触摸惯性 */
 static char pick_dir[512] = "ux0:/";  /* 文件选择页上次所在目录（本次运行内记忆） */
 /* 页头下细条的两个来源（提示优先于扫描反馈）：
  *  - 手动扫描的进度/结果：round 结束时边沿检测记下结束时刻，其后约 4s 显示；
@@ -376,6 +379,7 @@ static void unpick_all(void)
     g_app.picked_sel = 0;
     pick_scroll = 0;
     pick_press_scroll = 0;
+    glide_reset(&pick_glide);
 }
 
 /* 设备栏确认：设备有效 + 有文件才发。
@@ -415,6 +419,10 @@ void page_devices_render(void)
     hdr_buttons();
     dev_strip();
     pane_rects(&dev, &fil);
+    dev_scroll = glide_step(&dev_glide, dev_scroll,
+                            area_max_scroll(g_app.dev_count, PANE_VIEW_H));
+    pick_scroll = glide_step(&pick_glide, pick_scroll,
+                             area_max_scroll(g_app.picked_count, PANE_VIEW_H));
     dev_pane_render(&dev, g_app.pane_focus == 0);
     pick_pane_render(&fil, g_app.pane_focus == 1);
 
@@ -472,6 +480,8 @@ void page_devices_input(const Input *in)
     /* 触摸拖动：按按下点落在哪一栏决定滚哪一栏（触摸不切焦点） */
     if (in->drag_start || in->dragging) {
         bool over_dev = in->drag_x0 >= dev.x && in->drag_x0 < dev.x + dev.w;
+        glide_stop(&dev_glide);
+        glide_stop(&pick_glide);
         if (over_dev && count > 0)
             area_drag(in, count, &dev_scroll, &dev_press_scroll,
                       &g_app.dev_sel, PANE_TOP, PANE_VIEW_H);
@@ -480,6 +490,16 @@ void page_devices_input(const Input *in)
                       &g_app.picked_sel, PANE_TOP, PANE_VIEW_H);
         return;   /* 拖动期间不处理其它触摸动作 */
     }
+    if (in->drag_end) {
+        /* 抬手帧仍带着起点：按这次拖动落在哪一栏，只让那一栏继续滑 */
+        bool over_dev = in->drag_x0 >= dev.x && in->drag_x0 < dev.x + dev.w;
+        if (over_dev && count > 0)          glide_release(&dev_glide, in);
+        else if (!over_dev && g_app.picked_count > 0)
+                                            glide_release(&pick_glide, in);
+        return;
+    }
+    glide_stop(&dev_glide);
+    glide_stop(&pick_glide);
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id >= WID_DEVS_BASE && id < WID_DEVS_BASE + count) {
@@ -701,6 +721,7 @@ void enter_dir(const char *name)
     else
         snprintf(g_app.cur_dir, sizeof g_app.cur_dir, "%s/%s", g_app.cur_dir, name);
     file_scroll = 0;
+    glide_reset(&file_glide);
     remember_dir();
     files_load();
     g_app.file_sel = files_first_sel();   /* 落在第一个真实项上，不停在 ".." */
@@ -721,6 +742,7 @@ void parent_dir(void)
         strcpy(g_app.cur_dir, "ux0:/");
     }
     file_scroll = 0;
+    glide_reset(&file_glide);
     remember_dir();
     files_load();
     g_app.file_sel = files_first_sel();
@@ -739,6 +761,7 @@ void page_files_render(void)
         w_text(SCR_W - 28 - cw, 56, 1.0f,
                g_app.picked_count > 0 ? theme->text : theme->text_dim, "%s", cnt);
     }
+    file_scroll = glide_step(&file_glide, file_scroll, list_max_scroll(count));
     if (count > 0) {
         int i;
         clamp_scroll(&file_scroll, count);
@@ -804,9 +827,15 @@ void page_files_input(const Input *in)
 {
     int count = g_app.file_count;
     if (count > 0 && (in->drag_start || in->dragging)) {
+        glide_stop(&file_glide);
         list_drag(in, count, &file_scroll, &file_press_scroll, &g_app.file_sel);
         return;   /* 拖动期间不处理其它触摸动作 */
     }
+    if (in->drag_end) {
+        if (count > 0) glide_release(&file_glide, in);
+        return;
+    }
+    glide_stop(&file_glide);
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id == WID_FILES_DONE) {
@@ -847,6 +876,7 @@ static void open_files(void)
     strncpy(g_app.cur_dir, pick_dir, sizeof g_app.cur_dir - 1);
     g_app.cur_dir[sizeof g_app.cur_dir - 1] = 0;
     file_scroll = 0;
+    glide_reset(&file_glide);
     files_load();
     g_app.file_sel = files_first_sel();
     g_app.page = PAGE_FILES;

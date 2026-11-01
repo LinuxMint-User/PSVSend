@@ -23,6 +23,7 @@
 #define XF_BAR_W      660      /* 行内细进度条宽 */
 
 static int xf_press_scroll = 0;
+static ScrollGlide xf_glide;      /* 进度页文件列表触摸惯性 */
 
 /* ---- 速度读数：2s 滑动窗口 ----
  * 旧算法是"累计平均"：分子 = 已传字节，分母 = 从点击发送（或会话建立）起的
@@ -225,10 +226,11 @@ void page_progress_render(void)
     }
     if (active < 0 && xf_count > 0) active = xf_count - 1;
 
-    /* 列表可视区滚动夹紧 */
+    /* 列表可视区滚动夹紧（惯性先推进） */
     {
         int max_s = xf_count * ROW_STRIDE - XF_VIEW_H;
         if (max_s < 0) max_s = 0;
+        xf_scroll = glide_step(&xf_glide, xf_scroll, max_s);
         if (xf_scroll < 0) xf_scroll = 0;
         if (xf_scroll > max_s) xf_scroll = max_s;
     }
@@ -369,6 +371,7 @@ void page_progress_input(const Input *in)
     if (in->drag_start || in->dragging) {
         int max_s = xf_count * ROW_STRIDE - XF_VIEW_H;
         if (max_s < 0) max_s = 0;
+        glide_stop(&xf_glide);
         if (in->drag_start) xf_press_scroll = xf_scroll;
         int ns = xf_press_scroll - in->drag_dy;
         if (ns < 0) ns = 0;
@@ -376,6 +379,11 @@ void page_progress_input(const Input *in)
         xf_scroll = ns;
         return;
     }
+    if (in->drag_end) {
+        glide_release(&xf_glide, in);
+        return;
+    }
+    glide_stop(&xf_glide);
     if (in->up || in->down) {
         int max_s = xf_count * ROW_STRIDE - XF_VIEW_H;
         if (max_s < 0) max_s = 0;

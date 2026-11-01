@@ -18,6 +18,7 @@
 /* 接收确认焦点：0=Reject 1=Setup 2=Accept */
 static int recv_focus = 2;
 static int rs_scroll = 0;         /* 接收设置页文件列表内容偏移 */
+static ScrollGlide rs_glide;      /* 接收设置页触摸惯性 */
 static int rs_press_scroll = 0;
 /* 接收设置改名已接系统键盘（ime_ask）：rename_pop 保留为恒 false 的清理位，
  * 避免牵连各页退出时的复位赋值；真正的输入弹窗由 ask_rename() 直接驱动 */
@@ -311,6 +312,7 @@ void page_recv_confirm_input(const Input *in)
             recv_focus = 1;
             g_app.inc_sel = 0;
             rs_scroll = 0;
+            glide_reset(&rs_glide);
             rename_pop = false;
             api_recv_decide_hold(1);   /* 进设置页：暂停 60s 决定窗口 */
             g_app.page = PAGE_RECV_SETUP;
@@ -343,6 +345,7 @@ void page_recv_confirm_input(const Input *in)
         } else if (recv_focus == 1) {
             g_app.inc_sel = 0;
             rs_scroll = 0;
+            glide_reset(&rs_glide);
             rename_pop = false;
             api_recv_decide_hold(1);   /* 进设置页：暂停 60s 决定窗口 */
             g_app.page = PAGE_RECV_SETUP;
@@ -609,6 +612,11 @@ void page_recv_setup_render(void)
     w_hdr_button(HDR_SLOT_R, WID_HDR_BACK_RS, HDRBTN_BACK, false);
     int rows = 1 + g_app.inc_count;
     char sz[16];
+    {
+        int max_s = rows * ROW_STRIDE - LIST_VIEW_H;
+        if (max_s < 0) max_s = 0;
+        rs_scroll = glide_step(&rs_glide, rs_scroll, max_s);
+    }
     rs_clamp();
     int i;
 
@@ -725,6 +733,7 @@ void page_recv_setup_input(const Input *in)
     if (in->drag_start || in->dragging) {
         int max_s = rows * ROW_STRIDE - LIST_VIEW_H;
         if (max_s < 0) max_s = 0;
+        glide_stop(&rs_glide);
         if (in->drag_start) rs_press_scroll = rs_scroll;
         int ns = rs_press_scroll - in->drag_dy;
         if (ns < 0) ns = 0;
@@ -740,6 +749,11 @@ void page_recv_setup_input(const Input *in)
         g_app.inc_sel = row;
         return;
     }
+    if (in->drag_end) {
+        glide_release(&rs_glide, in);
+        return;
+    }
+    glide_stop(&rs_glide);
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id == WID_HDR_BACK_RS) { rs_leave(); return; }
@@ -810,6 +824,7 @@ static void open_recv_request(const RecvPending *rp)
     config_get_save_dir(g_app.recv_dir, sizeof g_app.recv_dir);
     g_app.inc_sel = 0;
     rs_scroll = 0;
+    glide_reset(&rs_glide);
     rename_pop = false;
     recv_focus = 2;
     g_recv_peer_gone = false;

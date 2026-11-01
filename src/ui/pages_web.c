@@ -24,7 +24,6 @@
 #define WID_WEB_START   0xB003      /* 选择态右下"启动"按钮 */
 
 static int  web_sel;                /* 选择态焦点：0=分享 1=接收 */
-static int  web_back_page;          /* 返回去向：PAGE_DEVICES / PAGE_SETTINGS */
 static bool web_stop_hold;          /* 手指正按住停止按钮（画蓄力弧用） */
 static WebEntry s_entries[MAX_PICKED];
 
@@ -57,15 +56,7 @@ static void web_enter(bool start_download)
 
 void open_web(bool start_download)
 {
-    web_back_page = PAGE_DEVICES;
     web_enter(start_download);
-}
-
-/* 设置页入口：不自动启动，返回设置页 */
-void open_web_settings(void)
-{
-    web_back_page = PAGE_SETTINGS;
-    web_enter(false);
 }
 
 static void web_start_selected(void)
@@ -82,7 +73,7 @@ static void web_leave(void)
 {
     api_web_stop();
     web_stop_hold = false;
-    g_app.page = (PageId)web_back_page;
+    g_app.page = PAGE_DEVICES;
 }
 
 /* ================= 选择态 ================= */
