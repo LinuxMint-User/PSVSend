@@ -725,9 +725,11 @@ void web_download_end(int gen)
 "$('tip').textContent=T0.con;" \
 "if(sid)connect('');"
 
-/* 上传面板的脚本：PIN → prepare-upload（等 PSV 确认）→ 逐文件 upload */
+/* 上传面板的脚本：PIN → prepare-upload（等 PSV 确认）→ 逐文件 upload。
+ * PIN 不落 sessionStorage、刷新必须重输：PIN 每次进页面重新生成，缓存旧值会让
+ * "PSV 关掉共享再重开"后仍不弹输入框（旧 PIN 只在真正上传时才被 401 拒）。 */
 #define HTML_UP_JS \
-"var pin=sessionStorage.getItem('psvsend_pin')||'';" \
+"var pin='';" \
 "function progress(a,b){var p=b>0?Math.round(a*100/b):0;$('bar').style.display='';" \
 "$('bar').firstElementChild.style.width=p+'%';}" \
 "async function send(){var fl=$('files').files;if(!fl.length)return;" \
@@ -753,11 +755,11 @@ void web_download_end(int gen)
 "$('pickLabel').textContent=T0.pick;$('send').textContent=T0.send;" \
 "$('foot').textContent=T0.foot;" \
 "$('pinGo').onclick=function(){pin=$('pin').value.replace(/\\D/g,'');" \
-"if(pin.length!==4){msg(T0.wrong,1);return;}sessionStorage.setItem('psvsend_pin',pin);" \
+"if(pin.length!==4){msg(T0.wrong,1);return;}" \
+"sessionStorage.removeItem('psvsend_pin');" \
 "$('pinCard').style.display='none';$('upCard').style.display='';msg('');};" \
 "$('pin').onkeydown=function(e){if(e.key==='Enter')$('pinGo').click();};" \
-"$('send').onclick=send;" \
-"if(pin.length===4){$('pinCard').style.display='none';$('upCard').style.display='';}"
+"$('send').onclick=send;"
 
 #define HTML_DL_BODY \
 "<div class=\"card\" id=\"pinCard\"><label id=\"pinLabel\" for=\"pin\"></label>" \
