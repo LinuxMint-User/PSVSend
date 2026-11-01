@@ -97,6 +97,14 @@ int  api_recv_status_pull(RecvStatus *out);
 /* 会话结束展示完毕，清场回空闲 */
 void api_recv_clear(void);
 
+/* ---- UI 门面：扫码链接（拉取会话，proto/receive.c） ----
+ * 扫到别人网页共享的二维码后发起；拿到清单后与推送会话同构地走确认页/进度页，
+ * 故上面的 pending/decide/status 接口照常使用。 */
+int  api_recv_link_open(const char *host, int port, const char *pin); /* 0=已开始 -1=忙 -2=参数非法 */
+int  api_recv_link_connecting(void);   /* 1=正在连接/取清单 */
+int  api_recv_link_error_take(void);   /* 取走一次性失败码 */
+void api_recv_link_cancel(void);       /* 离开扫码页时取消"连接中"的请求 */
+
 /* ---- UI 门面：Web 网页端（net/web.c） ----
  * 浏览器经明文 http://IP:端口 打开共享页；两种模式互斥（下载分享 / 网页接收）。
  * UI 只负责生成 PIN、启停、展示快照；路由与鉴权住在 net 层。 */

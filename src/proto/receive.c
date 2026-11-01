@@ -31,6 +31,7 @@
 #include <mbedtls/sha256.h>
 #include "proto/receive.h"
 #include "proto/transfer.h"       /* xfer_active：发送中拒绝接收（礼貌拒绝） */
+#include "net/httpc.h"            /* 扫码链接：明文 HTTP 客户端（prepare/download） */
 #include "core/json_util.h"
 #include "core/config.h"
 #include "core/dlog.h"
@@ -129,6 +130,10 @@ static int  g_phase = PH_NONE;      /* 当前生命周期 */
  * 不带 PIN，永远为 0，不受此影响。 */
 static int  g_pend_web = 0;
 static int  g_sess_web = 0;
+/* 拉取会话（扫码链接）的下载线程还在跑：与推送会话的 f[].busy 同义——告诉
+ * recv_clear/recv_status_pull"还有 worker 持有 g_sess"，别在文件间空档清场。
+ * 只有扫码链路会置 1，推送会话恒为 0。 */
+static int  g_sess_pull = 0;
 /* recv_clear 撞上"还有 worker 在收体"时不能当场清场：会删掉别人正在写的临时
  * 文件，且复位 phase 后新 prepare 立刻覆盖 g_sess，而旧 worker 仍持有指向
  * g_sess.f[i] 的指针。只能置中止位，等最后一个 worker 收尾时补做——否则
@@ -256,6 +261,7 @@ static bool sess_is_terminal(int state)
 static bool any_busy_locked(void)
 {
     int i;
+    if (g_sess_pull) return true;        /* 拉取线程可能在文件间空档，仍持有 g_sess */
     for (i = 0; i < g_sess.n; i++)
         if (g_sess.f[i].busy) return true;
     return false;
@@ -588,6 +594,7 @@ void recv_init(void)
     g_phase = PH_NONE;
     g_abort = 0;
     g_clear_pending = 0;
+    g_sess_pull = 0;
     unlock();
     /* 清扫上次异常退出残留的临时文件（接收中断只会留下 <名>.psvsend.tmp，不会
      * 留下正式文件；只扫当前默认/设置目录——临时目录里的崩溃残留是孤儿，不追扫）。
@@ -755,6 +762,85 @@ static bool recv_abort_pending(void)
     return g_abort != 0;
 }
 
+/* 由 g_pend 组装活动会话（推送会话与扫码拉取会话共用）。
+ *  - 只收 UI 勾选的文件；size==0 的当场建出空文件（见 prepare 里的注释）；
+ *  - session_id 为空串 = 本地生成（推送会话），否则用对方给的（拉取会话）；
+ *  - via_web 仅决定"停止网页共享时是否连带中止"。
+ * 返回参与文件数；0 = 全被勾掉，调用方自行把 phase 复位。调用者持锁。 */
+static int build_session_locked(const char *session_id, int via_web)
+{
+    int i, m = 0, has_pending = 0;
+    SceOff tot = 0;
+
+    memset(&g_sess, 0, sizeof g_sess);
+    g_phase = PH_ACTIVE;
+    g_sess_web = via_web ? 1 : 0;
+    g_sess_pull = 0;
+    g_pend_hold = 0;
+    if (session_id && session_id[0])
+        snprintf(g_sess.session, sizeof g_sess.session, "%s", session_id);
+    else
+        gen_hex(g_sess.session, 16);         /* 32 hex */
+    snprintf(g_sess.peer_ip, sizeof g_sess.peer_ip, "%s", g_pend.ip);
+    snprintf(g_sess.peer_alias, sizeof g_sess.peer_alias, "%s", g_pend.alias);
+    for (i = 0; i < g_pend.n && m < RECV_MAX_FILES; i++) {
+        RFile *f;
+        if (!g_pend.inc[i]) continue;
+        f = &g_sess.f[m];
+        memset(f, 0, sizeof *f);
+        snprintf(f->fileid, sizeof f->fileid, "%s", g_pend.f[i].fileid);
+        gen_hex(f->token, 16);
+        /* 落盘用名：UI 指定的保存名（改名）优先，否则对方原名；alloc_paths
+         * 内会再 sanitize + 冲突排重 */
+        snprintf(f->name, sizeof f->name, "%s",
+                 g_pend.f[i].rname[0] ? g_pend.f[i].rname : g_pend.f[i].name);
+        f->size = g_pend.f[i].size;
+        snprintf(f->sha256, sizeof f->sha256, "%s", g_pend.f[i].sha256);
+        if (f->size == 0) {
+            /* 空文件不需收体，但必须在盘上留下一个 0 字节文件：对端对空文件也
+             * 会（也可能不）发一次空体 upload。曾经的写法是"直接标完成、不建
+             * 文件"→ 界面显示收到、目录里却找不到（真机 d129 实测如此）。 */
+            SceUID fd0;
+            alloc_paths(f->name, f->final, sizeof f->final,
+                        f->part, sizeof f->part, g_sess.f, m);
+            fd0 = sceIoOpen(f->final,
+                            SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+            if (fd0 < 0) {
+                /* 建不出来（磁盘满/权限）：退回普通待收文件，让对端随后的
+                 * upload 走正常落盘路径；它不发的话会话以空闲超时收尾，不会静默丢。 */
+                dlog("recv: create empty file fail 0x%08X (%s)",
+                     (unsigned)fd0, f->final);
+                has_pending = 1;
+            } else {
+                sceIoClose(fd0);
+                f->st = 1;
+            }
+        } else {
+            alloc_paths(f->name, f->final, sizeof f->final,
+                        f->part, sizeof f->part, g_sess.f, m);
+            has_pending = 1;
+        }
+        /* 落盘名经 sanitize + 冲突排重后可能与原名不同（对端名含 '/'、
+         * 控制字符，或与本会话/磁盘既有文件重名时）。显示名回填实际
+         * 落盘名，否则界面显示的和用户能在目录里找到的不是一回事。 */
+        {
+            const char *bn = strrchr(f->final, '/');
+            snprintf(f->name, sizeof f->name, "%s", bn ? bn + 1 : f->final);
+        }
+        tot += f->size;
+        m++;
+    }
+    g_sess.n = m;
+    g_sess.total = tot;
+    g_sess.got_total = 0;
+    g_sess.cur = -1;
+    g_sess.start_us = now_us();
+    g_sess.last_us = g_sess.start_us;
+    g_abort = 0;
+    g_sess.state = has_pending ? RECV_ST_READY : RECV_ST_DONE;
+    return m;
+}
+
 /* prepare-upload：解析 → 挂起等 UI（≤60s）→ 回 HTTP 码并填 resp（200 时 JSON） */
 static int recv_http_prepare(const char *body, const char *ip, const char *peer_fp,
                              const HttpPeer *peer, int via_web,
@@ -764,7 +850,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
     JsonIter it;
     char tmp[192];
     long long sz;
-    int i, n = 0, code = 200, r;
+    int n = 0, code = 200, r;
     unsigned my_gen = 0;                     /* 本次占位的序号（见 g_gen） */
     bool pend_accept;
     int probe_ticks = 0, peer_gone = 0;
@@ -918,77 +1004,12 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
     r = g_pend_result;                       /* 醒来后再取一次，可能 UI 刚决定 */
     pend_accept = (r == 1);
     if (pend_accept) {
-        /* 组装活动会话：只收 UI 勾选的文件；未勾选直接跳过 */
-        char eid[512];
-        int k, m = 0, has_pending = 0;
-        SceOff tot = 0;
-        memset(&g_sess, 0, sizeof g_sess);
-        g_phase = PH_ACTIVE;
-        g_sess_web = g_pend_web;
-        g_pend_hold = 0;
-        gen_hex(g_sess.session, 16);         /* 32 hex */
-        snprintf(g_sess.peer_ip, sizeof g_sess.peer_ip, "%s", g_pend.ip);
-        snprintf(g_sess.peer_alias, sizeof g_sess.peer_alias, "%s", g_pend.alias);
-        for (i = 0; i < g_pend.n && m < RECV_MAX_FILES; i++) {
-            if (!g_pend.inc[i]) continue;
-            RFile *f = &g_sess.f[m];
-            memset(f, 0, sizeof *f);
-            snprintf(f->fileid, sizeof f->fileid, "%s", g_pend.f[i].fileid);
-            gen_hex(f->token, 16);
-            /* 落盘用名：UI 指定的保存名（改名）优先，否则对方原名；alloc_paths
-             * 内会再 sanitize + 冲突排重 */
-            snprintf(f->name, sizeof f->name, "%s",
-                     g_pend.f[i].rname[0] ? g_pend.f[i].rname : g_pend.f[i].name);
-            f->size = g_pend.f[i].size;
-            snprintf(f->sha256, sizeof f->sha256, "%s", g_pend.f[i].sha256);
-            if (f->size == 0) {
-                /* 空文件不需收体，但必须在盘上留下一个 0 字节文件：对端对空文件也
-                 * 会（也可能不）发一次空体 upload。曾经的写法是"直接标完成、不建
-                 * 文件"→ 界面显示收到、目录里却找不到（真机 d129 实测如此）。 */
-                SceUID fd0;
-                alloc_paths(f->name, f->final, sizeof f->final,
-                            f->part, sizeof f->part, g_sess.f, m);
-                fd0 = sceIoOpen(f->final,
-                                SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-                if (fd0 < 0) {
-                    /* 建不出来（磁盘满/权限）：退回普通待收文件，让对端随后的
-                     * upload 走正常落盘路径；它不发的话会话以空闲超时收尾，不会静默丢。 */
-                    dlog("recv: create empty file fail 0x%08X (%s)",
-                         (unsigned)fd0, f->final);
-                    has_pending = 1;
-                } else {
-                    sceIoClose(fd0);
-                    f->st = 1;
-                }
-            } else {
-                alloc_paths(f->name, f->final, sizeof f->final,
-                            f->part, sizeof f->part, g_sess.f, m);
-                has_pending = 1;
-            }
-            /* 落盘名经 sanitize + 冲突排重后可能与原名不同（对端名含 '/'、
-             * 控制字符，或与本会话/磁盘既有文件重名时）。显示名回填实际
-             * 落盘名，否则界面显示的和用户能在目录里找到的不是一回事。 */
-            {
-                const char *bn = strrchr(f->final, '/');
-                snprintf(f->name, sizeof f->name, "%s", bn ? bn + 1 : f->final);
-            }
-            tot += f->size;
-            m++;
-        }
-        g_sess.n = m;
-        g_sess.total = tot;
-        g_sess.got_total = 0;
-        g_sess.cur = -1;
-        g_sess.start_us = now_us();
-        g_sess.last_us = g_sess.start_us;
-        g_abort = 0;
+        int k, m = build_session_locked(NULL, g_pend_web);
         if (m == 0) {                        /* 全被勾掉：告诉对方不用传 */
             g_phase = PH_NONE;
-            g_pend_hold = 0;
             code = 204;
         } else {
-            g_sess.state = has_pending ? RECV_ST_READY : RECV_ST_DONE;
-            if (!has_pending) g_sess.err[0] = 0;
+            char eid[512];
             /* 回执 JSON：{sessionId, files{fileId:token}} */
             int o = 0;
             o += snprintf(resp + o,
@@ -1559,6 +1580,475 @@ static int recv_http_cancel(const char *query, const char *ip)
     }
     unlock();
     return 200;                              /* 协议：cancel 恒回 200 */
+}
+
+/* ---------------- 扫码链接：拉取会话（见 receive.h） ----------------
+ * 与推送会话共用 g_phase/g_pend/g_sess：扫到分享二维码 → 后台线程 POST
+ * prepare-download 拿清单 → 照常走确认页 → 接受后同一线程逐个 GET 文件。
+ * 一次只允许一个"连接中"的链接；已出现待决定/活动会话时拒绝再开（与 prepare 的
+ * 单活动会话口径一致）。 */
+enum { LINK_ERR_NONE = 0, LINK_ERR_CONN = 1, LINK_ERR_REFUSED = 2,
+       LINK_ERR_RESP = 3, LINK_ERR_CANCELLED = 4, LINK_ERR_BUSY = 5 };
+
+static volatile int g_link_state;    /* 0=空闲 1=连接/取清单（还没出确认页） */
+static volatile int g_link_err;      /* 一次性失败码（UI 取走即清零） */
+static unsigned     g_link_gen;      /* 取消/重开的序号：迟到的线程不得回写 */
+static SceUID       g_link_thr = -1;
+/* 取消后旧线程可能还在 connect/POST（≤6s），新一次扫码会顶掉句柄：把旧句柄
+ * 记在这里，退出后统一回收（同 scan.c 的 worker 收尸思路）。 */
+#define LINK_ORPHANS 4
+static SceUID       g_link_orphan[LINK_ORPHANS];
+static char         g_link_host[64];
+static int          g_link_port;
+static char         g_link_pin[8];
+
+static int link_thr(SceSize args, void *argp);
+static void link_download(const char *host, int port, const char *sid);
+
+/* 回收已退出的链接线程对象（未退出就留着，不碰运行中的线程） */
+static void link_reap(void)
+{
+    int i;
+    if (g_link_thr >= 0 && thread_exited(g_link_thr)) {
+        sceKernelDeleteThread(g_link_thr);
+        g_link_thr = -1;
+    }
+    for (i = 0; i < LINK_ORPHANS; i++) {
+        if (g_link_orphan[i] <= 0) continue;
+        if (!thread_exited(g_link_orphan[i])) continue;
+        sceKernelDeleteThread(g_link_orphan[i]);
+        g_link_orphan[i] = -1;
+    }
+}
+
+static void link_track_orphan(SceUID t)
+{
+    int i;
+    if (t <= 0) return;
+    for (i = 0; i < LINK_ORPHANS; i++)
+        if (g_link_orphan[i] <= 0) { g_link_orphan[i] = t; return; }
+    dlog("recv: link orphan table full, thread %d dropped", (int)t);
+}
+
+int recv_link_open(const char *host, int port, const char *pin)
+{
+    SceUID t;
+
+    if (!host || !host[0] || strlen(host) >= sizeof g_link_host ||
+        port <= 0 || port > 65535 || !pin || strlen(pin) != 4)
+        return -2;
+    link_reap();
+    lock();
+    if (g_link_state != 0 || g_phase != PH_NONE) {
+        unlock();
+        return -1;
+    }
+    snprintf(g_link_host, sizeof g_link_host, "%s", host);
+    g_link_port = port;
+    snprintf(g_link_pin, sizeof g_link_pin, "%s", pin);
+    g_link_err = LINK_ERR_NONE;
+    g_link_state = 1;
+    g_link_gen++;
+    unlock();
+
+    t = sceKernelCreateThread("psvsend_link", link_thr, 0x40, 0x40000, 0, 0, NULL);
+    if (t < 0) {
+        lock();
+        g_link_state = 0;
+        g_link_err = LINK_ERR_CONN;
+        unlock();
+        dlog("recv: link thread create fail 0x%08X", (unsigned)t);
+        return -1;
+    }
+    if (sceKernelStartThread(t, 0, NULL) < 0) {
+        sceKernelDeleteThread(t);
+        lock();
+        g_link_state = 0;
+        g_link_err = LINK_ERR_CONN;
+        unlock();
+        return -1;
+    }
+    if (g_link_thr >= 0)
+        link_track_orphan(g_link_thr);   /* 旧线程还在（取消后未退），交给收尸表 */
+    g_link_thr = t;
+    dlog("recv: link open %s:%d pin=%s", host, port, pin);
+    return 0;
+}
+
+int recv_link_connecting(void)
+{
+    return g_link_state != 0;
+}
+
+int recv_link_error_take(void)
+{
+    int e;
+    lock();
+    e = g_link_err;
+    g_link_err = LINK_ERR_NONE;
+    unlock();
+    return e;
+}
+
+void recv_link_cancel(void)
+{
+    lock();
+    if (g_link_state == 1 && g_phase == PH_NONE) {
+        g_link_gen++;
+        g_link_state = 0;
+        g_link_err = LINK_ERR_CANCELLED;
+        dlog("recv: link open cancelled");
+    }
+    unlock();
+}
+
+/* 拉取会话的写盘回调：每块都推进进度并检查用户中止 */
+typedef struct {
+    SceUID fd;
+    RFile *f;
+    int    wr_fail;
+} LinkSink;
+
+static int link_sink(void *ctx, const unsigned char *buf, int len)
+{
+    LinkSink *s = (LinkSink *)ctx;
+    int ab;
+
+    if (sceIoWrite(s->fd, buf, (unsigned)len) != len) {
+        s->wr_fail = 1;
+        return -1;
+    }
+    lock();
+    s->f->got += len;
+    g_sess.got_total += len;
+    ab = g_abort;
+    unlock();
+    return ab ? -1 : 0;
+}
+
+/* 逐个文件 GET + 写盘 + 收尾（会话终态/清理口径与推送侧一致） */
+static void link_download(const char *host, int port, const char *sid)
+{
+    int i;
+
+    for (i = 0; i < g_sess.n; i++) {
+        RFile *f = &g_sess.f[i];
+        LinkSink sink;
+        SceUID fd;
+        char path[320];
+        int64_t total = -1;
+        int status = 0, rc, wr_fail = 0;
+        bool aborted = false;
+
+        lock();
+        if (g_abort) aborted = true;
+        else if (f->st == 0) {
+            f->busy = true;
+            g_sess.cur = i;
+            g_sess.state = RECV_ST_RECEIVING;
+            g_sess.last_us = now_us();
+            f->got = 0;
+        }
+        unlock();
+        if (aborted) break;
+        if (f->st != 0) continue;
+
+        fd = sceIoOpen(f->part, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+        if (fd < 0) {
+            dlog("recv: link open part fail 0x%08X (%s)", (unsigned)fd, f->part);
+            lock();
+            file_fail_locked(f, "无法创建文件");
+            unlock();
+            continue;
+        }
+        snprintf(path, sizeof path,
+                 "/api/localsend/v2/download?sessionId=%s&fileId=%s",
+                 sid, f->fileid);
+        sink.fd = fd;
+        sink.f = f;
+        sink.wr_fail = 0;
+        rc = httpc_get_stream(host, port, path, link_sink, &sink, &total,
+                              &status, 15000);
+        wr_fail = sink.wr_fail;
+        sceIoClose(fd);
+        if (rc == 0 && total >= 0 && total != (int64_t)f->size)
+            rc = -4;                         /* 清单与实际长度不符 */
+
+        if (rc == 0) {
+            if (sceIoRename(f->part, f->final) < 0) {
+                lock();
+                file_fail_locked(f, "文件落盘失败");
+                unlock();
+            } else {
+                lock();
+                f->st = 1;
+                f->busy = false;
+                update_cur_locked();
+                check_all_done_locked();
+                unlock();
+            }
+            continue;
+        }
+
+        lock();
+        f->busy = false;
+        update_cur_locked();
+        if (g_abort) {
+            unlock();
+            break;                           /* 用户取消：循环外统一收尾 */
+        }
+        if (rc == -2 && wr_fail) {
+            file_fail_locked(f, "写入失败（磁盘空间不足？）");
+            unlock();
+            continue;
+        }
+        if (rc == -4) {
+            file_fail_locked(f, "文件大小与清单不符");
+            unlock();
+            continue;
+        }
+        /* 连接/断流/HTTP 非 200：对方已不可用，剩余文件不再尝试 */
+        {
+            char err[192];
+            if (rc == -3)
+                snprintf(err, sizeof err, "共享已停止（HTTP %d）", status);
+            else
+                snprintf(err, sizeof err, "下载中断");
+            file_fail_locked(f, err);
+            {
+                int k;
+                for (k = i + 1; k < g_sess.n; k++)
+                    if (g_sess.f[k].st == 0) g_sess.f[k].st = 3;
+            }
+            check_all_done_locked();
+        }
+        unlock();
+        break;
+    }
+
+    lock();
+    if (g_abort) {
+        cleanup_parts();
+        if (!sess_is_terminal(g_sess.state))
+            sess_terminal(RECV_ST_CANCEL, "用户取消");
+    } else {
+        int k, failed = 0;
+        for (k = 0; k < g_sess.n; k++) {
+            if (g_sess.f[k].st == 0) g_sess.f[k].st = 3;   /* 未开始的按失败收尾 */
+            if (g_sess.f[k].st == 3) failed++;
+        }
+        if (!sess_is_terminal(g_sess.state)) {
+            if (failed)
+                sess_terminal(RECV_ST_PARTIAL,
+                              g_sess.err[0] ? g_sess.err : "部分文件下载失败");
+            else
+                sess_terminal(RECV_ST_DONE, NULL);
+        }
+    }
+    g_sess.cur = -1;
+    g_sess_pull = 0;                     /* 此后 recv_clear 可以正常清场 */
+    dlog("recv: link session %s end st=%d", g_sess.session, g_sess.state);
+    clear_pending_finish_locked();
+    unlock();
+}
+
+/* prepare-download 清单里的一条文件（解析结果） */
+typedef struct {
+    char   id[160];
+    char   name[192];
+    SceOff size;
+    bool   trunc;
+} LinkItem;
+
+/* 解析一条文件条目（对象）。名字与 prepare-upload 同一套规整：净化 + 超长保后缀截断 */
+static bool link_parse_item(const char *val, LinkItem *it)
+{
+    char raw[512], nm[192];
+    const char *p;
+    long long sz;
+
+    p = json_get_val(val, "id");
+    if (!p || !json_val_str(p, it->id, sizeof it->id) || !it->id[0])
+        return false;
+    raw[0] = 0;
+    p = json_get_val(val, "fileName");
+    if (p) json_val_str(p, raw, sizeof raw);
+    it->trunc = recv_sanitize_name(raw, nm, sizeof nm);
+    p = json_get_val(val, "size");
+    sz = 0;
+    if (p) json_val_int(p, &sz);
+    if (!nm[0] || sz < 0) return false;
+    snprintf(it->name, sizeof it->name, "%s", nm);
+    it->size = (SceOff)sz;
+    return true;
+}
+
+static int link_thr(SceSize args, void *argp)
+{
+    /* 清单最多 RECV_MAX_FILES 条：放静态区，别吃线程栈（256KB 还要装 HTTP 缓冲） */
+    static LinkItem tmp[RECV_MAX_FILES];
+    char host[64], pin[8], path[192], sid[64] = "";
+    char resp[24576];                    /* 64 条长文件名清单也放得下 */
+    char alias[64] = "";
+    int port, status = 0, r, n = 0, i;
+    unsigned my_gen, my_pend = 0;
+    const char *filesv, *infov, *q;
+    JsonIter it;
+
+    (void)args; (void)argp;
+    lock();
+    my_gen = g_link_gen;
+    snprintf(host, sizeof host, "%s", g_link_host);
+    port = g_link_port;
+    snprintf(pin, sizeof pin, "%s", g_link_pin);
+    unlock();
+
+    snprintf(path, sizeof path,
+             "/api/localsend/v2/prepare-download?pin=%s", pin);
+    r = httpc_post(host, port, path, NULL, resp, sizeof resp, &status, 6000);
+
+    lock();
+    if (g_link_gen != my_gen) { unlock(); return 0; }   /* 已取消/重开 */
+    if (r != 0) {
+        g_link_state = 0;
+        g_link_err = LINK_ERR_CONN;
+        unlock();
+        dlog("recv: link %s:%d prepare connect fail", host, port);
+        return 0;
+    }
+    if (status != 200) {
+        g_link_state = 0;
+        g_link_err = (status == 401 || status == 403) ? LINK_ERR_REFUSED
+                                                      : LINK_ERR_RESP;
+        unlock();
+        dlog("recv: link %s:%d prepare -> %d", host, port, status);
+        return 0;
+    }
+    unlock();
+
+    /* 解析清单（与 prepare-upload 同一套规整：净化 + 超长保后缀截断） */
+    infov = json_get_val(resp, "info");
+    if (infov) json_get_str(infov, "alias", alias, sizeof alias);
+    filesv = json_get_val(resp, "files");
+    if (!json_get_str(resp, "sessionId", sid, sizeof sid) || !sid[0] || !filesv) {
+        lock();
+        if (g_link_gen == my_gen) {
+            g_link_state = 0;
+            g_link_err = LINK_ERR_RESP;
+        }
+        unlock();
+        dlog("recv: link response unparseable: %.160s", resp);
+        return 0;
+    }
+    /* files 有两种形态：我们自己的网页共享是数组，官方端是 "id → 文件" 的 map。
+     * 两种都要能读，否则扫官方分享会"一条文件都解析不出来"。 */
+    for (q = filesv; *q == ' ' || *q == '\t' || *q == '\n' || *q == '\r'; q++)
+        ;
+    if (*q == '[') {
+        if (json_arr_first(filesv, &it)) {
+            do {
+                if (link_parse_item(it.val, &tmp[n])) n++;
+            } while (n < RECV_MAX_FILES && json_arr_next(&it));
+        }
+    } else if (*q == '{') {
+        if (json_iter_first(filesv, &it)) {
+            do {
+                if (link_parse_item(it.val, &tmp[n])) n++;
+            } while (n < RECV_MAX_FILES && json_iter_next(&it));
+        }
+    }
+
+    lock();
+    if (g_link_gen != my_gen) { unlock(); return 0; }
+    if (g_phase != PH_NONE) {
+        g_link_state = 0;
+        g_link_err = LINK_ERR_BUSY;
+        unlock();
+        dlog("recv: link refused, another session active");
+        return 0;
+    }
+    if (n == 0) {
+        g_link_state = 0;
+        g_link_err = LINK_ERR_RESP;
+        unlock();
+        dlog("recv: link %s:%d has no files", host, port);
+        return 0;
+    }
+    /* 占位：从这里开始与 prepare 完全同构（确认页/倒计时/ABA 保护都复用） */
+    g_phase = PH_PENDING;
+    g_pend_web = 0;                      /* 拉取会话不受"停止本机网页共享"影响 */
+    my_pend = ++g_gen;
+    g_peer_gone_evt = 0;
+    snprintf(g_pend.alias, sizeof g_pend.alias, "%s",
+             alias[0] ? alias : host);
+    snprintf(g_pend.type, sizeof g_pend.type, "%s", "web");
+    snprintf(g_pend.ip, sizeof g_pend.ip, "%s", host);
+    g_pend.fp[0] = 0;
+    g_pend.n = n;
+    g_pend.overflow = 0;
+    for (i = 0; i < n; i++) {
+        snprintf(g_pend.f[i].fileid, sizeof g_pend.f[i].fileid, "%s", tmp[i].id);
+        snprintf(g_pend.f[i].name, sizeof g_pend.f[i].name, "%s", tmp[i].name);
+        g_pend.f[i].size = tmp[i].size;
+        g_pend.f[i].sha256[0] = 0;
+        g_pend.f[i].rname[0] = 0;
+        g_pend.f[i].trunc = tmp[i].trunc;
+        g_pend.inc[i] = true;
+    }
+    g_pend_result = 0;
+    g_pend_hold = 0;
+    g_pend_dl = (SceLong64)now_us() + RECV_DECIDE_TIMEOUT_US;
+    g_link_state = 0;                    /* UI 改看 pending（确认页） */
+    unlock();
+    dlog("recv: link %s:%d session=%s files=%d", host, port, sid, n);
+
+    /* 等 UI 决定（与 http prepare 的轮询/暂停/超时语义一致） */
+    for (;;) {
+        int result, expired;
+        lock();
+        result = g_pend_result;
+        if (g_gen != my_pend) result = 3;     /* 已被 recv_clear 撤销 */
+        if (!result && g_pend_hold)
+            g_pend_dl = (SceLong64)now_us() + RECV_DECIDE_TIMEOUT_US;
+        expired = !g_pend_hold && (SceLong64)now_us() >= g_pend_dl;
+        unlock();
+        if (result) { r = result; break; }
+        if (expired) { r = 3; break; }
+        sceKernelDelayThread(50 * 1000);
+    }
+    if (r != 1) {
+        lock();
+        if (g_gen == my_pend) {
+            g_phase = PH_NONE;
+            g_pend_hold = 0;
+        }
+        g_pend_result = 0;
+        unlock();
+        dlog("recv: link session %s %s", sid, r == 2 ? "rejected" : "timeout");
+        return 0;
+    }
+
+    lock();
+    if (g_gen != my_pend) {              /* 决定后立刻被撤销 */
+        unlock();
+        return 0;
+    }
+    n = build_session_locked(sid, 0);
+    if (n == 0) {                        /* 全被勾掉：不下载 */
+        g_phase = PH_NONE;
+        g_pend_result = 0;
+        unlock();
+        return 0;
+    }
+    g_sess_pull = 1;                     /* 文件间空档也不许 recv_clear 清场 */
+    if (g_sess.state == RECV_ST_READY)
+        g_sess.state = RECV_ST_RECEIVING; /* 拉取马上开始，不显示"等待发送方" */
+    g_pend_result = 0;
+    unlock();
+    dlog("recv: link accept session=%s files=%d", g_sess.session, n);
+
+    link_download(host, port, sid);
+    return 0;
 }
 
 int recv_status_pull(RecvStatus *out)

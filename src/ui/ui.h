@@ -128,6 +128,7 @@ typedef enum {
     PAGE_VERIFY,       /* 设备身份验证：两侧指纹拼接后的 128 hex（发送等待/接收确认页进入） */
     PAGE_LAB,          /* 实验室：设置页「实验」分组进入，实验性小工具列表 */
     PAGE_CAM_BENCH,    /* 摄像头基准：后摄采集 + QR 解码性能实测（实验室子页） */
+    PAGE_LAB_SCAN,     /* 扫码取景：按住 R 识别屏幕上的分享二维码（实验室子页） */
     PAGE_WEB,          /* 网页共享：浏览器经 http://IP:端口 下载/上传（官方 web share） */
     PAGE_COUNT
 } PageId;
@@ -260,6 +261,8 @@ void page_lab_render(void);
 void page_lab_input(const Input *in);
 void page_cam_bench_render(void);
 void page_cam_bench_input(const Input *in);
+void page_lab_scan_render(void);
+void page_lab_scan_input(const Input *in);
 void page_web_render(void);
 void page_web_input(const Input *in);
 

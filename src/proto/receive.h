@@ -118,6 +118,22 @@ void recv_abort(void);
  * 收尾、进行中的上传中止；普通 LocalSend 发送方不受影响。 */
 void recv_cancel_web(void);
 
+/* ---- 扫码链接（拉取会话）：扫到别人网页共享的二维码后主动去下载 ----
+ * 与上面的推送会话共用同一份"待决定/活动会话"状态与确认页/进度页：
+ *   recv_link_open 起后台线程 POST prepare-download?pin=，拿到清单后进入
+ *   PH_PENDING（确认页照常勾选/改名/选目录）；接受后同一线程逐个 GET
+ *   download?sessionId=&fileId= 写盘，进度/错误/中止语义与推送会话一致。
+ * host 必须是 IPv4 字面量（二维码里是本机写的局域网 IP）。 */
+/* 返回 0=已开始连接；-1=已有待决定/活动会话或上一次连接还没结束；-2=参数非法 */
+int recv_link_open(const char *host, int port, const char *pin);
+/* 1=正在连接/取清单（还没出现待决定请求），0=不在连接阶段。UI 用它显示"正在打开" */
+int recv_link_connecting(void);
+/* 取走一次性失败码：0=无 1=连不上 2=对方拒绝/不是共享页 3=响应异常
+ * 4=已被取消（离开扫码页） */
+int recv_link_error_take(void);
+/* 取消"连接中"的扫码链接（已出现的待决定/活动会话不归它管，走 recv_decide/abort） */
+void recv_link_cancel(void);
+
 /* UI 轮询会话状态；返回 1=有会话（含终态）0=空闲 */
 int recv_status_pull(RecvStatus *out);
 

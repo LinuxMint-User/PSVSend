@@ -26,6 +26,12 @@ typedef struct {
 bool json_iter_first(const char *obj, JsonIter *it);
 bool json_iter_next(JsonIter *it);
 
+/* ---- 数组元素遍历（prepare-download 的 files 数组等） ----
+ * 用法同对象迭代：arr 指向 '['；it->val 为元素值起点，it->key 不填。
+ * 对象/数组两种 files 形态都要能读：官方端是 map，我们自己的网页共享是数组。 */
+bool json_arr_first(const char *arr, JsonIter *it);
+bool json_arr_next(JsonIter *it);
+
 /* 把 val（迭代器/上一级拿到的值指针，须指向 '"'）解码为字符串；非字符串 → false */
 bool json_val_str(const char *val, char *out, int outsz);
 /* 把 val（指向数字）读出整数；非数字 → false */

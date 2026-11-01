@@ -50,12 +50,14 @@ add_executable(${PROJECT_NAME}
     src/app/update.c
     src/app/ime.c
     src/app/cam_bench.c
+    src/app/cam_scan.c
     src/core/config.c
     src/core/dlog.c
     src/core/i18n.c
     src/core/json_util.c
     src/net/discovery.c
     src/net/http.c
+    src/net/httpc.c
     src/net/identity.c
     src/net/net.c
     src/net/scan.c

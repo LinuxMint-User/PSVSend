@@ -53,6 +53,7 @@
 #define WID_HDR_BACK_CB  0x8209               /* 摄像头基准页：停止并回实验室 */
 #define WID_HDR_WEB      0x820A               /* 主页页头最左：进网页共享页（不自动启动） */
 #define WID_HDR_BACK_WEB 0x820B               /* 网页共享页：停止并回主页/设置页 */
+#define WID_HDR_BACK_SCAN 0x820C              /* 扫码取景页：停相机并回实验室 */
 
 /* ---------- 各页共用的小工具 ---------- */
 
@@ -180,6 +181,7 @@ void open_dir_pick(PageId origin, bool persist, const char *start_dir); /* pages
 void open_color_pick(void);         /* pages_settings.c：进自定义色盘页（实时预览、确认落盘） */
 void open_verify(const char *peer_fp, const char *alias); /* pages_verify.c：进身份验证页 */
 void open_lab(void);                /* pages_lab.c：进实验室页（会先停字体预读） */
+void lab_scan_leave_for_recv(void); /* pages_lab.c：扫码页被接收确认页顶掉时停相机/清冻结态 */
 void open_web(bool start_download); /* pages_web.c：进网页共享页；true=直接用已选文件开分享 */
 void open_web_settings(void);       /* pages_web.c：从设置页进，返回设置页 */
 void ask_ime_host(void);            /* pages_recv.c：打开系统键盘改本机设备名（设置页主机名行用） */

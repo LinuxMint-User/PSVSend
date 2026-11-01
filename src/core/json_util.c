@@ -278,6 +278,43 @@ bool json_iter_next(JsonIter *it)
     return iter_read_member(it);
 }
 
+/* 数组元素：没有键，只把 val 指到元素起点并把游标推到下一个 ',' / ']' */
+static bool iter_read_elem(JsonIter *it)
+{
+    P p = { it->p };
+    skip_ws(&p);
+    if (*p.s == ']' || !*p.s) return false;
+    it->key[0] = 0;
+    it->val = p.s;
+    skip_value(&p);
+    it->p = p.s;
+    return true;
+}
+
+bool json_arr_first(const char *arr, JsonIter *it)
+{
+    P p;
+    if (!it || !arr) return false;
+    p.s = arr;
+    skip_ws(&p);
+    if (*p.s != '[') return false;
+    p.s++;
+    it->p = p.s;
+    return iter_read_elem(it);
+}
+
+bool json_arr_next(JsonIter *it)
+{
+    P p;
+    if (!it) return false;
+    p.s = it->p;
+    skip_ws(&p);
+    if (*p.s == ',') p.s++;
+    else if (*p.s == ']') return false;
+    it->p = p.s;
+    return iter_read_elem(it);
+}
+
 bool json_val_str(const char *val, char *out, int outsz)
 {
     P v;

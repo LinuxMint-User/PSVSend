@@ -437,6 +437,25 @@ void api_recv_clear(void)
     recv_clear();
 }
 
+/* 扫码链接（拉取会话）：扫到分享二维码后由 UI 发起，后续确认页/进度页与推送
+ * 会话共用同一套接口（api_recv_pending_pull / api_recv_decide / ...）。 */
+int api_recv_link_open(const char *host, int port, const char *pin)
+{
+    return recv_link_open(host, port, pin);
+}
+int api_recv_link_connecting(void)
+{
+    return recv_link_connecting();
+}
+int api_recv_link_error_take(void)
+{
+    return recv_link_error_take();
+}
+void api_recv_link_cancel(void)
+{
+    recv_link_cancel();
+}
+
 /* ---- UI 门面：Web 网页端（薄转发，见 net/web.h） ---- */
 void api_web_new_pin(void) { web_new_pin(); }
 void api_web_start_download(const WebEntry *files, int n)
