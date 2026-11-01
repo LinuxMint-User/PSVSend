@@ -114,6 +114,10 @@ int  recv_decide_left_s(void);
  * （删临时文件、回 CANCEL 态），空闲（READY/文件间）时立即生效。 */
 void recv_abort(void);
 
+/* 网页共享已停止：把"来自浏览器网页"（prepare 带有效 PIN）的待决定请求按拒绝
+ * 收尾、进行中的上传中止；普通 LocalSend 发送方不受影响。 */
+void recv_cancel_web(void);
+
 /* UI 轮询会话状态；返回 1=有会话（含终态）0=空闲 */
 int recv_status_pull(RecvStatus *out);
 

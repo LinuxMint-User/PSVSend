@@ -38,6 +38,7 @@ static int recv_included(void)
 static bool g_recv_expired = false;  /* 请求 60s 没人响应、已被后端作废 */
 static bool g_recv_peer_gone = false;/* 请求消失是因为发送方撤销（关掉 prepare 连接） */
 static uint64_t g_recv_supp_ms = 0;  /* 决定后抑制重弹到：毫秒时间戳 */
+static PageId recv_back = PAGE_DEVICES; /* 弹确认页前所在的页（收尾回程目标） */
 
 /* 拒绝当前请求并离开接收流程（后端回 403，发送方会看到拒绝） */
 static void recv_reject_close(void)
@@ -45,13 +46,36 @@ static void recv_reject_close(void)
     api_recv_clear();                /* PENDING → 唤醒 http 线程按拒绝处理 */
     g_recv_supp_ms = (uint64_t)sceKernelGetSystemTimeWide() / 1000 + 2000;
     rename_pop = false;
-    goto_devices();
+    return_from_recv();
 }
 
 static void recv_close(void)
 {
     rename_pop = false;
-    goto_devices();
+    return_from_recv();
+}
+
+/* 接收流程收尾的回程目标：弹确认页之前用户在哪一页就回哪一页（设备页 / 文件页 /
+ * 设置页 / 网页共享页）。网页共享页要确认共享仍在跑——期间被停掉就回设备页。 */
+void return_from_recv(void)
+{
+    int p = recv_back;
+    recv_back = PAGE_DEVICES;
+    goto_devices();                  /* 复位传输态与设备页焦点 */
+    switch (p) {
+    case PAGE_WEB:
+        if (api_web_mode() != WEB_MODE_NONE) g_app.page = PAGE_WEB;
+        break;
+    case PAGE_SETTINGS:
+        settings_open();             /* 重进设置页：焦点回首项 + 恢复字体预读 */
+        g_app.page = PAGE_SETTINGS;
+        break;
+    case PAGE_FILES:
+        g_app.page = PAGE_FILES;
+        break;
+    default:
+        break;                       /* 设备页：goto_devices 已经落在这里 */
+    }
 }
 
 /* 若 Accept 因没勾选任何文件而不可用，别把焦点停在它上面 */
@@ -788,6 +812,7 @@ static void open_recv_request(const RecvPending *rp)
      * page_settings_input 里收）。不收尾的话预读线程与"另外两份 CJK"的 ~33MB
      * 会一直留在页外。不在设置页时该调用是空操作。 */
     ui_font_preload_end();
+    recv_back = g_app.page;             /* 问"从哪儿来"：收尾时回到这一页 */
     g_app.page = PAGE_RECV_CONFIRM;
 }
 
@@ -828,6 +853,8 @@ void pages_tick(void)
     case PAGE_DEVICES:
     case PAGE_FILES:
     case PAGE_SETTINGS:
+    case PAGE_WEB:          /* 网页共享页：浏览器上传也要能弹确认页（此前被这里
+                             * 挡住，用户必须先退出共享页才看得到请求） */
         break;
     default:
         return;                              /* 发送等待/接收流程/传输中不打断 */

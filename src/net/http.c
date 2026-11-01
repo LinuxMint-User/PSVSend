@@ -996,6 +996,7 @@ static void h_prepare(HttpReq *r)
     char body[HTTP_MAX_PREPARE];
     char resp[HTTP_MAX_PREPARE];
     int got = r->llen;                   /* body 已随头读齐 */
+    int via_web = 0;
     if (got > (int)sizeof body - 1) got = (int)sizeof body - 1;
     memcpy(body, r->left, (unsigned)got);
     body[got] = 0;
@@ -1029,6 +1030,7 @@ static void h_prepare(HttpReq *r)
                 http_respond(r->cn, wc, reason_of(wc), "");
                 return;
             }
+            via_web = 1;                 /* 停共享时这份请求要跟着作废 */
             {
                 char ua[192] = "";
                 hdr_copy(r->buf, r->he, "user-agent", ua, sizeof ua);
@@ -1042,7 +1044,8 @@ static void h_prepare(HttpReq *r)
     }
     {
         int code = g_recv->prepare(body, r->ip, r->cn->peer_fp,
-                                   (const HttpPeer *)r->cn, resp, (int)sizeof resp);
+                                   (const HttpPeer *)r->cn, via_web,
+                                   resp, (int)sizeof resp);
         dlog("http: prepare -> %d (tls=%d)", code, r->cn->tls);
         http_respond(r->cn, code, reason_of(code), resp);
     }

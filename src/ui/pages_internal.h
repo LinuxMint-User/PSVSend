@@ -174,6 +174,7 @@ void enter_dir(const char *name);   /* pages_send.c：进入子目录并重载�
 void parent_dir(void);              /* pages_send.c：回上级目录（根则退回设备页） */
 void pane_focus_default(void);      /* pages_send.c：按已选文件数定主页焦点栏（有文件→设备栏） */
 void goto_devices(void);            /* pages_progress.c：回设备页并复位传输态（接收收尾/离开进度页用） */
+void return_from_recv(void);        /* pages_recv.c：接收流程收尾，回到弹确认页之前的页 */
 void spd_reset(void);               /* pages_progress.c：新传输起点作废上一笔的速度采样 */
 void open_dir_pick(PageId origin, bool persist, const char *start_dir); /* pages_settings.c */
 void open_color_pick(void);         /* pages_settings.c：进自定义色盘页（实时预览、确认落盘） */

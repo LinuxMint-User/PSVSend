@@ -124,6 +124,11 @@ static struct {
 } g_sess;
 
 static int  g_phase = PH_NONE;      /* 当前生命周期 */
+/* 本次请求/会话是否来自"网页共享"（prepare 的 query 带了有效 PIN）。只用于
+ * 停止共享时把网页侧的待决定请求拒掉、进行中的上传中止；普通 LocalSend 发送方
+ * 不带 PIN，永远为 0，不受此影响。 */
+static int  g_pend_web = 0;
+static int  g_sess_web = 0;
 /* recv_clear 撞上"还有 worker 在收体"时不能当场清场：会删掉别人正在写的临时
  * 文件，且复位 phase 后新 prepare 立刻覆盖 g_sess，而旧 worker 仍持有指向
  * g_sess.f[i] 的指针。只能置中止位，等最后一个 worker 收尾时补做——否则
@@ -728,6 +733,22 @@ void recv_abort(void)
     unlock();
 }
 
+/* 停止网页共享时调用：网页侧的待决定请求按"拒绝"立刻收尾（等决定的 prepare
+ * 线程 50ms 内返回 403，浏览器看到失败），已接受的网页上传会话中止。
+ * 普通 LocalSend 发送方（prepare 不带 PIN）不受影响。 */
+void recv_cancel_web(void)
+{
+    int abort_now = 0;
+    lock();
+    if (g_phase == PH_PENDING && g_pend_web && g_pend_result == 0)
+        g_pend_result = 2;                  /* 走拒绝分支：清占位、回 403 */
+    else if (g_phase == PH_ACTIVE && g_sess_web)
+        abort_now = 1;
+    unlock();
+    if (abort_now)
+        recv_abort();
+}
+
 /* http 层收体轮询用：有未决的"用户中止"请求就尽快收尾（无锁读 volatile） */
 static bool recv_abort_pending(void)
 {
@@ -736,7 +757,8 @@ static bool recv_abort_pending(void)
 
 /* prepare-upload：解析 → 挂起等 UI（≤60s）→ 回 HTTP 码并填 resp（200 时 JSON） */
 static int recv_http_prepare(const char *body, const char *ip, const char *peer_fp,
-                             const HttpPeer *peer, char *resp, int respsz)
+                             const HttpPeer *peer, int via_web,
+                             char *resp, int respsz)
 {
     const char *infov, *filesv, *p;
     JsonIter it;
@@ -775,6 +797,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
         return 409;
     }
     g_phase = PH_PENDING;                    /* 先占位：锁内的并发 prepare 409 */
+    g_pend_web = via_web ? 1 : 0;            /* 网页 PIN 来的请求：停共享时跟着作废 */
     my_gen = ++g_gen;                        /* 本次占位的身份（见 g_gen） */
     g_peer_gone_evt = 0;                     /* 上一份的"对方取消"标志不得串到本份 */
     g_pend.alias[0] = 0;
@@ -901,6 +924,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
         SceOff tot = 0;
         memset(&g_sess, 0, sizeof g_sess);
         g_phase = PH_ACTIVE;
+        g_sess_web = g_pend_web;
         g_pend_hold = 0;
         gen_hex(g_sess.session, 16);         /* 32 hex */
         snprintf(g_sess.peer_ip, sizeof g_sess.peer_ip, "%s", g_pend.ip);

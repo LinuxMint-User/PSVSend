@@ -444,6 +444,8 @@ void api_web_start_download(const WebEntry *files, int n)
     web_start_download(files, n);
 }
 void api_web_start_upload(void) { web_start_upload(); }
-void api_web_stop(void)         { web_stop(); }
+/* 停共享：除了清网页会话，还要把"浏览器发起的待决定/进行中上传"一起作废，
+ * 否则退出网页页后确认页仍能接受文件（上传走的是 receive 模块，不看网页模式）。 */
+void api_web_stop(void)         { web_stop(); recv_cancel_web(); }
 int  api_web_mode(void)         { return web_mode(); }
 void api_web_snapshot(WebSnap *out) { web_snapshot(out); }

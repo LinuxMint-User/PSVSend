@@ -355,7 +355,11 @@ void page_progress_render(void)
 /* 离开进度页：接收方向先清场（终态/取消后让后端回空闲，不然一直占着会话） */
 static void progress_leave(void)
 {
-    if (g_app.prog_dir == 1) api_recv_clear();
+    if (g_app.prog_dir == 1) {
+        api_recv_clear();
+        return_from_recv();      /* 从哪来回哪去（设备/文件/设置/网页共享） */
+        return;
+    }
     goto_devices();
 }
 
