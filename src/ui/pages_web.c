@@ -17,6 +17,7 @@
 #include "ui/theme.h"
 #include "core/i18n.h"
 #include "app/api.h"
+#include "qrcodegen/qrcodegen.h"
 
 #define WID_WEB_MODE0   0xB001      /* 选择态第一行：分享已选文件 */
 #define WID_WEB_MODE1   0xB002      /* 选择态第二行：网页接收 */
@@ -206,12 +207,76 @@ static void draw_stop_button(void)
            theme->text_dim, "%s", tr("Hold to stop"));
 }
 
+/* ---------- 扫码入口（运行页右半区） ----------
+ * 内容 = http://<IP>:<端口>/?pin=1234，浏览器打开时自动填 PIN 并进入，
+ * 省掉在手机上敲 IP 与 4 位数字。只在本机联网、共享运行且 PIN 已生成时画；
+ * IP / 端口 / PIN 任一变化（每次开分享 PIN 都会换）就重新编码。 */
+#define QR_MODULE   7               /* 每个模块的像素边长（整数，避免点阵糊） */
+#define QR_QUIET    4               /* 静区模块数（标准要求 ≥4） */
+#define QR_CX       686             /* 右半区中心 x（左列按钮/文案到 ~460 为止） */
+#define QR_LABEL_GAP 14             /* 码与"扫码打开"的间距 */
+#define QR_WHITE    0xFFFFFFFFu
+#define QR_BLACK    0xFF000000u
+
+static char    qr_text[72];
+static uint8_t qr_tmp[qrcodegen_BUFFER_LEN_MAX];
+static uint8_t qr_code[qrcodegen_BUFFER_LEN_MAX];
+static int     qr_size;             /* 0 = 当前没有可画的码 */
+static int     qr_px_left;          /* 码区左边界（0=没画）：连接来源文本不得越界 */
+
+static void qr_update(const WebSnap *s)
+{
+    char want[sizeof qr_text];
+
+    if (!s->ip[0] || s->port <= 0 || !s->pin[0]) {
+        qr_size = 0;
+        qr_px_left = 0;
+        qr_text[0] = 0;
+        return;
+    }
+    snprintf(want, sizeof want, "http://%s:%d/?pin=%s", s->ip, s->port, s->pin);
+    if (qr_size > 0 && strcmp(want, qr_text) == 0) return;
+    snprintf(qr_text, sizeof qr_text, "%s", want);
+    qr_size = qrcodegen_encodeText(qr_text, qr_tmp, qr_code,
+                                   qrcodegen_Ecc_MEDIUM, 1, 10,
+                                   qrcodegen_Mask_AUTO, true)
+            ? qrcodegen_getSize(qr_code) : 0;
+}
+
+static void draw_qr(void)
+{
+    int side, x0, y0, x, y;
+    int tw = 0;
+
+    if (qr_size <= 0) return;
+    side = (qr_size + QR_QUIET * 2) * QR_MODULE;
+    x0   = QR_CX - side / 2;
+    /* 码 + 下方标签作为一整块在卡片里垂直居中 */
+    y0   = LIST_TOP + (LIST_BOTTOM - LIST_TOP
+                       - (side + QR_LABEL_GAP + w_font_px(0.75f))) / 2;
+    qr_px_left = x0;
+    /* 深色主题下给白底加一圈边，避免白块直接糊在卡片上 */
+    w_rect((Rect){ x0 - 2, y0 - 2, side + 4, side + 4 }, theme->border);
+    w_rect((Rect){ x0, y0, side, side }, QR_WHITE);
+    for (y = 0; y < qr_size; y++)
+        for (x = 0; x < qr_size; x++)
+            if (qrcodegen_getModule(qr_code, x, y))
+                vita2d_draw_rectangle(x0 + (x + QR_QUIET) * QR_MODULE,
+                                      y0 + (y + QR_QUIET) * QR_MODULE,
+                                      QR_MODULE, QR_MODULE, QR_BLACK);
+    w_text_w(0.75f, tr("Scan to open"), &tw, NULL);
+    w_text(QR_CX - tw / 2.0f, y0 + side + QR_LABEL_GAP, 0.75f, theme->text_dim,
+           "%s", tr("Scan to open"));
+}
+
 static void render_running(const WebSnap *s)
 {
     Rect card = { 24, LIST_TOP, SCR_W - 48, LIST_BOTTOM - LIST_TOP };
     char buf[192];
 
     w_rect(card, theme->card);
+    qr_update(s);
+    draw_qr();
 
     /* 网关地址：浏览器要打开的就是这一行 */
     w_text(48, 96, 0.9f, theme->text_dim, "%s", tr("Open in a browser"));
@@ -240,6 +305,9 @@ static void render_running(const WebSnap *s)
         int i, n = s->client_count;
         int maxw = WEB_CARD_R - WEB_CLIENT_X - 24;
         if (n > WEB_CLIENT_MAX) n = WEB_CLIENT_MAX;
+        /* 来源行与右侧二维码的纵向区间重叠，有码时右边界收到码区左侧 */
+        if (qr_px_left > 0 && qr_px_left - 16 - WEB_CLIENT_X < maxw)
+            maxw = qr_px_left - 16 - WEB_CLIENT_X;
         for (i = 0; i < n; i++) {
             char line[64];
             int off = snprintf(line, sizeof line, "%s%s%s", s->clients[i].ip,

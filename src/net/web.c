@@ -732,6 +732,13 @@ void web_download_end(int gen)
 "document.documentElement.lang=L;var sel=$('lang');sel.value=L;" \
 "sel.onchange=function(){var u=new URL(location.href);u.searchParams.set('lang',sel.value);" \
 "location.href=u.toString();};" \
+/* 扫码入口带 ?pin=xxxx：读完立刻从地址栏抹掉（避免留在历史记录），
+ * 只在恰好 4 位数字时生效，否则按普通打开处理。 */ \
+"var QP=(function(){try{return new URLSearchParams(location.search);}catch(e){return null;}})();" \
+"function qpin(){var p='';try{p=(QP&&QP.get('pin'))||'';}catch(e){}" \
+"p=p.replace(/\\D/g,'');return p.length===4?p:'';}" \
+"function stripPin(){try{if(!QP||!QP.has('pin'))return;var u=new URL(location.href);" \
+"u.searchParams.delete('pin');history.replaceState(null,'',u.toString());}catch(e){}}" \
 "function beat(){var s='';try{s=sessionStorage.getItem('psvsend_sid')||'';}catch(e){}" \
 "fetch('/heartbeat?sessionId='+encodeURIComponent(s)," \
 "{method:'POST',cache:'no-store'}).catch(function(){});}" \
@@ -762,7 +769,7 @@ void web_download_end(int gen)
 "$('sub').textContent=T0.d;$('pinLabel').textContent=T0.pin;$('go').textContent=T0.go;" \
 "$('filesTitle').textContent=T0.files;$('foot').textContent=T0.foot;" \
 "$('tip').textContent=T0.con;" \
-"if(sid)connect('');"
+"var qp=qpin();if(qp){$('pin').value=qp;stripPin();connect(qp);}else if(sid)connect('');"
 
 /* 上传面板的脚本：PIN → prepare-upload（等 PSV 确认）→ 逐文件 upload。
  * PIN 不落 sessionStorage、刷新必须重输：PIN 每次进页面重新生成，缓存旧值会让
@@ -798,7 +805,8 @@ void web_download_end(int gen)
 "sessionStorage.removeItem('psvsend_pin');" \
 "$('pinCard').style.display='none';$('upCard').style.display='';msg('');};" \
 "$('pin').onkeydown=function(e){if(e.key==='Enter')$('pinGo').click();};" \
-"$('send').onclick=send;"
+"$('send').onclick=send;" \
+"var qp=qpin();if(qp){$('pin').value=qp;stripPin();$('pinGo').click();}"
 
 #define HTML_DL_BODY \
 "<div class=\"card\" id=\"pinCard\"><label id=\"pinLabel\" for=\"pin\"></label>" \

@@ -80,6 +80,8 @@ add_executable(${PROJECT_NAME}
     third_party/quirc/decode.c
     third_party/quirc/identify.c
     third_party/quirc/version_db.c
+    # QR 编码（nayuki qrcodegen，MIT；网页共享页显示扫码入口用）
+    third_party/qrcodegen/qrcodegen.c
 )
 target_link_libraries(${PROJECT_NAME}
     mbedtls mbedx509 mbedcrypto
