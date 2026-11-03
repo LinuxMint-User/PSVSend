@@ -3,7 +3,7 @@
 > 2026-10-31 整理，2026-11-01 补扫码取景、界面手感与扫码转正三批。内容来自 PSVSend（PS Vita 上的 LocalSend v2 客户端）的真机调试记录，
 > 面向「在 Vita 上做联网 / 工具类应用」的场景。游戏向的建议见
 > [psv-game-dev-notes.md](psv-game-dev-notes.md)。
-> 每条结论尽量附实测数字，细节可查 [design.md](design.md) 与 README 的功能条目。
+> 每条结论尽量附实测数字，细节可查 [design.md](design.md) 与 [changelog.md](changelog.md) 的功能条目。
 
 ## 1. 平台限制先查，别照搬 PC 假设
 
