@@ -12,7 +12,7 @@
 | 领域 | 状态 | 关键实现 |
 |------|------|----------|
 | 发送 | 已落地 | UDP announce + 对方 register；`prepare-upload` / `upload`；HTTP / HTTPS（mTLS）；1-6 路并发；发送前可选 sha256 |
-| 接收 | 已落地 | 确认页勾选 / 改名 / 选目录；单端口双栈；三级流水；单文件失败隔离；可选 sha256 |
+| 接收 | 已落地 | 确认页勾选 / 改名 / 选目录；文件夹按相对路径还原（暂存根 + 独立线程最终化）；≤2048 文件 / 4MB 清单；单端口双栈；三级流水；单文件失败隔离；可选 sha256 |
 | 发现 | 已落地 | 收不了组播，靠对方 register + **△** 主动扫描 /24；历史 IP 优先；公告错峰 1s / 2s |
 | 安全 | 已落地 | 设备身份证书（mTLS）+ trust-first；发送等待页 / 接收确认页「验证」（文本 + 图标）；白名单 / 接收 PIN 暂缓 |
 | 网页共享 | 已落地 | 明文 HTTP 页 + 4 位 PIN；浏览器下载已选文件 / 上传到 PSV；单段 Range；运行页二维码 |
@@ -89,7 +89,8 @@ src/
 │   ├── web.c/h         # 网页共享：会话 / PIN / 心跳 + 内嵌网页资源（编译进固件）
 │   └── identity.c/h    # TLS 设备身份（自签证书，附 id_cert.inc / id_key.inc）
 ├── proto/         # LocalSend 协议会话
-│   ├── receive.c/h     # 接收方向：会话状态机 + 流式写盘 + 用户确认（含扫码拉取会话）
+│   ├── receive.c/h     # 接收方向：会话状态机 + 流式写盘 + 用户确认 + 暂存根最终化（含扫码拉取会话）
+│   ├── recv_path.c/h   # 接收路径：归一化 / 组件净化 / UTF-8 校验 / 预算 / `(k)` / 保留后缀（不依赖 VitaSDK）
 │   └── transfer.c/h    # 发送方向：prepare/upload 线程 + 进度回写 + 取消通知
 └── ui/            # 前端（事件驱动 + 状态机）
     ├── ui_main.c       # 主循环 / 页面机 / 输入与渲染帧
@@ -101,23 +102,10 @@ src/
 
 ### 4.2 核心数据结构
 
-```c
-// 设备表（发现线程维护，mutex 保护）
-typedef struct {
-    char ip[16]; int port;
-    char alias[64], fingerprint[64], protocol[8]; // http/https
-    uint32_t last_seen;      // 超时未更新移除（如 60s）
-} Device;
-
-// 会话（收发共用一套结构）
-typedef struct {
-    int  id;                 // sessionId
-    int  direction;          // INCOMING(收) / OUTGOING(发)
-    char peer_ip[16];
-    FileEntry files[];       // 每文件: fileId、token、name、size、已收字节、状态
-    int  state;              // AWAIT_CONFIRM → TRANSFERRING → DONE / CANCELLED
-} Session;
-```
+- **设备表**：`Device[]`（发现线程维护，mutex 保护），含 ip / port / alias / fingerprint / protocol / last_seen。
+- **接收**：`PendFile[]` / `RFile[]` 按清单实际数量动态分配（≤2048，勾选用 bitset）；每个目录型顶层一条 `SessRoot`（最终名 / 暂存根名 / 文件数）与 0 字节文件表。UI 只拿 `RecvPendingSummary` / `RecvStatusSummary` + **64 行窗口**，不整份拷贝。
+- **发送**：`XferFile[]`（`XFER_MAX_FILES` 仍为 64 条），进度由 `XferInfo` 锁内快照。
+- **状态**：`AWAIT_CONFIRM → TRANSFERRING → FINALIZING`（仅接收）`→ DONE / PARTIAL / CANCELLED / FAIL`。
 
 ### 4.3 线程模型
 
@@ -127,6 +115,7 @@ typedef struct {
 | 发现线程 | UDP recvfrom 循环 + 定时发 announce |
 | HTTP 服务器线程 | accept 循环，**每连接一个工作线程**（LocalSend 并行传多文件）；工作线程内先做 **TLS / 明文嗅探**（首字节 `0x16`），TLS 连接现场做服务端握手 |
 | 收体流水线线程（recv） | 每个 upload 起两条（对端给了 sha256 且设置项 `recvSha` 开时）或一条：生产者只做解密 / 攒块，**sha 线程**只算校验和，**写盘线程**只 `sceIoWrite`；3×64KB 轮转缓冲 + `sem_free`/`sem_sha`/`sem_job` 计数信号量，块逐级传递、sha 与写盘处理不同块（d180，三级流水） |
+| 最终化线程（recv，M2） | 全部文件到终态后置 `FINALIZING`，由独立线程**在锁外**补建 0 字节文件、逐根 `rename` 或合并（文件 `(k)`、目录合并、类型冲突跳过计数）；完成回锁置 DONE / PARTIAL / FAIL，失败保留暂存根等下次启动清扫 |
 | 发送线程（xfer） | `prepare-upload` 一条连接等对方决定；接受后起 N 个 worker 线程并发上传（N = config `maxParallel`，上限 6），join 完全部 worker 后**统一写一次终态**（见 [changelog.md](changelog.md)「实现细节」）。每个文件另起一条**读盘线程**，worker 本线程只做 `mbedtls_ssl_write`：2×32KB 轮转缓冲 + `sem_free`/`sem_full` 计数信号量，读满声明 size（或读失败）投 `len=0` 终止块（d182，读/发双缓冲流水） |
 | 预扫线程（xfer，d185） | `prepare-upload` 之前按文件顺序算 sha256（设置项 `sendSha` 默认开）：一条读盘线程 + xfer 线程自身做 `mbedtls_sha256_update`，缓冲结构与发送侧同一套（2×32KB 轮转）。每条线程各自跑满（读 9.7 / 哈希 8.8MiB/s），合流实测 8.41MiB/s |
 | 定时器（可并入发现线程） | 设备超时清理、announce 周期触发 |
@@ -136,27 +125,39 @@ typedef struct {
 ### 4.4 前后端契约（api.h）
 
 ```c
-// 前端 → 后端
-void api_start(void);                        // 初始化网络 + 启动各线程
-const Device *api_device_list(int *count);   // 在线设备
-int  api_send_files(const char **paths, int n, const Device *target);
-int  api_accept_session(int session_id);
-int  api_reject_session(int session_id);
-int  api_cancel(int session_id);
+// 前端 → 后端（节选；完整契约见 src/app/api.h）
+// 发送
+int  api_send_start(const char *ip, int port, const char *proto, const char *fp,
+                    const XferFile *files, int n);
+void api_send_cancel(void);
+void api_send_info(XferInfo *out);
+// 接收：summary + 64 行窗口，不交全量数组
+int  api_recv_pending_summary(RecvPendingSummary *out);
+int  api_recv_pending_window(int base, int max, RecvPendingRow *out);
+int  api_recv_root_precheck(void);
+int  api_recv_set_root_action(int idx, int action, const char *new_name);
+void api_recv_decide(bool accept);
+int  api_recv_status_summary(RecvStatusSummary *out);
+int  api_recv_status_window(int base, int max, RecvStatusRow *out);
+void api_recv_abort(void);
+void api_recv_clear(void);
 
-// 后端 → 前端（回调，前端注册）
-void on_devices_changed(void);               // 刷新设备列表
-void on_incoming_request(const Session *s);  // 弹确认框
-void on_progress(const Session *s);          // 进度
-void on_session_done(const Session *s);      // 完成 / 失败
+// 后端 → 前端（回调只塞事件队列）
+void on_devices_changed(void);
+void on_incoming_request(void);
+void on_progress(void);
+void on_session_done(void);
 ```
 
 ### 4.5 HTTP 服务器要点
 
 - 路由：`/api/localsend/v2/register`、`prepare-upload`、`upload`、`cancel`、`info`
 - `prepare-upload` → 生成 sessionId，为每文件分配 fileId + token，返回 `{sessionId, files:[{id, token, fileName, size}]}`；同时向 UI 抛"待确认"事件
-- `upload?sessionId&fileId&token` → 校验会话与 token 匹配 → 流式写盘（先临时名，完成后重命名；同名加序号避免覆盖）
-- 安全底线：只收"prepare 过"的 fileId+token，否则 400；拒绝时回 401/403
+- **prepare 清单体**：请求头仍读进 32KB 缓冲；声明了 `Content-Length` 时按它堆分配（**4MB 硬上限**，超 413；读短 / 超时 400），handler 返回后才 `free`；无 CL 保留旧的“32KB + 空窗判完”兼容路径。`chunked` 明确 411；同一时刻只允许一个 prepare 体，忙则 409。回执按文件数动态分配（1MB 上限，越界 507，绝不发半截 JSON）。拒绝原因合并成一次性事件，主页细条用危险色显示 8s
+- `upload?sessionId&fileId&token` → 校验会话与 token 匹配 → 流式写盘（平铺文件先写 `*.psvsend.tmp`，目录型文件写 `<顶层>.psvsend-part/<相对路径>.psvsend.tmp`，完成后 rename；同名加序号避免覆盖）。路径在 prepare 阶段按 `recv_path` 净化并做预算检查，非法 / 超长条目跳过计数
+- **数量上限**：单会话 ≤2048 文件（设置页 6 档，超过设置值但 ≤2048 时本次临时提升）；相对路径 ≤512 字节、单级 ≤191 字节、深度 ≤16、最终路径按 part 口径 ≤1023
+- **单文件失败隔离**：写盘 / 校验 / 落盘错误只标记该文件，全部到终态后会话收尾为 PARTIAL
+- **安全底线**：只收"prepare 过"的 fileId+token，否则 400；拒绝时回 401/403
 - **单端口双栈**：工作线程先 `sceNetRecv(fd,p,1,0)` 读首字节，`0x16` → mbedTLS 服务端握手（失败即关连接），否则把该字节塞回 `Conn.p` 按明文 HTTP 解析（`conn_read` 先吐缓存，不丢包）。端口候选与 announce 不变，`protocol` 改声明 `https`
 - **服务端身份与信任**：出示 per-device 自签 RSA-2048 设备证书（§3），`VERIFY_OPTIONAL` + 空 CA；`srv_verify` 只把对端证书 SHA-256 记到 `Conn.peer_fp`，不中断握手（trust-first，白名单 / 验证码的判定点就留在这里）。身份解析全局缓存一次 + 启动预热，**握手路径内不写 dlog**（同步写盘几十毫秒，会挤爆官方 register 的 500ms 预算）
 - **吞吐**：收体走三级流水（解密 / sha256 / 写盘各一条线程，§4.3），实测 **5.21MiB/s**（148.6MB / 27.2s）；瓶颈是 socket 收 + TLS 解密本身（等价 ~5.58MiB/s）。发送方向走读/发双缓冲流水（d182，§4.3），实测 **4.66MiB/s**（148.6MB / 30.4s，发送体 28.8s = 4.92MiB/s），已达**裸 TCP 上行标定上限**（d181 专项测试：上行 4.72~4.85、下行 5.43~5.54MiB/s，socket 缓冲已最优、调大反而更慢）。两端都到顶（标定方法见 §4.3 / d181 专项测试：裸 TCP 双向灌流）
@@ -205,10 +206,10 @@ void on_session_done(const Session *s);      // 完成 / 失败
 | 设备列表（主） | 两栏：在线设备（别名、类型）+ 已选文件清单，左右位置可互换（设置项「布局」）；页头下细条 = **当前光标项的完整标识**（设备栏 = `proto://ip:port`，文件栏 = 完整路径）；**扫描进度 / 结果显示在设备栏标题行右侧**；细条空闲时（无身份生成、无临时警告、无选中项、非扫描中）**轮播 5 条操作 tips**（扫码入口开启时 6 条；8 秒一条，d241/d242）；页头四按钮平时只画图标，**按住 R 时活塞式展开为文字**（d238-d240，d242 扩到四个） | 上下选条目、左右切栏、方框选文件、确认发送、**设备栏**三角短按扫描、**文件栏**三角**长按 700ms**（图标外画蓄力环）清空全部；**触摸**：点设备行即发、点文件行移选中、行尾 ✕ 移除、页头右上角「扫码 / 网页共享 / 扫描 / 设置」按钮 |
 | 文件浏览 | ux0: 目录树，多选文件；**首行固定 `..`**（= 上一级） | 进入 / 勾选；**触摸**：点目录行进目录、点文件行勾选、点 `..` 回上级、右下「完成」按钮 |
 | 发送等待 | 目标设备 + 文件数 / 总大小；等接收方接受，被拒或失败**就地报错**（不跳进度页） | 取消 / 完成后返回 |
-| 接收请求确认 | 来者名字/平台 + 文件数 + 预览（含取消态） | 接受 / 设置 / 拒绝；发送方取消 → 单个关闭 |
-| 接收设置 | 本次保存目录（可点进目录选择器改本次）+ 逐文件改名（系统键盘 SceIme）/勾选跳过 | 方向键选行、确认勾选、返回继续；**触摸**：点行切勾选、点文件名行改名、页头右上角「返回」 |
-| 传输进度 | 会话列表（逐文件行 + 细进度条）+ 总进度条（**颜色随终态**：运行中 / 成功 = 主色、部分失败 = 警示色、取消 / 整体失败 = 危险色；填充恒为"已传 / 声明总大小"）+ 高级面板（三角展开：文件计数 / 耗时 / 速度） | 上下滚动列表、三角展开高级面板、取消（结束后变返回） |
-| 设置 | **顶部「关于」单行**（版本 + 构建号 + 适配说明 + 仓库，d234 起置顶，此前在底部且无焦点进不去）、主题、主色（色盘，**仅主题 = 自定义时显示**）、外观（深色/浅色）、布局（两栏左右互换）、**并发上传数**（1-6，默认 3，1 = 退回逐文件串行）、界面语言（跟随系统 / English / 简体中文 / 繁中（台灣）/ 繁中（香港）/ 日本語）、确认键布局、主机名（系统键盘改设备名）、保存目录、检查更新/自动频率、扫码（主页入口开关，d242）、实验（实验室） | 上下选行；**值行**点整行（或焦点行按确认）→ 右侧滑出**选项面板**（↑↓ 选档、确认应用且面板不收起、✗ 或点面板外关掉不应用），**动作行**点了直接执行；进入时焦点落在首项并滚回顶部；**触摸**：点行执行 / 开面板、页头右上角「返回」。子页——**主色色盘**（右下「保存」= 落盘、页头「返回」= 取消）、**目录选择器**（首行 `..` 回上级、右下「存到此处」、页头「返回」） |
+| 接收请求确认 | 来者名字/平台 + 文件数 + 总大小 + 预览（含取消态）；顶层目录与文件重名时问 **Merge / Rename / Skip**，嵌套被文件挡住时问 **Rename 顶层 / Skip / 返回** | 接受 / 设置 / 拒绝；发送方取消 → 单个关闭；冲突对话框打开期间暂停 60s 决定窗口 |
+| 接收设置 | 本次保存目录（可点进目录选择器改本次）+ 文件列表（**64 行窗口**，全局下标，支持 2048 条滚动）+ 逐文件改名（系统键盘 SceIme）/勾选跳过 | 方向键选行、确认勾选、返回继续；**触摸**：点行切勾选、点文件名行改名、页头右上角「返回」 |
+| 传输进度 | 会话列表（逐文件行 + 细进度条，接收侧 64 行窗口每帧刷新）+ 总进度条（**颜色随终态**：运行中 / 成功 = 主色、部分失败 = 警示色、取消 / 整体失败 = 危险色；填充恒为"已传 / 声明总大小"）+ 高级面板（三角展开：文件计数 / 耗时 / 速度）；接收收完显示「正在整理…」 | 上下滚动列表、三角展开高级面板、取消（结束后变返回）；**整理中不可取消 / 离开** |
+| 设置 | **顶部「关于」单行**（版本 + 构建号 + 适配说明 + 仓库，d234 起置顶，此前在底部且无焦点进不去）、主题、主色（色盘，**仅主题 = 自定义时显示**）、外观（深色/浅色）、布局（两栏左右互换）、**并发上传数**（1-6，默认 3，1 = 退回逐文件串行）、**接收文件上限**（64/128/256/512/1024/2048）、界面语言（跟随系统 / English / 简体中文 / 繁中（台灣）/ 繁中（香港）/ 日本語）、确认键布局、主机名（系统键盘改设备名）、保存目录、检查更新/自动频率、扫码（主页入口开关，d242）、实验（实验室） | 上下选行；**值行**点整行（或焦点行按确认）→ 右侧滑出**选项面板**（↑↓ 选档、确认应用且面板不收起、✗ 或点面板外关掉不应用），**动作行**点了直接执行；进入时焦点落在首项并滚回顶部；**触摸**：点行执行 / 开面板、页头右上角「返回」。子页——**主色色盘**（右下「保存」= 落盘、页头「返回」= 取消）、**目录选择器**（首行 `..` 回上级、右下「存到此处」、页头「返回」） |
 | 扫码取景 | 主页**肩键 L** 或页头**扫码按钮**进入（`设置 › 操作 › 扫码` 可整体关掉）；取景态只显示相机预览 + 底部摘要；**按住 R 解码**（松手回到纯预览）；多个码时冻结画面进入**多码选择**（按包围盒中心四向切换、±45° 方向锥过滤，页脚四臂按几何亮灭）；选中后进**链接详情**（URL / PIN / 主机），确认即起拉取会话 | 取景：按住 R 扫描、✗ 回主页；多码选择：方向键选、确认查看、✗ 回取景；详情：确认 → `prepare-download` → 原接收确认页 → 下载，✗ 回多码 / 取景 |
 | 网页共享 | **选择态**：本次将分享的文件清单（下载模式）/ 提示浏览器可上传（上传模式）；**运行态**：URL、4 位 PIN、模式、会话数、连接来源（IP + 浏览器，最多 4 行）+ 圆形长按按钮（外环 / 蓄力弧 / 实心圆） | 选择态：确认开始分享、✗ 返回；运行态：**按住圆形按钮或返回键 0.7 秒**停止共享（短按无效），触摸按住同样显示蓄力；页脚有提示被隐藏时显示 `R 更多提示`，按住 R 展开第二行 |
 
@@ -294,6 +295,8 @@ void on_session_done(const Session *s);      // 完成 / 失败
 ├── env.sh                      # 随仓库分发
 ├── build.sh                    # 随仓库分发：一键构建脚本
 ├── .github/workflows/          # 随仓库分发：CI 构建 + Release 草稿发布
+├── tests/                      # 随仓库分发：主机侧纯逻辑单测（独立 CMake 工程，本地手动跑）
+├── scripts/                    # 随仓库分发：fake-send.py 等开发脚本
 ├── src/                        # 随仓库分发：源码（按依赖域分子目录，include 以 src/ 为根）
 │   ├── main.c                  # 入口：启动后端 + UI
 │   ├── app/                    # 装配层：api.c/h（前后端契约：启动 / 网络巡检 / 设备快照）、update.c/h（更新检查）
@@ -304,6 +307,7 @@ void on_session_done(const Session *s);      // 完成 / 失败
 │   │                           #             web（网页共享会话与网页资源）
 │   │                           #             identity（TLS 设备身份，含 id_cert.inc / id_key.inc）
 │   ├── proto/                  # LocalSend 协议会话：transfer（发送）/ receive（接收；含扫码拉取会话）
+│   │                           #             recv_path（接收路径净化与预算，不依赖 VitaSDK）
 │   └── ui/                     # vita2d 界面（两栏主页 / 文件浏览 / 发送等待 / 接收确认与设置 / 传输进度 / 网页共享 / 扫码取景 / 设置 / 实验室）
 ├── sce_sys/                    # 随仓库分发：LiveArea 素材
 │   ├── icon0.png
@@ -366,7 +370,7 @@ src/ui/
 
 ## 6. 配置与存储
 
-- `ux0:data/psvsend/config`（JSON，键为驼峰）：alias（设备名）、fingerprint（随机身份串）、port、theme（0=Yaru / 1=OLED / 2=自定义）、lightMode（0=深色 / 1=浅色）、customH / customS / customV（自定义主色 HSV，h 0-359 / s 0-100 / v 0-100，默认 210/65/90；缺字段回默认、越界回默认）、confirmLayout（0=美式 / 1=日式）、paneSwap（主页两栏左右位置：0=设备在左默认 / 1=文件在左）、maxParallel（发送侧并发上传数 1-6，默认 3；越界回默认，1 = 逐文件串行）、sendSha（发送前算 sha256 并随 prepare 发出，0/1，默认 1）、recvSha（接收时校验对方 sha256，0/1，默认 1）、lang（0=跟随系统 / 1=English / 2=简体中文 / 3=繁中（台灣）/ 4=繁中（香港）/ 5=日本語；AUTO 由系统语言映射，系统繁体默认台灣）、knownIps（历史在线设备 IP，逗号分隔、LRU、上限 24，主动扫描种子）、updateAuto（更新检查：0=关 / 1=每天 / 2=每周默认 / 3=每月）、updateLast（上次检查更新的网络 unix 秒，自动节流）、saveDir（默认接收目录，默认 `ux0:data/psvsend/downloads`；读回去尾斜杠、非法回退默认）
+- `ux0:data/psvsend/config`（JSON，键为驼峰）：alias（设备名）、fingerprint（随机身份串）、port、theme（0=Yaru / 1=OLED / 2=自定义）、lightMode（0=深色 / 1=浅色）、customH / customS / customV（自定义主色 HSV，h 0-359 / s 0-100 / v 0-100，默认 210/65/90；缺字段回默认、越界回默认）、confirmLayout（0=美式 / 1=日式）、paneSwap（主页两栏左右位置：0=设备在左默认 / 1=文件在左）、maxParallel（发送侧并发上传数 1-6，默认 3；越界回默认，1 = 逐文件串行）、sendSha（发送前算 sha256 并随 prepare 发出，0/1，默认 1）、recvSha（接收时校验对方 sha256，0/1，默认 1）、recv_files_limit（接收文件上限档位 64/128/256/512/1024/2048，默认 64；越界回默认；超出设置值但 ≤2048 时本次临时提升，不改设置）、lang（0=跟随系统 / 1=English / 2=简体中文 / 3=繁中（台灣）/ 4=繁中（香港）/ 5=日本語；AUTO 由系统语言映射，系统繁体默认台灣）、knownIps（历史在线设备 IP，逗号分隔、LRU、上限 24，主动扫描种子）、updateAuto（更新检查：0=关 / 1=每天 / 2=每周默认 / 3=每月）、updateLast（上次检查更新的网络 unix 秒，自动节流）、saveDir（默认接收目录，默认 `ux0:data/psvsend/downloads`；读回去尾斜杠、非法回退默认）
 - `ux0:data/psvsend/downloads/`：接收文件的默认目录（config `saveDir` 可改；设置页持久改、接收 Setup 临时改本次）
 - 首次启动 `sceIoMkdir` 幂等创建（已存在返回 0x80410011，忽略）
 
@@ -374,7 +378,8 @@ src/ui/
 
 - **构建**：`./build.sh`（VitaSDK + 依赖安装见 [building.md](building.md)）；产物 `build/psvsend.vpk`。
 - **后端实现顺序**：见 §4.7；**前端实现顺序**：见 §5.7。
-- **伪发送端**：`scripts/fake-send.py` 可构造单文件校验失败、中途断流、跳过文件等场景，配合进度页 / 接收失败分级回归。
+- **伪发送端**：`scripts/fake-send.py` 可构造单文件校验失败、中途断流、跳过文件、嵌套 / 仅大小写不同 / 非法 / 超长 / 保留后缀布局（`--layout`），以及 2048 文件、2MB/4.1MB 清单、短 body、无 `Content-Length`、并发 prepare 等边界；配合确认页 / 进度页 / 失败分级回归。
+- **主机单测**：`cmake -S tests -B build-tests && cmake --build build-tests && ctest --test-dir build-tests --output-on-failure`（`recv_path` 纯逻辑，本地手动跑，不进 CI）。
 - **真机环境**：变革（HENkaku）3.65；其余固件未逐一验证。
 - **任务清单**：`docs/TODO.md`（本地维护，未入库）。
 

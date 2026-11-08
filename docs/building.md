@@ -52,3 +52,15 @@ cmake --build build
 ## 4. CI 构建
 
 不想本地构建？仓库已配置 GitHub Actions（[`.github/workflows/build-vpk.yml`](../.github/workflows/build-vpk.yml)），在官方 vitasdk Docker 镜像内自动构建：推送 `v*` tag 或在 Actions 页手动触发，VPK 会上传为 **Releases 草稿**（人工确认后公开）。直接到 [Releases](https://github.com/LinuxMint-User/PSVSend/releases) 下载即可。
+
+## 5. 主机单测（可选）
+
+接收路径逻辑（`src/proto/recv_path.c`）不依赖 VitaSDK，可在开发机上直接跑：
+
+```bash
+cmake -S tests -B build-tests
+cmake --build build-tests
+ctest --test-dir build-tests --output-on-failure
+```
+
+仅供本地回归，不接入 CI（推送前手动跑一遍即可）。

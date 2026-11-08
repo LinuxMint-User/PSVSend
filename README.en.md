@@ -21,6 +21,7 @@ A [LocalSend](https://localsend.org)-compatible client for the **PS Vita**. It t
 - **Device discovery**: UDP announce plus the peer's HTTP register. The Vita cannot receive multicast, so press **△** in the Devices pane to scan the /24 subnet; previously seen devices are probed first.
 - **Device identity verification**: a **Verify** button on the send-waiting and receive-confirmation pages shows the same 128-hex code as both text and a 4×4 icon grid; only available on encrypted connections.
 - **Receiving**: select files, rename each file, and choose a temporary save folder on the confirmation page; duplicate names get a `(k)` suffix; one failed file does not abort the rest.
+- **Folder receiving**: manifests with relative paths recreate the original hierarchy; same-name folders merge by default (rename / skip available) and nested conflicts can rename the top-level folder; each top-level folder is staged in `<name>.psvsend-part/` and renamed or merged when complete; staging folders left by a cancelled or killed transfer are cleaned up on the next start.
 - **Checksums and concurrency**: optional sha256 before sending / on receive; 1–6 concurrent uploads with per-file failure isolation.
 - **Web share**: a plain HTTP page on the PSV; enter a 4-digit PIN in a browser to download the selected files or upload files to the PSV. The run page shows a QR code that opens the page with the PIN pre-filled; up to 4 source devices are listed.
 - **QR scanning**: enter from the **L shoulder button** or the header **Scan** button, then hold **R** to scan a share QR code. If several codes are visible, the frame freezes and you pick one by position with the D-pad; the result reuses the receive confirmation page.
@@ -52,8 +53,9 @@ Detailed implementation history (build tags and design notes) is in [docs/change
 
 1. When a peer sends files, PSVSend opens the receive confirmation page with the sender, platform, file list, and total size.
 2. Focus starts on **Accept**: accept to let the peer start. **Setup** opens receive settings where you can uncheck files (unchecked files are skipped and omitted from the accept response). **Reject** returns 403.
-3. After accepting, the receive progress page shows per-file and total progress; you can cancel at any time.
-4. Files are saved to `ux0:data/psvsend/downloads/` by default (Settings › Save folder changes the default; Setup can change the folder for this transfer only). Data is written as it arrives (`.psvsend.tmp`, renamed when complete). Duplicate names get a `(k)` suffix instead of overwriting. A broken stream or checksum failure deletes the partial `.psvsend.tmp`; stale temp files from a previous crash are cleaned on the next start. If the peer provides sha256, it is verified by default (Settings › Verify on receive can disable it), in parallel with writing and without affecting throughput.
+3. If the incoming content collides with what is already in the save folder, you are asked how to proceed: **top-level folders** merge by default and can be renamed or skipped; **top-level files** can only be renamed or skipped; a **nested folder** blocked by a same-name file renames the top-level folder by default, and you can also skip it or go back.
+4. After accepting, the receive progress page shows per-file and total progress; you can cancel at any time. When the transfer finishes it briefly shows “Finalizing…” and cannot be cancelled during that phase.
+5. Files are saved to `ux0:data/psvsend/downloads/` by default (Settings › Save folder changes the default; Setup can change the folder for this transfer only). Data is written as it arrives and renamed when complete. Folders are first staged in `<name>.psvsend-part/`, then renamed as a whole or merged into an existing folder; duplicate names get a `(k)` suffix instead of overwriting. A broken stream or checksum failure deletes partial files; stale staging folders from a previous crash are cleaned on the next start. If the peer provides sha256, it is verified by default (Settings › Verify on receive can disable it), in parallel with writing and without affecting throughput.
 
 ### Web Share (browser transfers)
 
@@ -78,7 +80,8 @@ The receiver serves **HTTPS and plain HTTP on the same port** (the first byte `0
 ## Known Limitations
 
 - **Network**: IPv4 / protocol v2 only; the Vita cannot receive UDP multicast, so active scanning covers only the /24 subnet (non-standard /16 or /23 networks are not fully scanned).
-- **Sessions and capacity**: only one receive session at a time; up to 64 files and a 32 KB manifest per session; sending can only browse `ux0:/`; single file ≤ 4 GB − 1.
+- **Sessions and capacity**: only one receive session at a time; up to 2048 files and a 4 MB prepare manifest per session (Settings › Receive file limit offers 6 tiers; the limit is raised temporarily for the current request when needed); sending can only browse `ux0:/`; single file ≤ 4 GB − 1.
+- **Folders**: receiving only (the PS Vita cannot send folders); empty folders are not recreated (the protocol has no directory entries); folder names differing only in case are merged into one root (FAT is case-insensitive). Large flat batches (>64 files, each ≤256 KB) are written directly under the final name, so a hard kill during transfer may leave a partially written final-name file.
 - **Trust model**: trust-first; encryption protects against passive sniffing, not active MITM; identity verification is manual; fingerprint allow-lists / receive PIN are not implemented.
 - **Web Share**: shares only the files selected for this session; single-range `Range` only; no directory browsing / multi-range / packaged downloads; up to 4 source devices are listed.
 - **QR scanning**: only standard black-and-white QR codes and `http://host[:port]/?pin=NNNN`; overlapping or low-brightness codes have a low success rate.
