@@ -30,6 +30,7 @@ enum {
     SET_ITEM_PARALLEL,     /* 操作：并发上传数（发送侧同时上传的文件数 1-6） */
     SET_ITEM_SEND_SHA,     /* 操作：发送前计算 sha256（关掉即与旧版一致） */
     SET_ITEM_RECV_SHA,     /* 操作：接收时校验对端 sha256（关掉=兼容逃生舱） */
+    SET_ITEM_RECV_LIMIT,   /* 操作：接收文件上限（6 档） */
     SET_ITEM_QR,           /* 操作：主页扫码入口（页头按钮 + 肩键 L 提示） */
     SET_ITEM_HOSTNAME,     /* 设备：主机名（改名走系统键盘） */
     SET_ITEM_SAVEDIR,      /* 存储：默认保存目录（动作行：进目录选择器并落盘） */
@@ -58,6 +59,7 @@ enum {
     SET_SLOT_PARALLEL,
     SET_SLOT_SEND_SHA,     /* 操作：发送前计算 sha256 */
     SET_SLOT_RECV_SHA,     /* 操作：接收时校验 sha256（与发送项对称） */
+    SET_SLOT_RECV_LIMIT,   /* 操作：接收文件上限 */
     SET_SLOT_QR,           /* 操作：主页扫码入口 */
     SET_SLOT_HDR_ST,       /* 分组：存储 */
     SET_SLOT_SAVEDIR,
@@ -125,6 +127,7 @@ static int slot_item(int slot)
     case SET_SLOT_PARALLEL: return SET_ITEM_PARALLEL;
     case SET_SLOT_SEND_SHA: return SET_ITEM_SEND_SHA;
     case SET_SLOT_RECV_SHA: return SET_ITEM_RECV_SHA;
+    case SET_SLOT_RECV_LIMIT: return SET_ITEM_RECV_LIMIT;
     case SET_SLOT_QR:      return SET_ITEM_QR;
     case SET_SLOT_SAVEDIR: return SET_ITEM_SAVEDIR;
     case SET_SLOT_CHECK: return SET_ITEM_CHECK;
@@ -148,6 +151,7 @@ static int item_slot(int item)
     case SET_ITEM_PARALLEL: return SET_SLOT_PARALLEL;
     case SET_ITEM_SEND_SHA: return SET_SLOT_SEND_SHA;
     case SET_ITEM_RECV_SHA: return SET_SLOT_RECV_SHA;
+    case SET_ITEM_RECV_LIMIT: return SET_SLOT_RECV_LIMIT;
     case SET_ITEM_QR:       return SET_SLOT_QR;
     case SET_ITEM_CHECK:    return SET_SLOT_CHECK;
     case SET_ITEM_AUTO:     return SET_SLOT_AUTO;
@@ -236,6 +240,7 @@ static int set_opt_count(int item)
     case SET_ITEM_PARALLEL: return PARALLEL_MAX - PARALLEL_MIN + 1;
     case SET_ITEM_SEND_SHA: return 2;
     case SET_ITEM_RECV_SHA: return 2;
+    case SET_ITEM_RECV_LIMIT: return RECV_FILES_LIMIT_TIERS;
     case SET_ITEM_QR:       return 2;
     case SET_ITEM_AUTO:     return 4;
     }
@@ -271,6 +276,9 @@ static void set_opt_name(int item, int idx, char *buf, int n)
     case SET_ITEM_QR:
         snprintf(buf, n, "%s", tr(idx ? "On" : "Off"));
         break;
+    case SET_ITEM_RECV_LIMIT:
+        snprintf(buf, n, "%d", config_recv_limit_tiers[idx]);
+        break;
     case SET_ITEM_AUTO:
         snprintf(buf, n, "%s", tr(set_upd_mode[idx]));
         break;
@@ -292,6 +300,12 @@ static int set_opt_cur(int item)
     case SET_ITEM_PARALLEL: return g_cfg.max_parallel - PARALLEL_MIN;
     case SET_ITEM_SEND_SHA: return g_cfg.send_sha ? 1 : 0;
     case SET_ITEM_RECV_SHA: return g_cfg.recv_sha ? 1 : 0;
+    case SET_ITEM_RECV_LIMIT: {
+        int i;
+        for (i = 0; i < RECV_FILES_LIMIT_TIERS; i++)
+            if (config_recv_limit_tiers[i] == g_cfg.recv_files_limit) return i;
+        return 0;
+    }
     case SET_ITEM_QR:       return g_cfg.qr_scan ? 1 : 0;
     case SET_ITEM_AUTO:     return g_cfg.upd_auto;
     }
@@ -344,6 +358,10 @@ static void set_opt_apply(int item, int idx)
         /* 只影响后续接收（每个文件开收时读一次） */
         g_cfg.recv_sha = idx;
         config_save();
+        break;
+    case SET_ITEM_RECV_LIMIT:
+        /* 只影响后续接收（prepare 时读设置值；超出时本次临时提升） */
+        config_set_recv_files_limit(config_recv_limit_tiers[idx]);
         break;
     case SET_ITEM_QR:
         /* 立即生效：主页下次渲染即隐藏 / 显示页头按钮与页脚 L 提示 */
@@ -427,6 +445,7 @@ static const char *set_item_title(int item)
     case SET_ITEM_PARALLEL: return tr("Parallel uploads");
     case SET_ITEM_SEND_SHA: return tr("Send checksum");
     case SET_ITEM_RECV_SHA: return tr("Receive checksum");
+    case SET_ITEM_RECV_LIMIT: return tr("File limit");
     case SET_ITEM_QR:       return tr("QR scan");
     case SET_ITEM_AUTO:     return tr("Auto check");
     }
@@ -534,7 +553,7 @@ static void row_toggle(Rect r, const char *label, const char *value,
 void page_settings_render(void)
 {
     char theme_v[64], light_v[32], layout_v[96], lang_v[32], pane_v[32];
-    char par_v[32], sha_v[16], recv_v[16], qr_v[16];
+    char par_v[32], sha_v[16], recv_v[16], qr_v[16], rlim_v[16];
     char upd_v[64];
     int upd_st = update_state();
     int slot, shrink;
@@ -566,6 +585,7 @@ void page_settings_render(void)
     snprintf(par_v, sizeof par_v, "%d", g_cfg.max_parallel);
     snprintf(sha_v, sizeof sha_v, "%s", tr(g_cfg.send_sha ? "On" : "Off"));
     snprintf(recv_v, sizeof recv_v, "%s", tr(g_cfg.recv_sha ? "On" : "Off"));
+    snprintf(rlim_v, sizeof rlim_v, "%d", g_cfg.recv_files_limit);
     snprintf(qr_v, sizeof qr_v, "%s", tr(g_cfg.qr_scan ? "On" : "Off"));
     upd_v[0] = 0;
     switch (upd_st) {
@@ -693,6 +713,9 @@ void page_settings_render(void)
         case SET_ITEM_RECV_SHA:
             row_toggle(r, tr("Receive checksum"), recv_v,
                        tr("Off: write errors go undetected"), item == g_app.set_sel);
+            break;
+        case SET_ITEM_RECV_LIMIT:
+            w_row(r, tr("File limit"), rlim_v, item == g_app.set_sel);
             break;
         case SET_ITEM_QR:
             row_toggle(r, tr("QR scan"), qr_v,

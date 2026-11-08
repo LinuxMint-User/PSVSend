@@ -74,6 +74,12 @@ int  api_recv_pending_summary(RecvPendingSummary *out);
 int  api_recv_pending_window(int base, int max, RecvPendingRow *out);
 void api_recv_pending_toggle(int idx, bool on);
 void api_recv_pending_rename(int idx, const char *name);
+/* 顶层冲突（M5）：预检 → summary/window → 动作写回 */
+int  api_recv_root_precheck(void);
+int  api_recv_root_summary(RecvRootSummary *out);
+int  api_recv_root_window(int base, int max, RecvRootRow *out);
+int  api_recv_set_root_action(int idx, int action, const char *new_name);
+int  api_recv_set_root_name(int idx, const char *name);
 int  api_recv_status_summary(RecvStatusSummary *out);
 int  api_recv_status_window(int base, int max, RecvStatusRow *out);
 

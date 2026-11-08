@@ -78,6 +78,58 @@ typedef struct {
     unsigned char st;            /* 0=未完成 1=完成 3=失败 */
 } RecvStatusRow;
 
+/* ---- M5 顶层冲突解决 ----
+ * 顶层 = 相对路径的第一级：带 '/' 的是目录型顶层（整棵文件夹），不带的是
+ * 平铺文件。prepare 后 UI 调 recv_pending_root_precheck 让后端 stat 唯一顶层 /
+ * 嵌套目录路径，再按 summary + window 逐条展示；动作写回后
+ * build_session_locked 按解析结果组装，UI 不遍历全量文件。 */
+enum {
+    RECV_ROOT_ACT_NONE = 0,
+    RECV_ROOT_ACT_MERGE = 1,     /* 目录合并（目标不存在时等价整体改名） */
+    RECV_ROOT_ACT_RENAME = 2,    /* 顶层改名（所有路径跟着换新根） */
+    RECV_ROOT_ACT_SKIP = 3       /* 跳过整个顶层 */
+};
+enum {
+    RECV_ROOT_CF_NONE = 0,
+    RECV_ROOT_CF_DIR = 1,        /* 同名目录已存在：可 Merge */
+    RECV_ROOT_CF_OCCUPIED = 2,   /* 被同名文件占用 / 平铺文件已存在 */
+    RECV_ROOT_CF_NESTED = 3,     /* 目标目录存在，但内部有文件挡住子目录 */
+    RECV_ROOT_CF_RESERVED = 4    /* 顶层名以保留后缀结尾，必须改名/跳过 */
+};
+/* recv_set_root_action / recv_set_root_name 的返回码 */
+enum {
+    RECV_ROOT_OK = 0,
+    RECV_ROOT_E_INDEX = -1,
+    RECV_ROOT_E_STATE = -2,
+    RECV_ROOT_E_NAME = -3,       /* 空 / 斜杠 / . / .. / 保留后缀 / 超长 */
+    RECV_ROOT_E_DUP = -4,        /* 与本次其他顶层入站名重名 */
+    RECV_ROOT_E_DIR = -5,        /* 新名字已是目录：应再提示 Merge/Rename */
+    RECV_ROOT_E_OCCUPIED = -6,   /* 新名字已是文件：继续改名 */
+    RECV_ROOT_E_SAME = -7        /* 与原名相同：视为取消/返回 */
+};
+
+typedef struct {
+    int roots;        /* 顶层条目数 */
+    int conflicts;    /* 有冲突的顶层数 */
+    int nested;       /* 嵌套挡目录的唯一路径数 */
+    int merges;       /* 已选 Merge */
+    int skips;        /* 已选 Skip */
+    int dirs;         /* 目录型顶层数 */
+    int files;        /* 平铺文件顶层数 */
+    int unresolved;   /* 仍有冲突且动作未定 */
+} RecvRootSummary;
+
+typedef struct {
+    char name[RP_COMP_MAX + 1];  /* 原始顶层名 */
+    char rname[RP_COMP_MAX + 1]; /* 改名后的顶层名（空=原名） */
+    int  files;                  /* 归入该顶层的文件数 */
+    SceOff size;
+    unsigned char is_dir;
+    unsigned char conflict;      /* RECV_ROOT_CF_* */
+    unsigned char action;        /* RECV_ROOT_ACT_* */
+    int  nested;                 /* 该根下被文件挡住的子目录数 */
+} RecvRootRow;
+
 /* 接收会话状态（进度页/结束态展示） */
 typedef enum {
     RECV_ST_NONE = 0,    /* 无活动会话（UI 可回主页） */
@@ -103,6 +155,23 @@ int recv_pending_window(int base, int max, RecvPendingRow *out);
 void recv_pending_toggle(int idx, bool on);
 /* 确认页逐文件改名：只改最后一级文件名（空串=恢复原名） */
 void recv_pending_rename(int idx, const char *name);
+
+/* ---- M5 顶层冲突：预检 / 汇总 / 窗口 / 动作 ---- */
+/* stat 唯一顶层与嵌套目录路径（只在 PENDING 内、UI 接受前调用；幂等，保留已选
+ * 动作）。返回 1=已预检，0=没有待决定请求。 */
+int recv_pending_root_precheck(void);
+/* 顶层冲突汇总；返回 1=有（out 可 NULL 仅探测） */
+int recv_pending_root_summary(RecvRootSummary *out);
+/* 拷贝顶层 [base, base+max) 行；返回实际行数（按根的首次出现顺序） */
+int recv_pending_root_window(int base, int max, RecvRootRow *out);
+/* 写回顶层动作：merge/rename/skip；rename 时 new_name 为单级新名。
+ * 返回 RECV_ROOT_OK 或 RECV_ROOT_E_*（见上方枚举）。 */
+int recv_set_root_action(int idx, int action, const char *new_name);
+/* 顶层改名（= recv_set_root_action(idx, RECV_ROOT_ACT_RENAME, name)）。
+ * 返回 RECV_ROOT_E_DIR 表示新名已是目录（UI 再提示 Merge/Rename）；
+ * RECV_ROOT_E_OCCUPIED 表示已是文件（继续改名）；RECV_ROOT_E_SAME 表示
+ * 与原名相同（视为取消/返回）。 */
+int recv_set_root_name(int idx, const char *name);
 
 /* 会话汇总；返回 1=有会话（含终态） */
 int recv_status_summary(RecvStatusSummary *out);

@@ -40,9 +40,27 @@ static bool g_recv_peer_gone = false;/* 请求消失是因为发送方撤销（�
 static uint64_t g_recv_supp_ms = 0;  /* 决定后抑制重弹到：毫秒时间戳 */
 static PageId recv_back = PAGE_DEVICES; /* 弹确认页前所在的页（收尾回程目标） */
 
+/* M5 顶层冲突弹窗状态（状态机实现见下方"顶层冲突解决"段；变量提前声明，
+ * 是因为 recv_reject_close / recv_close 也要复位它）。 */
+enum { RC_NONE = 0, RC_PRECHECK, RC_ROOT, RC_NESTED, RC_RENAME };
+static int rc_phase = RC_NONE;
+static int rc_sel;
+static int rc_err;
+static int rc_cur_idx = -1;
+static bool rc_cur_nested;
+static bool rc_rename_nested;
+static char rc_try_name[192];
+static RecvRootSummary rc_sum;
+static RecvRootRow rc_cur;
+static void rc_render(void);
+static bool rc_input(const Input *in);
+
 /* 拒绝当前请求并离开接收流程（后端回 403，发送方会看到拒绝） */
 static void recv_reject_close(void)
 {
+    rc_phase = RC_NONE;
+    rc_cur_idx = -1;
+    api_recv_decide_hold(0);
     api_recv_clear();                /* PENDING → 唤醒 http 线程按拒绝处理 */
     g_recv_supp_ms = (uint64_t)sceKernelGetSystemTimeWide() / 1000 + 2000;
     rename_pop = false;
@@ -51,6 +69,9 @@ static void recv_reject_close(void)
 
 static void recv_close(void)
 {
+    rc_phase = RC_NONE;
+    rc_cur_idx = -1;
+    api_recv_decide_hold(0);
     rename_pop = false;
     return_from_recv();
 }
@@ -183,6 +204,21 @@ void page_recv_confirm_render(void)
         w_text_clip(48, 212 + warn * 20, 0.9f, theme->warn, line, lmax);
         warn++;
     }
+    /* 设置值被本次临时提升（不改设置本身） */
+    if (rs.eff_limit > rs.cfg_limit) {
+        snprintf(line, sizeof line,
+                 tr("Temporarily raised to %d files for this transfer"),
+                 rs.eff_limit);
+        w_text_clip(48, 212 + warn * 20, 0.9f, theme->warn, line, lmax);
+        warn++;
+    }
+    /* 实际文件数 >=1024：轻提示速度可能下降（不要按档位判断，否则设置成
+     * 2048 后连 2 个文件也会提示） */
+    if (rs.count >= 1024) {
+        w_text_clip(48, 212 + warn * 20, 0.9f, theme->text_dim,
+                    tr("Many files, transfer may be slower"), lmax);
+        warn++;
+    }
 
     /* 文件预览（前几条）：整块必须待在卡片里（卡片底 = card.y + card.h），
      * 提示行越多起点越低，所以按剩余高度收缩条数——否则"…还有 N 个"会被顶
@@ -283,15 +319,19 @@ void page_recv_confirm_render(void)
         segs[ns].key = HKEY_BACK;  segs[ns++].text = s_reject;
     }
     w_page_footer_segs(segs, ns);
+    rc_render();                    /* M5 冲突弹窗画在最上层（含自己的页脚） */
 }
 
 void page_recv_confirm_input(const Input *in)
 {
     if (in->drag_start || in->dragging) return;
     if (g_recv_expired) {           /* 请求已过期：任意键/点击关闭 */
+        rc_phase = RC_NONE;
+        api_recv_decide_hold(0);
         if (in->tap || in->confirm || in->back) recv_close();
         return;
     }
+    if (rc_input(in)) return;       /* 冲突弹窗打开：吞掉确认页输入 */
     if (in->tap || in->confirm || in->back || in->left || in->right)
         api_recv_decide_touch();   /* 人在操作：60s 窗口重开（含方向键） */
     if (in->tap) {
@@ -352,9 +392,314 @@ void page_recv_confirm_input(const Input *in)
     if (in->back) recv_reject_close();
 }
 
+/* 系统键盘挂起事务：设置页主机名、接收设置逐文件改名、顶层改名、发送等待页
+ * 输入 PIN 共用同一状态机（分属不同页面不会同时出现）。busy 供主循环据此跳过
+ * 页面按键/触摸。 */
+enum {
+    IME_TX_NONE = 0,
+    IME_TX_RENAME,     /* 接收设置：改 inc_files[ime_tx_fi] 的保存名 */
+    IME_TX_ROOT,       /* 确认页：改顶层冲突里的根目录名（ime_tx_fi=根下标） */
+    IME_TX_HOST,       /* 设置页：改本机设备名 alias（config） */
+    IME_TX_PIN,        /* 发送等待页：对方要求 PIN（回填给 transfer.c） */
+};
+static int  ime_tx = IME_TX_NONE;  /* 当前挂起/打开的事务（NONE=空闲） */
+static int  ime_tx_fi = -1;        /* RENAME/ROOT 的目标（HOST 不使用） */
+static char ime_out[192];          /* 键盘结果落点（须存活到 poll 结束，ime 异步写） */
+
+/* ================= 顶层冲突解决（M5） =================
+ * 状态机：P_PRECHECK（后端 stat 唯一顶层/嵌套目录）→ P_ROOT（顶层冲突逐条
+ * 解决）→ P_NESTED（嵌套挡目录）→ P_RENAME（系统键盘改名）。弹窗期间暂停
+ * 60s 决定窗口；对方撤销由 pages_tick 强制关闭。 */
+#define RC_BTN_ID(i) (0x30000 + (i))   /* 弹窗按钮触摸 id（避开确认页 0..3） */
+
+static void do_accept(void);
+static void rc_open_next(int start);
+
+static bool rc_load(int idx, RecvRootRow *out)
+{
+    return api_recv_root_window(idx, 1, out) == 1;
+}
+
+/* 顶层冲突弹窗的按钮数：同名目录 = Merge/Rename/Skip，其余 = Rename/Skip */
+static int rc_root_btns(const RecvRootRow *r)
+{
+    if (r->is_dir && r->conflict == RECV_ROOT_CF_DIR) return 3;
+    return 2;
+}
+
+static const char *rc_root_label(const RecvRootRow *r, int i)
+{
+    if (r->is_dir && r->conflict == RECV_ROOT_CF_DIR) {
+        if (i == 0) return tr("Merge");
+        if (i == 1) return tr("Rename");
+        return tr("Skip");
+    }
+    return i == 0 ? tr("Rename") : tr("Skip");
+}
+
+static const char *rc_btn_label(int i)
+{
+    if (rc_phase == RC_ROOT) return rc_root_label(&rc_cur, i);
+    return i == 0 ? tr("Rename") : tr("Skip");
+}
+
+/* 关闭冲突流程，回到确认页（不自动接受） */
+static void rc_cancel_flow(void)
+{
+    rc_phase = RC_NONE;
+    rc_cur_idx = -1;
+    rc_err = 0;
+    rc_sel = 0;
+    api_recv_decide_hold(0);
+}
+
+static void rc_apply_action(int idx, int action)
+{
+    api_recv_set_root_action(idx, action, NULL);
+    rc_open_next(0);
+}
+
+/* 从 start 起找下一个未决冲突：先顶层冲突，再嵌套挡目录；都没有就接受。 */
+static void rc_open_next(int start)
+{
+    RecvRootRow row;
+    int i, n;
+
+    api_recv_root_summary(&rc_sum);
+    n = rc_sum.roots;
+    if (start < 0) start = 0;
+    for (i = start; i < n; i++) {
+        if (!rc_load(i, &row)) continue;
+        if (row.conflict == RECV_ROOT_CF_NONE) continue;
+        if (row.action != RECV_ROOT_ACT_NONE) continue;
+        if (row.conflict == RECV_ROOT_CF_NESTED) continue;
+        rc_cur_idx = i;
+        rc_cur = row;
+        rc_cur_nested = false;
+        rc_phase = RC_ROOT;
+        rc_sel = 0;
+        rc_err = 0;
+        return;
+    }
+    for (i = start; i < n; i++) {
+        if (!rc_load(i, &row)) continue;
+        if (row.conflict != RECV_ROOT_CF_NESTED) continue;
+        if (row.action != RECV_ROOT_ACT_NONE) continue;
+        rc_cur_idx = i;
+        rc_cur = row;
+        rc_cur_nested = true;
+        rc_phase = RC_NESTED;
+        rc_sel = 0;
+        rc_err = 0;
+        return;
+    }
+    rc_phase = RC_NONE;
+    rc_cur_idx = -1;
+    api_recv_decide_hold(0);
+    do_accept();
+}
+
+static void rc_begin_rename(int idx, bool nested)
+{
+    if (idx < 0 || ime_tx != IME_TX_NONE) return;
+    rc_cur_idx = idx;
+    rc_rename_nested = nested;
+    rc_err = 0;
+    rc_try_name[0] = 0;
+    rc_phase = RC_RENAME;
+    ime_tx = IME_TX_ROOT;
+    ime_tx_fi = idx;
+}
+
+/* 键盘返回：按后端校验码决定下一步（同名目录再问 Merge/Rename、同名文件继续
+ * 改名、与原名相同视为取消/返回）。 */
+static void rc_rename_apply(int idx, const char *name)
+{
+    int r;
+    snprintf(rc_try_name, sizeof rc_try_name, "%s", name ? name : "");
+    r = api_recv_set_root_name(idx, name);
+    if (r == RECV_ROOT_OK) {
+        api_recv_root_precheck();          /* 新名字下的嵌套冲突重新预检 */
+        rc_open_next(0);
+        return;
+    }
+    rc_err = r;
+    if (r == RECV_ROOT_E_DIR) {
+        /* 新名已是目录：改名已落下，回到顶层弹窗问 Merge/Rename/Skip */
+        if (rc_load(idx, &rc_cur)) {
+            rc_cur_idx = idx;
+            rc_cur_nested = false;
+            rc_phase = RC_ROOT;
+            rc_sel = 0;
+        } else {
+            rc_cancel_flow();
+        }
+        return;
+    }
+    if (r == RECV_ROOT_E_OCCUPIED || r == RECV_ROOT_E_NAME ||
+        r == RECV_ROOT_E_DUP) {
+        rc_phase = RC_RENAME;              /* 错误弹窗：Rename 重试 / Skip / Back */
+        rc_sel = 0;
+        return;
+    }
+    rc_cancel_flow();                      /* E_SAME / 其它：视为取消/返回 */
+}
+
+/* 键盘取消/打不开：回到冲突弹窗（若本来在错误弹窗里则留在原处） */
+static void rc_rename_abort(void)
+{
+    int idx = rc_cur_idx;
+    if (rc_err) {
+        rc_phase = RC_RENAME;
+        return;
+    }
+    if (idx >= 0 && rc_load(idx, &rc_cur)) {
+        rc_phase = rc_rename_nested ? RC_NESTED : RC_ROOT;
+        rc_sel = 0;
+    } else {
+        rc_cancel_flow();
+    }
+}
+
+static void rc_activate(int btn)
+{
+    if (rc_phase == RC_ROOT) {
+        if (rc_cur.is_dir && rc_cur.conflict == RECV_ROOT_CF_DIR) {
+            if (btn == 0)      rc_apply_action(rc_cur_idx, RECV_ROOT_ACT_MERGE);
+            else if (btn == 1) rc_begin_rename(rc_cur_idx, false);
+            else               rc_apply_action(rc_cur_idx, RECV_ROOT_ACT_SKIP);
+        } else {
+            if (btn == 0) rc_begin_rename(rc_cur_idx, false);
+            else          rc_apply_action(rc_cur_idx, RECV_ROOT_ACT_SKIP);
+        }
+    } else {                               /* RC_NESTED / RC_RENAME 错误弹窗 */
+        if (btn == 0) rc_begin_rename(rc_cur_idx, rc_phase == RC_NESTED);
+        else          rc_apply_action(rc_cur_idx, RECV_ROOT_ACT_SKIP);
+    }
+}
+
+/* 冲突弹窗渲染（画在确认页之上；不透明遮罩盖住底层按钮） */
+static void rc_render(void)
+{
+    Rect card;
+    char line[256];
+    const char *title;
+    const char *shown;
+    int n, i, bw, gap, bx, by;
+
+    if (rc_phase == RC_NONE || rc_phase == RC_PRECHECK) return;
+    if (rc_phase == RC_RENAME && rc_err == 0) {
+        /* 系统键盘事务进行中：只留遮罩标题，防止底层按钮被点到 */
+        card = w_modal_box(120);
+        w_text(card.x + 24, card.y + 42, 1.2f, theme->text, "%s",
+               tr("Rename folder"));
+        return;
+    }
+    card = w_modal_box(300);
+    if (rc_phase == RC_ROOT)        title = tr("Folder conflicts");
+    else if (rc_phase == RC_NESTED) title = tr("Nested folders conflict");
+    else                            title = tr("Rename folder");
+    w_text(card.x + 24, card.y + 22, 1.3f, theme->text, "%s", title);
+
+    shown = rc_cur.rname[0] ? rc_cur.rname : rc_cur.name;
+    w_text_mid(card.x + 24, card.y + 62, 1.1f, theme->text, shown, card.w - 48);
+
+    if (rc_phase == RC_ROOT) {
+        if (rc_cur.conflict == RECV_ROOT_CF_DIR)
+            snprintf(line, sizeof line, tr("%s already exists. Merge into it?"),
+                     shown);
+        else if (rc_cur.conflict == RECV_ROOT_CF_RESERVED)
+            snprintf(line, sizeof line, "%s",
+                     tr("This name is reserved. Please rename it."));
+        else
+            snprintf(line, sizeof line, tr("%s is already in use."),
+                     shown);
+        w_text_clip(card.x + 24, card.y + 104, 1.0f, theme->text_dim, line,
+                    card.w - 48);
+        snprintf(line, sizeof line, tr("%d file(s)"), rc_cur.files);
+        w_text(card.x + 24, card.y + 136, 1.0f, theme->text_dim, "%s", line);
+    } else if (rc_phase == RC_NESTED) {
+        snprintf(line, sizeof line,
+                 tr("%s has nested folders blocked by existing files."),
+                 shown);
+        w_text_clip(card.x + 24, card.y + 104, 1.0f, theme->text_dim, line,
+                    card.w - 48);
+        snprintf(line, sizeof line, tr("%d nested conflict(s)"), rc_cur.nested);
+        w_text(card.x + 24, card.y + 136, 1.0f, theme->text_dim, "%s", line);
+    } else {
+        const char *msg;
+        if (rc_err == RECV_ROOT_E_OCCUPIED)
+            msg = tr("A file with that name already exists.");
+        else if (rc_err == RECV_ROOT_E_DUP)
+            msg = tr("Name is used by another incoming folder.");
+        else
+            msg = tr("Invalid folder name.");
+        w_text_clip(card.x + 24, card.y + 104, 1.0f, theme->danger, msg,
+                    card.w - 48);
+        w_text_mid(card.x + 24, card.y + 136, 1.0f, theme->text_dim,
+                   rc_try_name, card.w - 48);
+    }
+
+    n = (rc_phase == RC_ROOT) ? rc_root_btns(&rc_cur) : 2;
+    if (rc_sel < 0) rc_sel = 0;
+    if (rc_sel >= n) rc_sel = n - 1;
+    bw = 200;
+    gap = 16;
+    bx = card.x + (card.w - (n * bw + (n - 1) * gap)) / 2;
+    by = card.y + card.h - 64;
+    for (i = 0; i < n; i++) {
+        Rect b = { bx + i * (bw + gap), by, bw, 44 };
+        w_add(RC_BTN_ID(i), b);
+        w_button(b, rc_btn_label(i), i == rc_sel);
+    }
+
+    {
+        HintSeg segs[4] = { 0 };
+        int ns = 0;
+        segs[ns].key = HKEY_DPAD;
+        segs[ns].dir_off = HDIR_VERT;      /* 只亮左右：切按钮 */
+        segs[ns++].text = tr("Choose");
+        segs[ns].key = HKEY_CONFIRM;
+        segs[ns++].text = rc_btn_label(rc_sel);
+        segs[ns].key = HKEY_BACK;
+        segs[ns++].text = tr("Cancel");
+        w_page_footer_segs(segs, ns);
+    }
+}
+
+/* 冲突弹窗输入：打开时吞掉确认页所有按键/触摸 */
+static bool rc_input(const Input *in)
+{
+    int n;
+
+    if (rc_phase == RC_NONE) return false;
+    if (page_ime_busy()) return true;
+    if (rc_phase == RC_PRECHECK) return true;
+    if (rc_phase == RC_RENAME && rc_err == 0) return true;  /* 键盘进行中 */
+    n = (rc_phase == RC_ROOT) ? rc_root_btns(&rc_cur) : 2;
+    if (in->tap) {
+        int id = w_hit(in->tap_x, in->tap_y);
+        if (id >= RC_BTN_ID(0) && id < RC_BTN_ID(n)) {
+            rc_sel = id - RC_BTN_ID(0);
+            rc_activate(rc_sel);
+        }
+        return true;
+    }
+    if (in->left || in->right) {
+        rc_sel += in->right ? 1 : -1;
+        if (rc_sel < 0) rc_sel = n - 1;
+        if (rc_sel >= n) rc_sel = 0;
+        return true;
+    }
+    if (in->confirm) { rc_activate(rc_sel); return true; }
+    if (in->alt) { rc_begin_rename(rc_cur_idx, rc_cur_nested); return true; }
+    if (in->back) { rc_cancel_flow(); return true; }
+    return true;
+}
+
 /* 接受：勾选/改名早已逐条写回后端，这里只给出目录与接受决定；进度页不再
  * 本地拷贝全量清单（2048 条会卡帧），首帧显示等待、随后按 summary+窗口刷新。 */
-static void start_recv(void)
+static void do_accept(void)
 {
     RecvPendingSummary s;
     if (api_recv_pending_summary(&s) != 1) {  /* 已过期（竞态防护，正常不会到） */
@@ -362,7 +707,6 @@ static void start_recv(void)
         return;
     }
     if (s.selected == 0) { recv_reject_close(); return; }   /* 全被勾掉：当拒绝 */
-    api_recv_set_dir(g_app.recv_dir);   /* 本次保存目录（Setup 里可临时改；默认=config saveDir */
     xf_scroll = 0;
     spd_reset();                        /* 上一笔的速度采样作废（间隔 <1s 时不会自动清） */
     g_app.prog_name[0] = 0;
@@ -377,8 +721,33 @@ static void start_recv(void)
     g_app.prog_running = true;
     g_app.prog_start = sceKernelGetSystemTimeWide();
     rename_pop = false;
+    rc_phase = RC_NONE;
     api_recv_decide(true);           /* 唤醒后端：组会话、回 200 给发送方 */
     g_app.page = PAGE_PROGRESS;
+}
+
+static void start_recv(void)
+{
+    RecvPendingSummary s;
+    if (api_recv_pending_summary(&s) != 1) {  /* 已过期（竞态防护，正常不会到） */
+        recv_close();
+        return;
+    }
+    if (s.selected == 0) { recv_reject_close(); return; }   /* 全被勾掉：当拒绝 */
+    api_recv_set_dir(g_app.recv_dir);   /* 本次保存目录（Setup 里可临时改） */
+
+    /* P_PRECHECK：后端只 stat 唯一顶层 / 嵌套目录路径；有冲突就进弹窗流程，
+     * 期间暂停 60s 决定窗口。 */
+    rc_phase = RC_PRECHECK;
+    if (api_recv_root_precheck() != 1) { rc_phase = RC_NONE; return; }
+    api_recv_root_summary(&rc_sum);
+    if (rc_sum.unresolved > 0) {
+        api_recv_decide_hold(1);
+        rc_open_next(0);
+        return;                        /* 留在确认页，弹窗由 rc_render 画 */
+    }
+    rc_phase = RC_NONE;
+    do_accept();
 }
 
 /* ================= 接收设置页（本次保存目录 + 逐文件勾选/改名占位） ================= */
@@ -438,15 +807,6 @@ static void rs_toggle(int fi)
     row->selected = on;
 }
 
-/* 系统键盘挂起事务：设置页主机名、接收设置逐文件改名、发送等待页输入 PIN
- * 共用同一状态机（分属不同页面不会同时出现）。busy 供主循环据此跳过页面
- * 按键/触摸。 */
-enum {
-    IME_TX_NONE = 0,
-    IME_TX_RENAME,     /* 接收设置：改 inc_files[ime_tx_fi] 的保存名 */
-    IME_TX_HOST,       /* 设置页：改本机设备名 alias（config） */
-    IME_TX_PIN,        /* 发送等待页：对方要求 PIN（回填给 transfer.c） */
-};
 /* 接收改名的键盘时限：决定窗口在设置页里是暂停的（recv_decide_hold），所以
  * 不再有"须赶在 60s 窗口内改完"的约束，这里纯粹是键盘引擎假死的保险丝。
  * 主机名是纯设置项、同样无业务时限，但也得设限：键盘引擎一旦假死（d55-d58
@@ -457,9 +817,6 @@ enum {
 /* PIN 键盘：须短于 transfer.c 的 PIN_WAIT_US（120s），键盘假死时后台也能先
  * 超时收尾，不会两边一起挂住。 */
 #define PIN_IME_LIMIT_US  (110ll * 1000 * 1000)
-static int  ime_tx = IME_TX_NONE;  /* 当前挂起/打开的事务（NONE=空闲） */
-static int  ime_tx_fi = -1;        /* RENAME 的目标行（HOST 不使用） */
-static char ime_out[192];          /* 键盘结果落点（须存活到 poll 结束，ime 异步写） */
 
 /* 把键盘输入净化后写入 rname 并同步后端。净化/截断统一走 api_recv_sanitize_name
  * （后端落盘同一函数），保证行上显示的即落盘名。无效输入 → 沿用原名。
@@ -564,11 +921,14 @@ void page_ime_pump(void)
         if (r == 0) return;                 /* 仍在进行：继续出帧渲染 */
         if (r == 1) {
             if (ime_tx == IME_TX_RENAME) rename_apply(ime_tx_fi, ime_out);
+            else if (ime_tx == IME_TX_ROOT) rc_rename_apply(ime_tx_fi, ime_out);
             else if (ime_tx == IME_TX_HOST) host_apply(ime_out);
             else if (ime_tx == IME_TX_PIN) api_send_set_pin(ime_out);
         } else if (ime_tx == IME_TX_PIN) {
             /* PIN 被取消：唤醒后台按失败收尾，别让它干等 2 分钟 */
             api_send_pin_cancel();
+        } else if (ime_tx == IME_TX_ROOT) {
+            rc_rename_abort();                 /* 键盘取消：回冲突弹窗 */
         }
         ime_tx = IME_TX_NONE;
         return;
@@ -579,6 +939,16 @@ void page_ime_pump(void)
         if (ime_ask_begin(tr("Rename file"), init,
                           ime_out, sizeof ime_out, RN_IME_LIMIT_US) != 1)
             ime_tx = IME_TX_NONE;           /* 打开失败：放弃（dlog 已记） */
+    } else if (ime_tx == IME_TX_ROOT) {
+        RecvRootRow row;
+        const char *init = "";
+        if (rc_load(ime_tx_fi, &row))
+            init = row.rname[0] ? row.rname : row.name;
+        if (ime_ask_begin(tr("Rename folder"), init,
+                          ime_out, sizeof ime_out, RN_IME_LIMIT_US) != 1) {
+            ime_tx = IME_TX_NONE;
+            rc_rename_abort();              /* 打不开：回冲突弹窗，别卡住 */
+        }
     } else if (ime_tx == IME_TX_HOST) {
         char al[sizeof g_cfg.alias];
         config_get_alias(al, sizeof al);
@@ -855,6 +1225,9 @@ static void open_recv_request(void)
     glide_reset(&rs_glide);
     rename_pop = false;
     recv_focus = 2;
+    rc_phase = RC_NONE;
+    rc_cur_idx = -1;
+    rc_err = 0;
     g_recv_peer_gone = false;
     /* 设置页的另一种离开方式：接收请求把设置页顶掉（返回键那条出口在
      * page_settings_input 里收）。不收尾的话预读线程与"另外两份 CJK"的 ~33MB
@@ -896,6 +1269,12 @@ void pages_tick(void)
         /* 请求不在了：若后端报"发送方断开了连接"，确认页要换成"对方已取消"
          * 而不是"已过期"。事件不管在哪页都取走，避免陈旧标志误判下一次超时。 */
         int gone = api_recv_peer_gone_take();
+        if (rc_phase != RC_NONE) {       /* 对方撤销：强制关闭冲突弹窗 */
+            rc_phase = RC_NONE;
+            rc_cur_idx = -1;
+            rc_err = 0;
+            api_recv_decide_hold(0);
+        }
         if (gone && g_app.page == PAGE_RECV_CONFIRM) g_recv_peer_gone = true;
         return;                              /* 无"待决定"请求 */
     }

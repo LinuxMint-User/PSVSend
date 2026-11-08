@@ -78,9 +78,12 @@ typedef struct {
     /* POST /prepare-upload：body=清单 JSON，ip=来源，peer_fp=对端叶证书 SHA-256
      * （明文连接为空串），peer=本连接句柄（等用户决定期间探活用）；via_web=1 表示
      * 这次请求带了有效的网页共享 PIN（浏览器网页上传，停共享时要跟着作废）；
+     * no_cl=1 表示清单没有 Content-Length、以 EOF 判完（此时半关闭是正常收尾，
+     * 不能当作发送方放弃，见 receive.c 的探活条件）；
      * 回执写 resp，返回 HTTP 状态码 */
     int  (*prepare)(const char *body, const char *ip, const char *peer_fp,
-                    const HttpPeer *peer, int via_web, char *resp, int respsz);
+                    const HttpPeer *peer, int via_web, int no_cl,
+                    char *resp, int respsz);
     /* POST /upload?...：total<0 表示 chunked（无 Content-Length）；rd/ctx 由 http 层
      * 提供，协议层经它流式读 body（阻塞轮询语义：返回实读字节 / 0 关闭或超时 / <0 错） */
     int  (*upload)(const char *query, const char *ip, int64_t total,

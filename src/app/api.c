@@ -392,6 +392,31 @@ void api_recv_pending_rename(int idx, const char *name)
     recv_pending_rename(idx, name);
 }
 
+int api_recv_root_precheck(void)
+{
+    return recv_pending_root_precheck();
+}
+
+int api_recv_root_summary(RecvRootSummary *out)
+{
+    return recv_pending_root_summary(out);
+}
+
+int api_recv_root_window(int base, int max, RecvRootRow *out)
+{
+    return recv_pending_root_window(base, max, out);
+}
+
+int api_recv_set_root_action(int idx, int action, const char *new_name)
+{
+    return recv_set_root_action(idx, action, new_name);
+}
+
+int api_recv_set_root_name(int idx, const char *name)
+{
+    return recv_set_root_name(idx, name);
+}
+
 int api_recv_status_summary(RecvStatusSummary *out)
 {
     return recv_status_summary(out);

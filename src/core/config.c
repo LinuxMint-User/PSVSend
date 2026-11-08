@@ -19,6 +19,18 @@ static uint64_t g_last_save_us = 0;
 #define CFG_THEME_MAX 2                    /* = ui/theme.h 的 THEME_COUNT-1；
                                             * core 层不引用 ui 头，加色系时两处同步 */
 
+const int config_recv_limit_tiers[RECV_FILES_LIMIT_TIERS] =
+    { 64, 128, 256, 512, 1024, 2048 };
+
+/* 取 >= v 的最小档；越界夹到两端（设置页/读盘都走这一处）。 */
+int config_recv_limit_clamp(int v)
+{
+    int i;
+    for (i = 0; i < RECV_FILES_LIMIT_TIERS; i++)
+        if (v <= config_recv_limit_tiers[i]) return config_recv_limit_tiers[i];
+    return config_recv_limit_tiers[RECV_FILES_LIMIT_TIERS - 1];
+}
+
 /* 锁由 config_init() 预先建立（惰性创建在首次并发下可能两个线程各建一把 →
  * 一把锁形同虚设 + SceUID 泄漏）；下面仅作兜底，正常路径不会再建。 */
 static void cfg_lock(void)
@@ -59,6 +71,7 @@ static void cfg_defaults(void)
     g_cfg.max_parallel = PARALLEL_DEFAULT;  /* 发送侧并发上传数：默认 3 */
     g_cfg.send_sha = 1;                /* 发送前算 sha256：默认开（与官方一致） */
     g_cfg.recv_sha = 1;                /* 接收校验 sha256：默认开（与官方一致） */
+    g_cfg.recv_files_limit = RECV_FILES_LIMIT_DEFAULT;
     g_cfg.qr_scan = 1;                 /* 主页扫码入口：默认开 */
     g_cfg.lang = 0;                    /* 语言偏好默认跟随系统 */
     g_cfg.known_n = 0;
@@ -111,6 +124,7 @@ void config_init(void)
             if (json_get_int(buf, "maxParallel", &v)) g_cfg.max_parallel = (int)v;
             if (json_get_int(buf, "sendSha", &v)) g_cfg.send_sha = (int)v ? 1 : 0;
             if (json_get_int(buf, "recvSha", &v)) g_cfg.recv_sha = (int)v ? 1 : 0;
+            if (json_get_int(buf, "recvFiles", &v)) g_cfg.recv_files_limit = (int)v;
             if (json_get_int(buf, "qrScan", &v)) g_cfg.qr_scan = (int)v ? 1 : 0;
             if (json_get_int(buf, "lang", &v)) g_cfg.lang = (int)v;
             if (json_get_int(buf, "updateAuto", &v)) g_cfg.upd_auto = (int)v;
@@ -147,6 +161,7 @@ void config_init(void)
         g_cfg.max_parallel = PARALLEL_DEFAULT;
     if (g_cfg.send_sha != 0 && g_cfg.send_sha != 1) g_cfg.send_sha = 1;
     if (g_cfg.recv_sha != 0 && g_cfg.recv_sha != 1) g_cfg.recv_sha = 1;
+    g_cfg.recv_files_limit = config_recv_limit_clamp(g_cfg.recv_files_limit);
     if (g_cfg.qr_scan != 0 && g_cfg.qr_scan != 1) g_cfg.qr_scan = 1;
     if (g_cfg.custom_h < 0 || g_cfg.custom_h > 359) g_cfg.custom_h = 210;
     if (g_cfg.custom_s < 0 || g_cfg.custom_s > 100) g_cfg.custom_s = 65;
@@ -209,6 +224,7 @@ static void config_write_locked(void)
                    "  \"maxParallel\": %d,\n"
                    "  \"sendSha\": %d,\n"
                    "  \"recvSha\": %d,\n"
+                   "  \"recvFiles\": %d,\n"
                    "  \"qrScan\": %d,\n"
                    "  \"lang\": %d,\n"
                    "  \"updateAuto\": %d,\n"
@@ -219,7 +235,8 @@ static void config_write_locked(void)
                    a, f, g_cfg.port, g_cfg.theme_id, g_cfg.light_mode,
                    g_cfg.custom_h, g_cfg.custom_s, g_cfg.custom_v,
                    g_cfg.confirm_layout, g_cfg.pane_swap, g_cfg.max_parallel,
-                   g_cfg.send_sha, g_cfg.recv_sha, g_cfg.qr_scan, g_cfg.lang,
+                   g_cfg.send_sha, g_cfg.recv_sha, g_cfg.recv_files_limit,
+                   g_cfg.qr_scan, g_cfg.lang,
                    g_cfg.upd_auto, g_cfg.upd_last, d, k);
     if (len < 0 || len >= (int)sizeof out) {
         dlog("cfg: json overflow (%d)", len);
@@ -343,6 +360,14 @@ void config_set_max_parallel(int v)
     cfg_lock();
     if (v < PARALLEL_MIN || v > PARALLEL_MAX) v = PARALLEL_DEFAULT;
     g_cfg.max_parallel = v;
+    config_write_locked();
+    cfg_unlock();
+}
+
+void config_set_recv_files_limit(int v)
+{
+    cfg_lock();
+    g_cfg.recv_files_limit = config_recv_limit_clamp(v);
     config_write_locked();
     cfg_unlock();
 }

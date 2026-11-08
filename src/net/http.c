@@ -1116,6 +1116,7 @@ static void h_prepare(HttpReq *r)
     {
         int code = g_recv->prepare(body, r->ip, r->cn->peer_fp,
                                    (const HttpPeer *)r->cn, r->via_web,
+                                   r->cl64 <= 0 ? 1 : 0,
                                    resp, cap);
         dlog("http: prepare -> %d (tls=%d)", code, r->cn->tls);
         http_respond(r->cn, code, reason_of(code), resp);

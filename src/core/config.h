@@ -23,6 +23,12 @@
 #define PARALLEL_MAX      6
 #define PARALLEL_DEFAULT  3
 
+/* 接收文件数上限（设置页 6 档）。默认 64；实际文件数超过它时本次临时提升到
+ * 最小可容纳档（不改设置本身）。 */
+#define RECV_FILES_LIMIT_DEFAULT 64
+#define RECV_FILES_LIMIT_TIERS   6
+extern const int config_recv_limit_tiers[RECV_FILES_LIMIT_TIERS];
+
 /* 客户端发布版本（运行时显示 / 设置页"关于"）。
  * 与 CMakeLists.txt 的 project(VERSION 2.6.0) 保持一致——升级版本号时
  * 两处一起改，SFO APP_VER 由 CMake 从 VERSION 派生，无需手改。 */
@@ -32,7 +38,7 @@
  * 装完直接看"关于"就能核对刷入的是不是对新固件，不必翻日志。
  * 只用于显示/标识——不要拼进 PSVSEND_APP_VERSION：app/update.c 会解析远端
  * config.h 里的该宏做版本比较，混入构建号会让比较失准。 */
-#define PSVSEND_BUILD_TAG "d244"
+#define PSVSEND_BUILD_TAG "d252"
 
 typedef struct {
     char alias[64];          /* 设备名，广播给其他 LocalSend 设备 */
@@ -53,6 +59,7 @@ typedef struct {
     int  recv_sha;           /* 接收时校验对端给的 sha256（默认开）。本机校验与
                               * 写盘/解密并行，实测零墙钟成本；关掉的用途是兼容
                               * 对端哈希实现有误时的逃生舱（否则会被 422 拒收）。 */
+    int  recv_files_limit;   /* 接收文件上限档位：64/128/256/512/1024/2048（默认 64） */
     int  qr_scan;            /* 主页扫码入口（默认开）：开=页头按钮 + 肩键 L 提示；
                               * 关=按钮隐藏、L 不响应、页脚不显示该提示。 */
     int  lang;               /* 界面语言偏好：I18N_LANG_*（0=跟随系统，见 core/i18n.h） */
@@ -93,6 +100,9 @@ void config_set_save_dir(const char *dir);
 void config_set_lang(int lang);                  /* 越界 → AUTO */
 void config_set_upd_auto(int v);                 /* 越界 → 每周 */
 void config_set_max_parallel(int v);             /* 越界 → 默认 3（发送线程读该项） */
+/* 接收文件上限：取 >= v 的最小档（<64→64，>2048→2048）；setter 落盘 */
+int  config_recv_limit_clamp(int v);
+void config_set_recv_files_limit(int v);
 void config_set_upd_last(long long t);
 
 #endif

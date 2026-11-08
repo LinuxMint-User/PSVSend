@@ -111,7 +111,7 @@ void page_progress_render(void)
     SceOff done[MAX_PICKED];
     bool rfail[MAX_PICKED] = { false };  /* 每行是否失败（发送路径：逐文件独立成败） */
     SceOff sent_bytes = 0;               /* 真实已传字节（速度用，不从百分比反推） */
-    int fin = 0, nfail = 0, active = -1;
+    int fin = 0, nfail = 0, nskip = 0, active = -1;
     bool fail_state = false, partial = false;
     XferInfo xv;
     const char *msg = NULL;
@@ -174,6 +174,7 @@ void page_progress_render(void)
             g_app.prog_total = total;
             fin = rs.done;
             nfail = rs.failed;
+            nskip = rs.skipped;                    /* 接受时/竞态跳过的计数 */
             active = rs.cur;                       /* 正在收的文件（-1=无） */
             sent_bytes = rs.got_total;
             if (rs.state == RECV_ST_READY || rs.state == RECV_ST_RECEIVING)
@@ -181,7 +182,8 @@ void page_progress_render(void)
                     (int)((sceKernelGetSystemTimeWide() - rs.start_us) / 1000);
             g_app.prog_pct = rs.total > 0
                 ? (int)(rs.got_total * 100 / rs.total)
-                : (rs.state == RECV_ST_DONE ? 100 : 0);
+                : ((rs.state == RECV_ST_DONE || rs.state == RECV_ST_PARTIAL)
+                       ? 100 : 0);
             if (g_app.prog_pct > 100) g_app.prog_pct = 100;
             prog_finalizing = rs.state == RECV_ST_FINALIZING;
             g_app.prog_running = rs.state == RECV_ST_READY ||
@@ -196,7 +198,8 @@ void page_progress_render(void)
                 msg = rs.err[0] ? rs.err : tr("Receive failed");
                 msg_col = theme->danger;
             } else if (partial) {
-                msg = rs.err[0] ? rs.err : tr("Receive failed");
+                /* 纯跳过（用户选的 Skip / 竞态跳过）没有错误文案：不要谎报失败 */
+                msg = rs.err[0] ? rs.err : tr("Complete");
                 msg_col = theme->warn;
             } else if (rs.state == RECV_ST_CANCEL) {
                 msg = rs.err[0] ? rs.err : tr("Cancelled");
@@ -307,8 +310,14 @@ void page_progress_render(void)
         if (g_app.prog_done) {
             st = tr("Complete");
             sc = theme->success;
-        } else if (partial) {                  /* 完成，但有 N 个文件失败（警示色） */
-            snprintf(stbuf, sizeof stbuf, tr("Complete, %d failed"), nfail);
+        } else if (partial) {                  /* 完成，但有 N 个文件失败/跳过（警示色） */
+            if (nfail > 0 && nskip > 0)
+                snprintf(stbuf, sizeof stbuf, tr("Complete, %d failed, %d skipped"),
+                         nfail, nskip);
+            else if (nfail > 0)
+                snprintf(stbuf, sizeof stbuf, tr("Complete, %d failed"), nfail);
+            else
+                snprintf(stbuf, sizeof stbuf, tr("Complete, %d skipped"), nskip);
             st = stbuf;
             sc = theme->warn;
         } else if (g_app.prog_cancel) {
