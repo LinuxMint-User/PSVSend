@@ -8,7 +8,7 @@
 #include "net/device.h"        /* Device / DEVICE_MAX（类型住 net 层，见 device.h） */
 #include "net/web.h"           /* WebEntry / WebSnap / WEB_MODE_*：网页共享契约 */
 #include "proto/transfer.h"    /* XferFile / XferInfo / XFER_MAX_FILES：发送契约数据类型 */
-#include "proto/receive.h"     /* RecvPending / RecvStatus / RECV_ST_*：接收契约数据类型 */
+#include "proto/receive.h"     /* RecvSummary / RecvRow / RECV_ST_*：接收契约数据类型 */
 
 /* 启动后端：config_init + net_start + discovery_start（各模块内部幂等）。
  * 后台线程自理：api_watch（500ms 巡检重试）+ http（收对方 register/info）。
@@ -66,10 +66,10 @@ void api_send_pin_cancel(void);
 void api_send_info(XferInfo *out);
 
 /* ---- UI 门面：接收（proto/receive.c） ----
- * 接收数据类型（RecvPending/RecvStatus/RECV_ST_ 枚举/RECV_MAX_FILES）随本契约
+ * 接收数据类型（RecvPendingSummary/RecvStatusSummary/窗口行/RECV_ST_ 枚举）随本契约
  * 暴露，UI 不再直接 include proto/receive.h。以下均为薄转发。 */
 
-/* M1 新契约：summary + 窗口（M4 UI 切到这些；旧全量 pull 届时下线） */
+/* summary + 窗口：确认页/进度页只读汇总，列表按 [base, base+max) 拉取 */
 int  api_recv_pending_summary(RecvPendingSummary *out);
 int  api_recv_pending_window(int base, int max, RecvPendingRow *out);
 void api_recv_pending_toggle(int idx, bool on);
@@ -77,16 +77,10 @@ void api_recv_pending_rename(int idx, const char *name);
 int  api_recv_status_summary(RecvStatusSummary *out);
 int  api_recv_status_window(int base, int max, RecvStatusRow *out);
 
-/* 兼容包装（M4 下线）：有"等待决定"的接收请求？1=有并拷贝 out */
-int  api_recv_pending_pull(RecvPending *out);
 /* 上一份待确认请求是否因"发送方放弃（断开连接）"而消失；一次性，取走即清零 */
 int  api_recv_peer_gone_take(void);
 /* 最近一次 prepare 被拒的原因（HTTP_REJ_*，一次性）；主页红色细条用 */
 int  api_recv_reject_take(void);
-/* 同步"本次勾选接收的文件"（下标与 pending 一致） */
-void api_recv_set_include(const bool inc[RECV_MAX_FILES]);
-/* 接受前逐文件指定"保存名"（idx 与 pending 一致；空串=保持原名） */
-void api_recv_set_name(int idx, const char *name);
 /* 名字 → 可落盘的单级文件名（净化 + 超长保后缀截断）；UI 改名与列表预演用，
  * 与后端落盘同一口径，保证显示名即落盘名 */
 void api_recv_sanitize_name(const char *in, char *out, int n);
@@ -102,8 +96,6 @@ void api_recv_decide_touch(void);
 int  api_recv_decide_left_s(void);
 /* 用户中止进行中的接收 */
 void api_recv_abort(void);
-/* 轮询接收会话状态；1=有会话（含终态）0=空闲 */
-int  api_recv_status_pull(RecvStatus *out);
 /* 会话结束展示完毕，清场回空闲 */
 void api_recv_clear(void);
 

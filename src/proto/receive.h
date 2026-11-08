@@ -24,9 +24,8 @@
 #include "net/http.h"      /* HttpRecvOps / http_stream_fn（注册给 http 层的处理集） */
 #include "proto/recv_path.h" /* RP_REL_MAX：相对路径窗口行缓冲 */
 
-/* 后端硬上限（单次接收会话；超出的在确认页明示丢弃）。
- * RECV_MAX_FILES 是旧的全量快照/UI 窗口行数，仅用于 M1~M3 的兼容包装；
- * M4 切到 summary/window 后下线。 */
+/* 后端硬上限（单次接收会话；超出的整份拒绝）。
+ * RECV_MAX_FILES 仅用于扫码拉取（prepare-download）清单的临时上限。 */
 #define RECV_FILES_MAX 2048
 #define RECV_MAX_FILES 64
 
@@ -51,6 +50,7 @@ typedef struct {
 
 typedef struct {
     char name[RP_REL_MAX + 1];   /* 规整后的相对路径（落盘口径） */
+    char rname[RP_COMP_MAX + 1]; /* UI 改名后的最后一级（空=沿用原名） */
     SceOff size;
     bool trunc;                  /* 名字过长被缩短过 */
     bool selected;               /* 当前勾选状态 */
@@ -78,23 +78,7 @@ typedef struct {
     unsigned char st;            /* 0=未完成 1=完成 3=失败 */
 } RecvStatusRow;
 
-/* ---- 旧全量快照（M1~M3 编译兼容；M4 下线） ---- */
-/* UI：待确认请求快照（recv_pending_pull 锁内拷贝；count 可大于 RECV_MAX_FILES，
- * files 只填前 RECV_MAX_FILES 行） */
-typedef struct {
-    char peer_alias[64];
-    char peer_type[24];
-    char peer_ip[16];
-    char peer_fp[65];            /* 对端叶证书 SHA-256（TLS 才有；明文为空） */
-    int  count;                  /* 列入清单的文件数（≤ RECV_MAX_FILES） */
-    int  overflow;               /* 发送方实际文件数超过上限、被丢弃的个数 */
-    /* name 已经是"规整后的落盘名"（净化 + 超长保后缀截断），不是对方原样给的
-     * 原始字符串——确认页显示与实际落盘一致。trunc=名字过长被缩短过。 */
-    struct { char name[192]; SceOff size; bool trunc; } files[RECV_MAX_FILES];
-    SceOff total;
-} RecvPending;
-
-/* UI：接收会话状态（recv_status_pull 锁内拷贝，进度页/结束态展示） */
+/* 接收会话状态（进度页/结束态展示） */
 typedef enum {
     RECV_ST_NONE = 0,    /* 无活动会话（UI 可回主页） */
     RECV_ST_READY,       /* 已接受，等对方开始传 */
@@ -107,26 +91,10 @@ typedef enum {
     RECV_ST_PARTIAL      /* 全部文件已收尾，但其中有失败（部分成功） */
 } RecvStateId;
 
-typedef struct {
-    int  state;                    /* RecvStateId */
-    char peer_alias[64];
-    int  count;                    /* 实际参与的文件数（已剔除跳过） */
-    int  cur;                      /* 当前正在收的文件下标（-1=无） */
-    char name[RECV_MAX_FILES][192];
-    SceOff size[RECV_MAX_FILES];
-    SceOff got[RECV_MAX_FILES];    /* 每文件已收字节 */
-    unsigned char st[RECV_MAX_FILES]; /* 每文件状态：0=未完成 1=完成 3=失败
-                                       * （与发送侧 XferFile.state 同口径，UI 直接映射） */
-    SceOff total;                  /* 本次要收的总字节 */
-    SceOff got_total;
-    uint64_t start_us;             /* 会话开始（accept 决定时刻） */
-    char err[192];                 /* FAIL/CANCEL/TIMEOUT/PARTIAL 原因（其它状态空） */
-} RecvStatus;
-
 /* 后端初始化（建锁 + 清扫上次中断残留的 *.psvsend.tmp）；api_start 调用 */
 void recv_init(void);
 
-/* ---- M1 新契约（M4 UI 切到这里；旧全量 pull 届时下线） ---- */
+/* ---- 接收状态契约（UI 只读 summary + 窗口） ---- */
 /* 待决定请求的汇总；返回 1=有（out 可 NULL 仅探测） */
 int recv_pending_summary(RecvPendingSummary *out);
 /* 拷贝 pending 的 [base, base+max) 行；返回实际拷贝行数 */
@@ -141,12 +109,6 @@ int recv_status_summary(RecvStatusSummary *out);
 /* 拷贝会话的 [base, base+max) 行；返回实际拷贝行数 */
 int recv_status_window(int base, int max, RecvStatusRow *out);
 
-/* ---- 旧全量快照（M1~M3 兼容；M4 下线） ---- */
-/* UI 轮询：有"等待决定"的接收请求？返回 1 并拷贝 out（out==NULL 时仅探测
- * 不拷贝，用 1/0 回答"有没有"）；0=无（含已消失/已超时）。
- * 只填前 RECV_MAX_FILES 行；count 可能大于它。 */
-int recv_pending_pull(RecvPending *out);
-
 /* 上一份待确认请求是否因"发送方放弃"而消失（一次性：取走即清零）。
  * 官方发送方在等接受的阶段取消时是 abort 掉 prepare 请求（关连接），
  * 不会、也无法调 /cancel——那时 sessionId 还没生成。 */
@@ -154,12 +116,6 @@ int recv_pending_peer_gone_take(void);
 /* 最近一次 prepare 被拒的原因（HTTP_REJ_*，一次性：取走即清零）。
  * 覆盖文件数超限 / 清单过大 / 忙 / 内存不足，UI 在主页细条上短时提示。 */
 int recv_reject_take(void);
-/* 兼容包装：同步前 RECV_MAX_FILES 行的勾选（其余行保持默认选中）。 */
-void recv_set_include(const bool inc[RECV_MAX_FILES]);
-
-/* 兼容包装：等价 recv_pending_rename（idx 为全局下标）。 */
-void recv_set_name(int idx, const char *name);
-
 /* 名字 → 可落盘的单级文件名：按 ux0: 合法性净化 + 超长时"保后缀、截主名"，
  * 见 receive.c。落盘与 UI 改名共用，保证"界面上显示的即落盘名"；
  * UI 侧只经 api_recv_sanitize_name 调用。
@@ -208,9 +164,6 @@ int recv_link_connecting(void);
 int recv_link_error_take(void);
 /* 取消"连接中"的扫码链接（已出现的待决定/活动会话不归它管，走 recv_decide/abort） */
 void recv_link_cancel(void);
-
-/* 兼容包装：只填前 RECV_MAX_FILES 行；返回 1=有会话（含终态）0=空闲 */
-int recv_status_pull(RecvStatus *out);
 
 /* 接收会话结束展示完毕，清场回空闲 */
 void recv_clear(void);

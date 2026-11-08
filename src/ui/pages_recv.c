@@ -23,16 +23,15 @@ static int rs_press_scroll = 0;
 /* 接收设置改名已接系统键盘（ime_ask）：rename_pop 保留为恒 false 的清理位，
  * 避免牵连各页退出时的复位赋值；真正的输入弹窗由 ask_rename() 直接驱动 */
 static bool rename_pop = false;
+static RecvPendingRow cf_prev[5];  /* 确认页前 5 条预览（窗口拉取，不遍历全量） */
 
 static void start_recv(void);
 
-/* 当前勾选接收的文件数 */
+/* 当前勾选且可接收的文件数（后端 summary 口径：path_ok && inc） */
 static int recv_included(void)
 {
-    int i, n = 0;
-    for (i = 0; i < g_app.inc_count && i < MAX_INF; i++)
-        if (g_app.inc_files[i].inc) n++;
-    return n;
+    RecvPendingSummary s;
+    return api_recv_pending_summary(&s) ? s.selected : 0;
 }
 
 /* ================= 接收请求确认（真实：后端 PENDING 会话） ================= */
@@ -96,7 +95,8 @@ void page_recv_confirm_render(void)
     int lmax = card.w - 72;
 
     /* 请求还在等 UI 决定吗？不在了（超时被后端作废 / 发送方撤销）→ 只给关闭 */
-    g_recv_expired = api_recv_pending_pull(NULL) == 0;
+    RecvPendingSummary rs;
+    g_recv_expired = api_recv_pending_summary(&rs) == 0;
     if (g_recv_expired) {
         w_rect(card, theme->card);
         w_text_clip(48, 120, 1.5f, theme->text, g_app.recv_alias, lmax);
@@ -124,7 +124,7 @@ void page_recv_confirm_render(void)
     }
 
     w_rect(card, theme->card);
-    int n = g_app.inc_count, seln = recv_included();
+    int n = rs.count, seln = rs.selected;
     int i;
     /* 来者名字（右上是平台类型）。对端别名长度不受本端控制（最长 64 字节，
      * 1.5 号字下足以铺满整屏并与右上"平台类型"压盖/出屏），故先量出平台类型
@@ -141,10 +141,8 @@ void page_recv_confirm_render(void)
              g_app.recv_alias, n);
     w_text_clip(48, 152, 1.15f, theme->text, line, lmax);
 
-    SceOff t = 0;
-    for (i = 0; i < n; i++) t += g_app.inc_files[i].size;
     char sz[16];
-    w_human_size(t, sz);
+    w_human_size(rs.total, sz);
     if (seln == n)
         snprintf(line, sizeof line, tr("Total %s"), sz);
     else
@@ -168,16 +166,14 @@ void page_recv_confirm_render(void)
         }
     }
 
-    /* 名字过长、接收后会被自动缩短的文件数（后端在 prepare 时就算好了 trunc；
-     * 用户自己改过名的行按新名算，不再提示）。缩短口径=保后缀、截主名。 */
-    int toolong = 0;
-    for (i = 0; i < n; i++)
-        if (g_app.inc_files[i].trunc && !g_app.inc_files[i].rname[0]) toolong++;
+    /* 名字过长、接收后会被自动缩短的文件数（后端 summary 已剔除用户改过名的行）。
+     * 缩短口径=保后缀、截主名。 */
+    int toolong = rs.trunc;
     int warn = 0;
-    if (g_app.recv_overflow > 0) {
+    if (rs.overflow > 0) {
         snprintf(line, sizeof line,
                  tr("%d more file(s) exceed the receive limit and will be skipped."),
-                 g_app.recv_overflow);
+                 rs.overflow);
         w_text_clip(48, 212, 0.9f, theme->warn, line, lmax);
         warn++;
     }
@@ -200,12 +196,16 @@ void page_recv_confirm_render(void)
         if (last <= limit_y) break;
         show--;
     }
+    if (show > 0) {
+        int got = api_recv_pending_window(0, show, cf_prev);
+        if (got < show) show = got;      /* 请求刚落走：不画上一份的陈旧行 */
+    }
     for (i = 0; i < show; i++) {
         int sw = 0, nw;
-        w_human_size(g_app.inc_files[i].size, sz);
+        w_human_size(cf_prev[i].size, sz);
         w_text_w(1.0f, sz, &sw, NULL);
         nw = w_text_mid(72, list_y + i * 26, 1.0f, theme->text,
-                        g_app.inc_files[i].name, card.w - 160 - sw);
+                        cf_prev[i].name, card.w - 160 - sw);
         w_text(72 + nw + 12, list_y + i * 26, 1.0f, theme->text_dim, "(%s)", sz);
     }
     if (n > show)
@@ -352,38 +352,22 @@ void page_recv_confirm_input(const Input *in)
     if (in->back) recv_reject_close();
 }
 
-/* 接受：把勾选集写回后端并请其建立会话（回执 200 后对方即可开传），
- * 跳接收进度页。此时会话可能还没建好，进度页首帧用本地清单兜底。 */
+/* 接受：勾选/改名早已逐条写回后端，这里只给出目录与接受决定；进度页不再
+ * 本地拷贝全量清单（2048 条会卡帧），首帧显示等待、随后按 summary+窗口刷新。 */
 static void start_recv(void)
 {
-    bool inc[RECV_MAX_FILES];
-    int i, n = 0;
-    SceOff tot = 0;
-    if (api_recv_pending_pull(NULL) != 1) {   /* 已过期（竞态防护，正常不会到） */
+    RecvPendingSummary s;
+    if (api_recv_pending_summary(&s) != 1) {  /* 已过期（竞态防护，正常不会到） */
         recv_close();
         return;
     }
-    for (i = 0; i < g_app.inc_count && i < RECV_MAX_FILES; i++)
-        inc[i] = g_app.inc_files[i].inc;
-    api_recv_set_include(inc);
-    api_recv_set_dir(g_app.recv_dir);   /* 本次保存目录（Setup 里可临时改；默认=config saveDir） */
-    for (i = 0; i < g_app.inc_count && i < RECV_MAX_FILES; i++) {
-        if (!g_app.inc_files[i].inc) continue;
-        if (n >= MAX_PICKED) break;
-        /* 进度页清单显示"保存名"（改名后为新名，否则对方原名） */
-        snprintf(xf_name[n], sizeof xf_name[0], "%s",
-                 g_app.inc_files[i].rname[0]
-                     ? g_app.inc_files[i].rname : g_app.inc_files[i].name);
-        xf_size[n] = g_app.inc_files[i].size;
-        tot += g_app.inc_files[i].size;
-        n++;
-    }
-    if (n == 0) { recv_reject_close(); return; }   /* 全被勾掉：当拒绝 */
-    xf_count = n;
+    if (s.selected == 0) { recv_reject_close(); return; }   /* 全被勾掉：当拒绝 */
+    api_recv_set_dir(g_app.recv_dir);   /* 本次保存目录（Setup 里可临时改；默认=config saveDir */
     xf_scroll = 0;
-    spd_reset();                     /* 上一笔的速度采样作废（间隔 <1s 时不会自动清） */
+    spd_reset();                        /* 上一笔的速度采样作废（间隔 <1s 时不会自动清） */
     g_app.prog_name[0] = 0;
-    g_app.prog_size = tot;
+    g_app.prog_size = s.selected_size;
+    g_app.prog_total = s.count;         /* 会话建好前的列表行数兜底 */
     g_app.prog_dir = 1;
     g_app.prog_pct = 0;
     g_app.prog_done = false;
@@ -400,8 +384,59 @@ static void start_recv(void)
 /* ================= 接收设置页（本次保存目录 + 逐文件勾选/改名占位） ================= */
 /* 本页是整幅列表，几何直接走 ui.h 的公共常量（列表顶 / 可视区底 / 行高 / 行步进），
  * 不再另立一套 RSS_*——此前列表顶 68 / 步进 60 / 底部留白 14 与公共口径都不一致。 */
-#define RS_REN_ID   0x4000             /* 触摸 id：改名按钮 = 基址 + 行号 */
-#define RS_CHK_ID   0x8000             /* 触摸 id：勾选框  = 基址 + 行号 */
+/* 触摸 id：基址 + 全局行号（0=目录行，1..=文件行）。总数可达 2049 行，
+ * 基址必须避开页头按钮等其它 id（旧 0x4000/0x8000 会在 64 行以上撞车）。 */
+#define RS_REN_ID   0x10000            /* 改名按钮 */
+#define RS_CHK_ID   0x20000            /* 勾选框 */
+
+/* 文件窗口：[inc_base, inc_base+inc_count) 是后端拷来的 64 行；行号/勾选/改名
+ * 一律用全局下标，滚动到新位置或版本变化时才重拉。 */
+static RecvPendingRow rs_win[MAX_INF];
+static int rs_win_ver = -1;            /* 已拉取时的 g_app.inc_version */
+
+static const char *rel_base(const char *rel)
+{
+    const char *p = strrchr(rel, '/');
+    return p ? p + 1 : rel;
+}
+
+/* 按当前滚动位置拉窗口（滚动/版本变化才真正调后端） */
+static void rs_sync_window(void)
+{
+    int total = g_app.inc_total;
+    int first = rs_scroll / ROW_STRIDE;     /* 首个可见行 */
+    int want = first > 0 ? first - 1 : 0;   /* 首个可见文件下标 */
+    int maxb = total > MAX_INF ? total - MAX_INF : 0;
+    if (want > maxb) want = maxb;
+    if (want < 0) want = 0;
+    if (want == g_app.inc_base && rs_win_ver == g_app.inc_version) return;
+    g_app.inc_count = api_recv_pending_window(want, MAX_INF, rs_win);
+    g_app.inc_base = want;
+    rs_win_ver = g_app.inc_version;
+}
+
+/* 全局文件下标 → 窗口行（不在窗口内返回 NULL） */
+static RecvPendingRow *rs_row(int fi)
+{
+    int k = fi - g_app.inc_base;
+    if (k < 0 || k >= g_app.inc_count) return NULL;
+    return &rs_win[k];
+}
+
+/* 切换某全局行的勾选（窗口内就地更新，避免整窗重拉） */
+static void rs_toggle(int fi)
+{
+    RecvPendingRow tmp;
+    RecvPendingRow *row = rs_row(fi);
+    bool on;
+    if (!row) {
+        if (api_recv_pending_window(fi, 1, &tmp) != 1) return;
+        row = &tmp;
+    }
+    on = !row->selected;
+    api_recv_pending_toggle(fi, on);
+    row->selected = on;
+}
 
 /* 系统键盘挂起事务：设置页主机名、接收设置逐文件改名、发送等待页输入 PIN
  * 共用同一状态机（分属不同页面不会同时出现）。busy 供主循环据此跳过页面
@@ -424,26 +459,34 @@ enum {
 #define PIN_IME_LIMIT_US  (110ll * 1000 * 1000)
 static int  ime_tx = IME_TX_NONE;  /* 当前挂起/打开的事务（NONE=空闲） */
 static int  ime_tx_fi = -1;        /* RENAME 的目标行（HOST 不使用） */
-static char ime_out[128];          /* 键盘结果落点（须存活到 poll 结束，ime 异步写） */
+static char ime_out[192];          /* 键盘结果落点（须存活到 poll 结束，ime 异步写） */
 
 /* 把键盘输入净化后写入 rname 并同步后端。净化/截断统一走 api_recv_sanitize_name
- * （后端落盘同一函数），保证行上显示的即落盘名。无效输入 → 沿用原名。 */
+ * （后端落盘同一函数），保证行上显示的即落盘名。无效输入 → 沿用原名。
+ * fi 是全局文件下标；窗口只用于取当前显示状态，打不开就退回后端单行查询。 */
 static void rename_apply(int fi, const char *in)
 {
-    char cur[128];
-    if (fi < 0 || fi >= g_app.inc_count) return;
+    RecvPendingRow tmp;
+    RecvPendingRow *row;
+    char cur[192];
+
+    if (fi < 0 || fi >= g_app.inc_total) return;
+    row = rs_row(fi);
+    if (!row) {
+        if (api_recv_pending_window(fi, 1, &tmp) != 1) return;
+        row = &tmp;
+    }
     api_recv_sanitize_name(in, cur, sizeof cur);
     if (!cur[0] || strcmp(cur, "unnamed") == 0) {
-        g_app.inc_files[fi].rname[0] = 0;   /* 净化后无效：沿用原名 */
-        api_recv_set_name(fi, "");
+        row->rname[0] = 0;                  /* 净化后无效：沿用原名 */
+        api_recv_pending_rename(fi, "");
         return;
     }
-    if (strcmp(cur, g_app.inc_files[fi].name) == 0)
+    if (strcmp(cur, rel_base(row->name)) == 0)
         cur[0] = 0;                         /* 等于原名：无需改名 */
-    g_app.inc_files[fi].trunc = false;      /* 用户已自己定名，不再提示"过长" */
-    snprintf(g_app.inc_files[fi].rname, sizeof g_app.inc_files[fi].rname,
-             "%s", cur);
-    api_recv_set_name(fi, cur);
+    row->trunc = false;                     /* 用户已自己定名，不再提示"过长" */
+    snprintf(row->rname, sizeof row->rname, "%s", cur);
+    api_recv_pending_rename(fi, cur);
 }
 
 /* 请求打开系统键盘改行 fi 的保存名。仅登记，真正的 ime_ask_begin 由主循环
@@ -451,7 +494,7 @@ static void rename_apply(int fi, const char *in)
  * 对话框在绘制中打开会抢占显示通道导致弹不出（d55 卡死根因之一）。 */
 static void ask_rename(int fi)
 {
-    if (ime_tx != IME_TX_NONE || fi < 0 || fi >= g_app.inc_count) return;
+    if (ime_tx != IME_TX_NONE || fi < 0 || fi >= g_app.inc_total) return;
     ime_tx = IME_TX_RENAME;
     ime_tx_fi = fi;   /* 初值在 pump 里现取（主线程串行，内容一致） */
 }
@@ -531,10 +574,9 @@ void page_ime_pump(void)
         return;
     }
     if (ime_tx == IME_TX_RENAME) {
-        if (ime_ask_begin(tr("Rename file"),
-                          g_app.inc_files[ime_tx_fi].rname[0]
-                              ? g_app.inc_files[ime_tx_fi].rname
-                              : g_app.inc_files[ime_tx_fi].name,
+        RecvPendingRow *r = rs_row(ime_tx_fi);
+        const char *init = r ? (r->rname[0] ? r->rname : rel_base(r->name)) : "";
+        if (ime_ask_begin(tr("Rename file"), init,
                           ime_out, sizeof ime_out, RN_IME_LIMIT_US) != 1)
             ime_tx = IME_TX_NONE;           /* 打开失败：放弃（dlog 已记） */
     } else if (ime_tx == IME_TX_HOST) {
@@ -554,7 +596,7 @@ void page_ime_pump(void)
 
 static void rs_clamp(void)
 {
-    int rows = 1 + g_app.inc_count;
+    int rows = 1 + g_app.inc_total;
     int max_s = rows * ROW_STRIDE - LIST_VIEW_H;
     if (max_s < 0) max_s = 0;
     if (rs_scroll < 0) rs_scroll = 0;
@@ -563,7 +605,7 @@ static void rs_clamp(void)
 
 static void rs_keep_visible(void)
 {
-    int rows = 1 + g_app.inc_count;
+    int rows = 1 + g_app.inc_total;
     int st = g_app.inc_sel * ROW_STRIDE;
     int bot = st + ROW_H;
     if (st < rs_scroll) rs_scroll = st;
@@ -605,7 +647,7 @@ void page_recv_setup_render(void)
 {
     w_page_header(tr("Receive setup"));
     w_hdr_button(HDR_SLOT_R, WID_HDR_BACK_RS, HDRBTN_BACK, false);
-    int rows = 1 + g_app.inc_count;
+    int rows = 1 + g_app.inc_total;
     char sz[16];
     {
         int max_s = rows * ROW_STRIDE - LIST_VIEW_H;
@@ -613,6 +655,7 @@ void page_recv_setup_render(void)
         rs_scroll = glide_step(&rs_glide, rs_scroll, max_s);
     }
     rs_clamp();
+    rs_sync_window();                 /* 滚动/版本变化才拉窗口 */
     int i;
 
     vita2d_enable_clipping();
@@ -653,22 +696,24 @@ void page_recv_setup_render(void)
         }
 
         int idx = i - 1;
-        bool on = g_app.inc_files[idx].inc;
+        RecvPendingRow *fr = rs_row(idx);
+        if (!fr) continue;                  /* 窗口尚未覆盖（滚动中瞬时） */
+        bool on = fr->selected;
         uint32_t nc = sel ? theme->text : theme->text_dim;
-        w_human_size(g_app.inc_files[idx].size, sz);
+        w_human_size(fr->size, sz);
         w_text_right(size_right, r.y + (r.h - w_font_px(SC_SUB)) / 2, SC_SUB,
                      theme->text_dim, "%s", sz);
-        if (g_app.inc_files[idx].rname[0]) {
+        if (fr->rname[0]) {
             /* 已改名：上行小字原名，下行保存名 */
             RowGeom g2;
             row_geom(r, ROW_2LINE, 0, &g2);      /* 两行排的 y */
             w_text_mid(g.x_text, g2.y_main, 0.8f, theme->text_dim,
-                       g_app.inc_files[idx].name, g.w_text);
+                       fr->name, g.w_text);
             w_text_mid(g.x_text, g2.y_sub, SC_SUB, nc,
-                       g_app.inc_files[idx].rname, g.w_text);
+                       fr->rname, g.w_text);
         } else {
             w_text_mid(g.x_text, g.y_main, g.main_sc, nc,
-                       g_app.inc_files[idx].name, g.w_text);
+                       fr->name, g.w_text);
         }
         rss_add_hit(RS_REN_ID + i, ren);
         rss_add_hit(RS_CHK_ID + i, chk);
@@ -724,7 +769,7 @@ static void rs_leave(void)
 
 void page_recv_setup_input(const Input *in)
 {
-    int rows = 1 + g_app.inc_count;
+    int rows = 1 + g_app.inc_total;
     if (in->drag_start || in->dragging) {
         int max_s = rows * ROW_STRIDE - LIST_VIEW_H;
         if (max_s < 0) max_s = 0;
@@ -761,10 +806,7 @@ void page_recv_setup_input(const Input *in)
         if (id >= RS_CHK_ID && id < RS_CHK_ID + rows) {
             int row = id - RS_CHK_ID;
             g_app.inc_sel = row;
-            if (row > 0) {
-                int fi = row - 1;
-                g_app.inc_files[fi].inc = !g_app.inc_files[fi].inc;
-            }
+            if (row > 0) rs_toggle(row - 1);
             return;
         }
         if (id >= 0 && id < rows) {
@@ -782,12 +824,8 @@ void page_recv_setup_input(const Input *in)
         rs_keep_visible();
     }
     if (in->confirm) {
-        if (g_app.inc_sel > 0) {
-            int fi = g_app.inc_sel - 1;
-            g_app.inc_files[fi].inc = !g_app.inc_files[fi].inc;
-        } else {
-            open_dir_pick(PAGE_RECV_SETUP, false, g_app.recv_dir);   /* 目录行 */
-        }
+        if (g_app.inc_sel > 0) rs_toggle(g_app.inc_sel - 1);
+        else open_dir_pick(PAGE_RECV_SETUP, false, g_app.recv_dir);   /* 目录行 */
     }
     if (in->alt) {
         if (g_app.inc_sel > 0) ask_rename(g_app.inc_sel - 1);
@@ -796,26 +834,21 @@ void page_recv_setup_input(const Input *in)
 }
 
 /* ================= 新接收请求自动弹窗 ================= */
-/* 把"待决定请求"快照复制到 UI 工作副本并进入接收确认页 */
-static void open_recv_request(const RecvPending *rp)
+/* 新请求到达：只记录 summary（总数/别名/指纹），文件清单不整份拷进 UI，
+ * Setup 页按滚动窗口从后端拉。 */
+static void open_recv_request(void)
 {
-    int i, n = rp->count;
-    if (n > RECV_MAX_FILES) n = RECV_MAX_FILES;
-    if (n > MAX_INF) n = MAX_INF;
-    g_app.recv_overflow = rp->overflow;
-    snprintf(g_app.recv_alias, sizeof g_app.recv_alias, "%s", rp->peer_alias);
-    snprintf(g_app.recv_fp, sizeof g_app.recv_fp, "%s", rp->peer_fp);
+    RecvPendingSummary s;
+    if (api_recv_pending_summary(&s) != 1) return;
+    snprintf(g_app.recv_alias, sizeof g_app.recv_alias, "%s", s.peer_alias);
+    snprintf(g_app.recv_fp, sizeof g_app.recv_fp, "%s", s.peer_fp);
     snprintf(g_app.recv_type, sizeof g_app.recv_type, "%s",
-             rp->peer_type[0] ? rp->peer_type : "unknown");
-    g_app.inc_count = n;
-    for (i = 0; i < n; i++) {
-        snprintf(g_app.inc_files[i].name, sizeof g_app.inc_files[i].name,
-                 "%s", rp->files[i].name);
-        g_app.inc_files[i].rname[0] = 0;
-        g_app.inc_files[i].trunc = rp->files[i].trunc;   /* 名字过长被缩短过 */
-        g_app.inc_files[i].inc = true;      /* 默认全收，Setup 里可取消勾选 */
-        g_app.inc_files[i].size = rp->files[i].size;
-    }
+             s.peer_type[0] ? s.peer_type : "unknown");
+    g_app.inc_total = s.count;
+    g_app.inc_base = -1;
+    g_app.inc_count = 0;
+    g_app.inc_version++;               /* 新请求：窗口内容版本变化 */
+    rs_win_ver = -1;
     config_get_save_dir(g_app.recv_dir, sizeof g_app.recv_dir);
     g_app.inc_sel = 0;
     rs_scroll = 0;
@@ -840,7 +873,6 @@ static void open_recv_request(const RecvPending *rp)
  * 接收流程页/传输中本身不打断（switch 的 default）。 */
 void pages_tick(void)
 {
-    RecvPending rp;
     uint64_t now_ms = (uint64_t)sceKernelGetSystemTimeWide() / 1000;
 
     /* 发送等待页：只在对端接受、真正开始上传（cur>=0）后才切进度页。
@@ -860,7 +892,7 @@ void pages_tick(void)
      * 仍按旧页（设置页/接收设置页）处理，两边状态就指向不同的页了。请求留在
      * pending 里，等键盘关掉后下一帧照常弹。 */
     if (page_ime_busy()) return;
-    if (api_recv_pending_pull(&rp) != 1) {
+    if (api_recv_pending_summary(NULL) != 1) {
         /* 请求不在了：若后端报"发送方断开了连接"，确认页要换成"对方已取消"
          * 而不是"已过期"。事件不管在哪页都取走，避免陈旧标志误判下一次超时。 */
         int gone = api_recv_peer_gone_take();
@@ -879,5 +911,5 @@ void pages_tick(void)
     default:
         return;                              /* 发送等待/接收流程/传输中不打断 */
     }
-    open_recv_request(&rp);
+    open_recv_request();
 }

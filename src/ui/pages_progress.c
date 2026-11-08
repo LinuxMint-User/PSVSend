@@ -24,6 +24,10 @@
 
 static int xf_press_scroll = 0;
 static ScrollGlide xf_glide;      /* 进度页文件列表触摸惯性 */
+/* 接收路径的 64 行窗口（每帧重拉：got/状态都在变）。发送路径仍用 xf_* 数组。 */
+static RecvStatusRow prog_win[MAX_INF];
+static int prog_win_base = 0, prog_win_n = 0;
+static bool prog_finalizing = false;   /* 最终化中：显示"正在整理…"且禁止取消 */
 
 /* ---- 速度读数：2s 滑动窗口 ----
  * 旧算法是"累计平均"：分子 = 已传字节，分母 = 从点击发送（或会话建立）起的
@@ -118,6 +122,9 @@ void page_progress_render(void)
         /* 发送路径（真实）：从 xfer 模块拷快照映射到行显示数组 */
         api_send_info(&xv);
         xf_count = xv.count > MAX_PICKED ? MAX_PICKED : xv.count;
+        g_app.prog_total = xf_count;
+        prog_win_n = 0;
+        prog_finalizing = false;
         sent_bytes = xv.total_sent;
         for (i = 0; i < xf_count; i++) {
             snprintf(xf_name[i], sizeof xf_name[0], "%s",
@@ -151,24 +158,22 @@ void page_progress_render(void)
             msg = xv.msg[0] ? xv.msg : tr("Sending...");
         }
     } else {
-        /* 接收路径（真实）：每帧从 receive 模块拷会话快照；会话还没建好
-         * （Accept 刚点、http 线程未醒的几帧）用 start_recv 捕获的清单兜底。 */
-        RecvStatus rs;
-        memset(&rs, 0, sizeof rs);
-        bool has = api_recv_status_pull(&rs) == 1;
+        /* 接收路径（真实）：summary 每帧取一次，文件行按 64 行窗口每帧重拉
+         * （got/状态都在变，不能只在滚动/版本变化时拉）。会话还没建好的几帧
+         * 用 start_recv 记下的总数占位，只显示"等待"。 */
+        RecvStatusSummary rs;
+        bool has = api_recv_status_summary(&rs) == 1;
         if (has) {
-            xf_count = rs.count > MAX_PICKED ? MAX_PICKED : rs.count;
-            for (i = 0; i < xf_count; i++) {
-                snprintf(xf_name[i], sizeof xf_name[0], "%s",
-                         rs.name[i][0] ? rs.name[i] : "?");
-                xf_size[i] = rs.size[i];
-                done[i] = rs.got[i] < rs.size[i] ? rs.got[i] : rs.size[i];
-                /* 逐文件状态与发送侧同口径：1=完成 3=失败（失败文件不计数完成，
-                 * 与发送路径的 "Files x/y" 一致） */
-                rfail[i] = rs.st[i] == 3;
-                if (rfail[i]) nfail++;
-                else if (rs.st[i] == 1) fin++;
-            }
+            int total = rs.count;
+            int maxb = total > MAX_INF ? total - MAX_INF : 0;
+            int want = xf_scroll / ROW_STRIDE;
+            if (want > maxb) want = maxb;
+            if (want < 0) want = 0;
+            prog_win_base = want;
+            prog_win_n = api_recv_status_window(want, MAX_INF, prog_win);
+            g_app.prog_total = total;
+            fin = rs.done;
+            nfail = rs.failed;
             active = rs.cur;                       /* 正在收的文件（-1=无） */
             sent_bytes = rs.got_total;
             if (rs.state == RECV_ST_READY || rs.state == RECV_ST_RECEIVING)
@@ -178,8 +183,10 @@ void page_progress_render(void)
                 ? (int)(rs.got_total * 100 / rs.total)
                 : (rs.state == RECV_ST_DONE ? 100 : 0);
             if (g_app.prog_pct > 100) g_app.prog_pct = 100;
+            prog_finalizing = rs.state == RECV_ST_FINALIZING;
             g_app.prog_running = rs.state == RECV_ST_READY ||
-                                 rs.state == RECV_ST_RECEIVING;
+                                 rs.state == RECV_ST_RECEIVING ||
+                                 prog_finalizing;   /* 整理中也算"未结束" */
             g_app.prog_done = rs.state == RECV_ST_DONE;
             g_app.prog_cancel = rs.state == RECV_ST_CANCEL;
             fail_state = rs.state == RECV_ST_FAIL ||
@@ -193,22 +200,28 @@ void page_progress_render(void)
                 msg_col = theme->warn;
             } else if (rs.state == RECV_ST_CANCEL) {
                 msg = rs.err[0] ? rs.err : tr("Cancelled");
+            } else if (prog_finalizing) {
+                msg = tr("Finalizing...");
             } else if (rs.state == RECV_ST_READY) {
                 msg = tr("Waiting for sender to start...");
             } else if (rs.state == RECV_ST_RECEIVING) {
                 msg = tr("Receiving...");
             }
+            /* rs 是本分支的局部快照：rs.err 的地址出了作用域就不再保证有效，
+             * 而 msg 要到页面底部才画。指向 rs.err 的一律先拷进函数级缓冲。 */
+            if (msg == rs.err) {
+                snprintf(msg_buf, sizeof msg_buf, "%s", rs.err);
+                msg = msg_buf;
+            }
         } else {
-            /* 首帧兜底：按已接受的清单画 0%，马上会被真实会话快照取代。
+            /* 首帧兜底：总数已由 start_recv 记下，行窗口为空，只显示等待。
              * Accept 后 http 线程应在几十 ms 内建好会话；若过了 2s 还没会话、
              * 且请求也不再 PENDING（说明后端已把决定处理掉但没建成会话，
              * 如请求恰好在决定前过期）→ 不能卡在进度页，给个失败态可退出。 */
-            for (i = 0; i < xf_count; i++) {
-                done[i] = 0;
-                if (xf_size[i] == 0) fin++;
-            }
+            prog_win_n = 0;
+            prog_finalizing = false;
             msg = tr("Waiting for sender to start...");
-            if (api_recv_pending_pull(NULL) == 0 &&
+            if (api_recv_pending_summary(NULL) == 0 &&
                 (uint64_t)sceKernelGetSystemTimeWide() - g_app.prog_start >
                     2000000ULL) {
                 g_app.prog_running = false;
@@ -217,18 +230,12 @@ void page_progress_render(void)
                 msg_col = theme->danger;
             }
         }
-        /* rs 是本分支的局部快照：rs.err 的地址出了作用域就不再保证有效，而
-         * msg 要到页面底部才画。指向 rs.err 的一律先拷进函数级缓冲。 */
-        if (msg == rs.err) {
-            snprintf(msg_buf, sizeof msg_buf, "%s", rs.err);
-            msg = msg_buf;
-        }
     }
-    if (active < 0 && xf_count > 0) active = xf_count - 1;
+    if (active < 0 && g_app.prog_total > 0) active = g_app.prog_total - 1;
 
     /* 列表可视区滚动夹紧（惯性先推进） */
     {
-        int max_s = xf_count * ROW_STRIDE - XF_VIEW_H;
+        int max_s = g_app.prog_total * ROW_STRIDE - XF_VIEW_H;
         if (max_s < 0) max_s = 0;
         xf_scroll = glide_step(&xf_glide, xf_scroll, max_s);
         if (xf_scroll < 0) xf_scroll = 0;
@@ -240,14 +247,29 @@ void page_progress_render(void)
     /* 每文件一行：名称 + 百分比 + 细进度条（内容随 xf_scroll 像素滚动） */
     vita2d_enable_clipping();
     vita2d_set_clip_rectangle(0, LIST_TOP, SCR_W, XF_BOTTOM);
-    for (i = xf_scroll / ROW_STRIDE; i < xf_count; i++) {
+    for (i = xf_scroll / ROW_STRIDE; i < g_app.prog_total; i++) {
         int top = LIST_TOP + i * ROW_STRIDE - xf_scroll;
         Rect r = { 24, top, SCR_W - 48, ROW_H };
         RowGeom g;
+        const char *name;
+        SceOff rsize, rgot;
+        bool is_fail;
         if (top >= XF_BOTTOM) break;
+        if (g_app.prog_dir == 0) {
+            name = xf_name[i];
+            rsize = xf_size[i];
+            rgot = done[i];
+            is_fail = rfail[i];               /* 该文件独立失败 → 标红 */
+        } else {
+            int k = i - prog_win_base;
+            if (k < 0 || k >= prog_win_n) continue;   /* 窗口未覆盖（滚动瞬时） */
+            name = prog_win[k].name[0] ? prog_win[k].name : "?";
+            rsize = prog_win[k].size;
+            rgot = prog_win[k].got;
+            is_fail = prog_win[k].st == 3;
+        }
         bool is_active = (i == active) && g_app.prog_running;
-        bool is_fail = rfail[i];              /* 该文件独立失败 → 标红 */
-        int fp = xf_size[i] > 0 ? (int)(done[i] * 100 / xf_size[i]) : 100;
+        int fp = rsize > 0 ? (int)(rgot * 100 / rsize) : 100;
         if (fp > 100) fp = 100;
         char pctlb[16];
         snprintf(pctlb, sizeof pctlb, "%d%%", fp);
@@ -256,7 +278,7 @@ void page_progress_render(void)
                               : (is_active ? theme->text : theme->text_dim);
         row_geom(r, ROW_DENSE, 0, &g);
         w_text_right(g.x_right, g.y_main, g.main_sc, nc, "%s", pctxt);
-        w_text_mid(g.x_text, g.y_main, g.main_sc, nc, xf_name[i], XF_NAME_W);
+        w_text_mid(g.x_text, g.y_main, g.main_sc, nc, name, XF_NAME_W);
         w_bar((Rect){ g.x_text, g.y_sub, XF_BAR_W, 10 }, theme->card,
               is_fail ? theme->danger : theme->accent, fp);
     }
@@ -264,9 +286,9 @@ void page_progress_render(void)
 
     /* 内容超长时右侧细滚动条 */
     {
-        int max_s = xf_count * ROW_STRIDE - XF_VIEW_H;
+        int max_s = g_app.prog_total * ROW_STRIDE - XF_VIEW_H;
         if (max_s > 0) {
-            int bh = XF_VIEW_H * XF_VIEW_H / (xf_count * ROW_STRIDE);
+            int bh = XF_VIEW_H * XF_VIEW_H / (g_app.prog_total * ROW_STRIDE);
             if (bh < 24) bh = 24;
             int by = LIST_TOP + (XF_VIEW_H - bh) * xf_scroll / max_s;
             w_rect((Rect){ 936, LIST_TOP, 4, XF_VIEW_H }, theme->card);
@@ -325,7 +347,7 @@ void page_progress_render(void)
         }
         snprintf(st, sizeof st,
                  tr("Files %d/%d    Elapsed %d:%02d    Speed %.2f MB/s"),
-                 fin, xf_count, g_app.prog_ms / 60000,
+                 fin, g_app.prog_total, g_app.prog_ms / 60000,
                  (g_app.prog_ms / 1000) % 60, speed);
         w_text(40, 456, 1.0f, theme->text_dim, "%s", st);
     }
@@ -334,7 +356,8 @@ void page_progress_render(void)
     int ns = 0;
     segs[ns].key = HKEY_TRIANGLE;  segs[ns++].text = tr("Advanced");  /* 固定 → 靠左 */
     segs[ns].key = HKEY_CONFIRM;   segs[ns].varies = true;
-    segs[ns++].text = g_app.prog_running ? tr("Cancel") : tr("Done");   /* 会变 → 靠右 */
+    segs[ns++].text = prog_finalizing ? tr("Finalizing...")
+                    : g_app.prog_running ? tr("Cancel") : tr("Done");  /* 会变 → 靠右 */
     w_page_footer_segs(segs, ns);
 
     /* 底部右侧按钮：右边=取消/完成，其左=高级 */
@@ -343,7 +366,15 @@ void page_progress_render(void)
     w_add(0, adv);
     w_add(1, main);
     w_button(adv, tr("Advanced"), g_app.prog_info);
-    if (g_app.prog_running) {
+    if (prog_finalizing) {
+        /* 最终化期间不允许取消/离开：显示禁用态（后端也在 FINALIZING 时拒绝清场） */
+        w_rect(main, theme->card);
+        w_rect_outline(main, theme->border);
+        int tw = 0, th = 0;
+        w_text_w(1.3f, tr("Finalizing..."), &tw, &th);
+        w_text(main.x + (main.w - tw) / 2, main.y + (main.h - th) / 2, 1.3f,
+               theme->text_dim, "%s", tr("Finalizing..."));
+    } else if (g_app.prog_running) {
         w_rect(main, theme->danger);
         int tw = 0, th = 0;
         w_text_w(1.3f, tr("Cancel"), &tw, &th);
@@ -369,7 +400,7 @@ void page_progress_input(const Input *in)
 {
     /* 文件列表滚动（拖动跟手 / 方向键逐行） */
     if (in->drag_start || in->dragging) {
-        int max_s = xf_count * ROW_STRIDE - XF_VIEW_H;
+        int max_s = g_app.prog_total * ROW_STRIDE - XF_VIEW_H;
         if (max_s < 0) max_s = 0;
         glide_stop(&xf_glide);
         if (in->drag_start) xf_press_scroll = xf_scroll;
@@ -385,7 +416,7 @@ void page_progress_input(const Input *in)
     }
     glide_stop(&xf_glide);
     if (in->up || in->down) {
-        int max_s = xf_count * ROW_STRIDE - XF_VIEW_H;
+        int max_s = g_app.prog_total * ROW_STRIDE - XF_VIEW_H;
         if (max_s < 0) max_s = 0;
         xf_scroll += in->up ? -ROW_STRIDE : ROW_STRIDE;
         if (xf_scroll < 0) xf_scroll = 0;
@@ -395,6 +426,7 @@ void page_progress_input(const Input *in)
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
         if (id == 1) {   /* 主按钮：传输中取消，否则退出 */
+            if (prog_finalizing) return;         /* 最终化中不可取消/离开 */
             if (g_app.prog_running) {
                 if (g_app.prog_dir == 0) api_send_cancel();
                 else api_recv_abort();
@@ -407,6 +439,7 @@ void page_progress_input(const Input *in)
         return;
     }
     if (in->confirm || in->back) {
+        if (prog_finalizing) return;          /* 最终化中不可取消/离开 */
         if (g_app.prog_running) {
             if (g_app.prog_dir == 0) api_send_cancel();
             else api_recv_abort();

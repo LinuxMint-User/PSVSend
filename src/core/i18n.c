@@ -256,6 +256,7 @@ static const TrEntry s_tr[] = {
     { "Waiting for sender to start...", "等待发送方开始…", "等待傳送方開始…", "等待傳送方開始…",
       "送信側の開始を待っています…" },
     { "Receiving...", "接收中…", "接收中…", "接收中…", "受信中…" },
+    { "Finalizing...", "正在整理…", "正在整理…", "正在整理…", "整理しています…" },
     { "Receiving", "接收", "接收", "接收", "受信中" },
     { "Session was not created (request expired).",
       "未能建立会话（请求已过期）。",

@@ -108,10 +108,10 @@ typedef struct {
     SceOff size;
 } PickedFile;
 
-#define MAX_INF 64
+#define MAX_INF 64      /* inc_files 窗口行数；文件总数见 App.inc_total（可达 2048） */
 typedef struct {
-    char  name[192];    /* 名字（后端已规整：净化 + 超长保后缀截断，即落盘名） */
-    char  rname[128];   /* 接收时的保存名：Setup 页系统键盘改名后非空，否则沿用原名 */
+    char  name[512];    /* 相对路径（后端已规整：逐级净化 + 超长保后缀截断，即落盘路径） */
+    char  rname[192];   /* 接收时的保存名（只替换最后一级）：Setup 页改名后非空 */
     bool  trunc;        /* 名字过长被缩短过（确认页提示用；用户改名后清掉） */
     bool  inc;          /* 勾选接收（默认勾上） */
     SceOff size;
@@ -174,6 +174,7 @@ typedef struct {
     bool    prog_info;     /* 高级面板展开 */
     bool    prog_running;
     int     prog_ms;       /* 已用时长（毫秒，结束后冻结） */
+    int     prog_total;    /* 进度页列表总行数（接收可达 2048；发送 <= MAX_PICKED） */
     char    prog_name[128];
     SceOff  prog_size;
     uint64_t prog_start;   /* 微秒 */
@@ -182,12 +183,14 @@ typedef struct {
     char    recv_alias[64];
     char    recv_type[24];
     char    recv_fp[65];    /* 对端证书 SHA-256（仅 TLS 有值；空=明文，验证入口不显示） */
-    InFile  inc_files[MAX_INF];
-    int     inc_count;
+    InFile  inc_files[MAX_INF]; /* 只当窗口：[inc_base, inc_base+inc_count) 行 */
+    int     inc_base;      /* 窗口首行的全局文件下标 */
+    int     inc_count;     /* 窗口行数（<= MAX_INF） */
+    int     inc_total;     /* 待接收文件总数（可达 2048） */
+    int     inc_version;   /* 窗口内容版本：新请求/外部变更时递增，驱动重拉 */
     int     inc_sel;       /* 接收设置页焦点：0=目录行，1..=文件行 */
     char    recv_dir[512]; /* 本次保存目录（新请求来时=config saveDir；Setup 页可临时改） */
     bool    recv_cancel;   /* 发送方已取消请求 */
-    int     recv_overflow; /* 发送方文件数超出上限被丢弃的个数（确认页提示） */
 
     /* 身份验证页（PAGE_VERIFY）：两台设备各自把自己与对端的指纹按字典序
      * 排序后直接拼接（官方 CombinedFingerprint 口径，不哈希），两边应完全一致 */

@@ -172,7 +172,7 @@ static int  g_phase = PH_NONE;      /* 当前生命周期 */
 static int  g_pend_web = 0;
 static int  g_sess_web = 0;
 /* 拉取会话（扫码链接）的下载线程还在跑：与推送会话的 f[].busy 同义——告诉
- * recv_clear/recv_status_pull"还有 worker 持有 g_sess"，别在文件间空档清场。
+ * recv_clear/recv_status_summary"还有 worker 持有 g_sess"，别在文件间空档清场。
  * 只有扫码链路会置 1，推送会话恒为 0。 */
 static int  g_sess_pull = 0;
 /* recv_clear 撞上"还有 worker 在收体"时不能当场清场：会删掉别人正在写的临时
@@ -909,7 +909,7 @@ static int disk_free(SceOff *free_size)
  *   锁外自行 sceIoRemove(f->part)：那会与新会话正在写的同名 .part 撞车（TOCTOU），
  *   而且这里本来就覆盖了同一路径。
  * 注：本函数在锁内做文件系统 IO，故只用于"失败/取消/清场"这类一次性路径；
- *     UI 每帧轮询的 recv_status_pull 不再调用它（见那里的说明）。 */
+ *     UI 每帧轮询的 recv_status_summary 不再调用它（见那里的说明）。 */
 static void cleanup_parts(void)
 {
     int i;
@@ -1381,7 +1381,8 @@ int recv_pending_summary(RecvPendingSummary *out)
             for (i = 0; i < g_pend.n; i++) {
                 SceOff z = g_pend.f[i].size;
                 tot += z;
-                if (g_pend.f[i].trunc) trunc++;
+                /* 用户已改名（rname 非空）的行不再提示"名字过长"：显示的就是他定的名 */
+                if (g_pend.f[i].trunc && !g_pend.f[i].rname[0]) trunc++;
                 if (g_pend.f[i].path_ok && pend_inc_get(i)) {
                     sel++;
                     ssz += z;
@@ -1416,6 +1417,7 @@ int recv_pending_window(int base, int max, RecvPendingRow *out)
     if (g_phase == PH_PENDING) {
         for (i = base; i < g_pend.n && n < max; i++, n++) {
             snprintf(out[n].name, sizeof out[n].name, "%s", g_pend.f[i].name);
+            snprintf(out[n].rname, sizeof out[n].rname, "%s", g_pend.f[i].rname);
             out[n].size = g_pend.f[i].size;
             out[n].trunc = g_pend.f[i].trunc;
             out[n].selected = pend_inc_get(i);
@@ -1451,34 +1453,6 @@ void recv_pending_rename(int idx, const char *name)
     unlock();
 }
 
-/* ---- 旧全量快照（兼容包装；M4 下线） ---- */
-int recv_pending_pull(RecvPending *out)
-{
-    int i, r = 0;
-    lock();
-    if (g_phase == PH_PENDING) {
-        if (out) {                   /* out==NULL：纯探测，只回答"有没有" */
-            snprintf(out->peer_alias, sizeof out->peer_alias, "%s", g_pend.alias);
-            snprintf(out->peer_type, sizeof out->peer_type, "%s", g_pend.type);
-            snprintf(out->peer_ip, sizeof out->peer_ip, "%s", g_pend.ip);
-            snprintf(out->peer_fp, sizeof out->peer_fp, "%s", g_pend.fp);
-            out->count = g_pend.n;
-            out->overflow = g_pend.overflow;
-            out->total = 0;
-            for (i = 0; i < g_pend.n; i++) out->total += g_pend.f[i].size;
-            for (i = 0; i < g_pend.n && i < RECV_MAX_FILES; i++) {
-                snprintf(out->files[i].name, sizeof out->files[i].name, "%s",
-                         path_base(g_pend.f[i].name));
-                out->files[i].size = g_pend.f[i].size;
-                out->files[i].trunc = g_pend.f[i].trunc;
-            }
-        }
-        r = 1;
-    }
-    unlock();
-    return r;
-}
-
 int recv_pending_peer_gone_take(void)
 {
     int r;
@@ -1497,23 +1471,6 @@ int recv_reject_take(void)
     g_reject_evt = 0;
     unlock();
     return r;
-}
-
-void recv_set_include(const bool inc[RECV_MAX_FILES])
-{
-    int i, n;
-    lock();
-    if (g_phase == PH_PENDING) {
-        n = g_pend.n < RECV_MAX_FILES ? g_pend.n : RECV_MAX_FILES;
-        for (i = 0; i < n; i++) pend_inc_set(i, inc && inc[i]);
-    }
-    unlock();
-}
-
-/* 兼容包装：等价 recv_pending_rename（idx 为全局下标）。 */
-void recv_set_name(int idx, const char *name)
-{
-    recv_pending_rename(idx, name);
 }
 
 void recv_decide(bool accept)
@@ -3167,37 +3124,6 @@ int recv_status_window(int base, int max, RecvStatusRow *out)
     }
     unlock();
     return n;
-}
-
-/* ---- 旧全量快照（兼容包装；M4 下线） ---- */
-int recv_status_pull(RecvStatus *out)
-{
-    int i, r = 0;
-    if (!out) return 0;
-    lock();
-    if (g_phase == PH_ACTIVE) {
-        status_idle_check_locked();
-        out->state = g_sess.state;
-        snprintf(out->peer_alias, sizeof out->peer_alias, "%s", g_sess.peer_alias);
-        out->count = g_sess.n;
-        out->cur = g_sess.cur;
-        out->total = g_sess.total;
-        out->got_total = g_sess.got_total;
-        out->start_us = g_sess.start_us;
-        snprintf(out->err, sizeof out->err, "%s", g_sess.err);
-        for (i = 0; i < g_sess.n && i < RECV_MAX_FILES; i++) {
-            if (!g_sess.f) break;
-            str_copy_utf8(out->name[i], (int)sizeof out->name[0],
-                          g_sess.f[i].rel);
-            out->size[i] = g_sess.f[i].size;
-            out->got[i] = g_sess.f[i].got < g_sess.f[i].size
-                              ? g_sess.f[i].got : g_sess.f[i].size;
-            out->st[i] = (unsigned char)g_sess.f[i].st;
-        }
-        r = 1;
-    }
-    unlock();
-    return r;
 }
 
 void recv_clear(void)

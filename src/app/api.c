@@ -402,12 +402,6 @@ int api_recv_status_window(int base, int max, RecvStatusRow *out)
     return recv_status_window(base, max, out);
 }
 
-/* 兼容包装（M4 下线） */
-int api_recv_pending_pull(RecvPending *out)
-{
-    return recv_pending_pull(out);
-}
-
 int api_recv_peer_gone_take(void)
 {
     return recv_pending_peer_gone_take();
@@ -416,16 +410,6 @@ int api_recv_peer_gone_take(void)
 int api_recv_reject_take(void)
 {
     return recv_reject_take();
-}
-
-void api_recv_set_include(const bool inc[RECV_MAX_FILES])
-{
-    recv_set_include(inc);
-}
-
-void api_recv_set_name(int idx, const char *name)
-{
-    recv_set_name(idx, name);
 }
 
 void api_recv_sanitize_name(const char *in, char *out, int n)
@@ -463,18 +447,13 @@ void api_recv_abort(void)
     recv_abort();
 }
 
-int api_recv_status_pull(RecvStatus *out)
-{
-    return recv_status_pull(out);
-}
-
 void api_recv_clear(void)
 {
     recv_clear();
 }
 
 /* 扫码链接（拉取会话）：扫到分享二维码后由 UI 发起，后续确认页/进度页与推送
- * 会话共用同一套接口（api_recv_pending_pull / api_recv_decide / ...）。 */
+ * 会话共用同一套接口（api_recv_pending_summary / api_recv_decide / ...）。 */
 int api_recv_link_open(const char *host, int port, const char *pin)
 {
     return recv_link_open(host, port, pin);
