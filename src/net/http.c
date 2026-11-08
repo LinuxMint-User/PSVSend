@@ -38,9 +38,11 @@
 #include "core/dlog.h"
 
 #define HTTP_RECV_TIMEOUT_S 3
-#define HTTP_MAX_REQ        32768   /* 请求头+体总读入上限（64 文件 prepare 清单可能 ~20KB） */
+#define HTTP_MAX_REQ        32768   /* 请求头+体总读入上限（prepare 大清单改走堆分配） */
 #define HTTP_MAX_BODY       2048    /* register 体上限 */
-#define HTTP_MAX_PREPARE    32768   /* prepare-upload 体/回执上限（清单 JSON，64 文件会话） */
+#define HTTP_MAX_PREPARE_BODY (4 * 1024 * 1024)  /* prepare 清单 body 硬上限 */
+#define HTTP_MAX_PREPARE_RESP (1024 * 1024)      /* prepare 回执硬上限 */
+#define HTTP_PREPARE_US     (10 * 1000000LL)     /* 读满大清单的总预算（4MB 慢 Wi-Fi 也够） */
 #define UPLOAD_IDLE_US      (30 * 1000000LL)  /* 收体时单块读的空闲上限 */
 #define NET_AGAIN(r) ((r) == 0x80410123)
 #define NET_RETRY_DELAY_US 20000    /* 20ms：仅用于"长时间空闲等一个事件"的场合 */
@@ -89,6 +91,35 @@ static SceUID g_conn_mtx = -1;      /* 保护连接登记表 */
 static void conn_lock(void)   { if (g_conn_mtx >= 0) sceKernelLockMutex(g_conn_mtx, 1, NULL); }
 static void conn_unlock(void) { if (g_conn_mtx >= 0) sceKernelUnlockMutex(g_conn_mtx, 1); }
 
+/* prepare 单并发闸门：同一时间只允许一个 prepare 体（含读 body、行 PIN 校验与
+ * 挂起等 UI 决定的 60s）在处理。否则两个发送方同时发 4MB 清单会双份驻留内存，
+ * 且接收侧只有一个 pending 槽，后来的那份注定白读。闸门在 handler 返回后才释放
+ * ——只护"读 body"不够：等 UI 决定期间新 prepare 仍应立刻 409，别让对端干等。 */
+static SceUID g_prep_mtx = -1;
+static int    g_prep_busy = 0;
+static int prep_gate_try(void)
+{
+    int ok = 0;
+    if (g_prep_mtx < 0) return 1;      /* 未初始化：不拦（正常不会发生） */
+    sceKernelLockMutex(g_prep_mtx, 1, NULL);
+    if (!g_prep_busy) { g_prep_busy = 1; ok = 1; }
+    sceKernelUnlockMutex(g_prep_mtx, 1);
+    return ok;
+}
+static void prep_gate_leave(void)
+{
+    if (g_prep_mtx < 0) return;
+    sceKernelLockMutex(g_prep_mtx, 1, NULL);
+    g_prep_busy = 0;
+    sceKernelUnlockMutex(g_prep_mtx, 1);
+}
+
+/* 把 http 层自己判出的拒绝原因转给接收侧（UI 从那侧一次性取走） */
+static void note_reject(int reason)
+{
+    if (g_recv && g_recv->reject_note) g_recv->reject_note(reason);
+}
+
 static const char *reason_of(int code)
 {
     switch (code) {
@@ -101,9 +132,12 @@ static const char *reason_of(int code)
     case 404: return "Not Found";
     case 409: return "Conflict";
     case 410: return "Gone";
+    case 411: return "Length Required";
+    case 413: return "Payload Too Large";
     case 422: return "Unprocessable Entity";
     case 429: return "Too Many Requests";
     case 500: return "Internal Server Error";
+    case 507: return "Insufficient Storage";
     default:  return "Error";
     }
 }
@@ -714,6 +748,36 @@ static int conn_read(Conn *c, void *buf, int max, SceLong64 deadline,
     }
 }
 
+/* 拒绝超大 prepare 时把对端在途的 body 读掉再关连接：带着未读数据 close
+ * 会让内核发 RST，对端可能收不到刚发出的 413。总预算 5s、单次空等 1s，
+ * 防异常客户端长期占着 worker。 */
+static void drain_declared_body(Conn *c, SceLong64 cl)
+{
+    char tmp[2048];
+    SceLong64 got = 0;
+    SceLong64 start = sceKernelGetSystemTimeWide();
+    while (got < cl && sceKernelGetSystemTimeWide() < start + 5000000LL) {
+        SceLong64 left = cl - got;
+        int want = left > (SceLong64)sizeof tmp ? (int)sizeof tmp : (int)left;
+        int r = conn_read(c, tmp, want,
+                          sceKernelGetSystemTimeWide() + 1000000LL, 0);
+        if (r <= 0) break;
+        got += r;
+    }
+}
+
+/* chunked 拒绝后把已在途的数据读掉（长度未知，按 300ms 空窗、最多 64KB） */
+static void drain_brief(Conn *c)
+{
+    char tmp[2048];
+    int i;
+    for (i = 0; i < 32; i++) {
+        int r = conn_read(c, tmp, sizeof tmp,
+                          sceKernelGetSystemTimeWide() + 300000LL, 0);
+        if (r <= 0) break;
+    }
+}
+
 static void http_respond(Conn *c, int code, const char *reason,
                          const char *body)
 {
@@ -956,9 +1020,10 @@ typedef struct {
     const char *query;      /* URL query（无则空串） */
     const char *buf;        /* 请求原始缓冲（诊断打点用） */
     int         he;         /* header 结束偏移（空行起点） */
-    const char *left;       /* body 起始（buf + he + 4） */
-    int         llen;       /* 已随头读入的 body 长度 */
+    const char *left;       /* body 起始（buf + he + 4；prepare 大 body 在堆上） */
+    int         llen;       /* 已读入的 body 长度 */
     SceLong64   cl64;       /* Content-Length（无则 0） */
+    int         via_web;    /* prepare 带了有效网页 PIN（校验已在读 body 前做完） */
 } HttpReq;
 
 /* GET /api/localsend/v2/info —— 回本机 member info */
@@ -990,16 +1055,28 @@ static void h_register(HttpReq *r)
     }
 }
 
+/* 统计清单里 "fileName" 的出现次数（≈文件数）。只用于估算回执容量：
+ * 多算只会让缓冲更大（有 1MB 上限），少算则由接收侧"越界必须报错"兜底。 */
+static int count_json_files(const char *body)
+{
+    static const char key[] = "\"fileName\"";
+    const char *p = body;
+    int n = 0;
+    while ((p = strstr(p, key)) != NULL) {
+        n++;
+        p += sizeof key - 1;
+    }
+    return n;
+}
+
 /* POST /api/localsend/v2/prepare-upload —— 清单交给接收模块挂起等 UI 决定 */
 static void h_prepare(HttpReq *r)
 {
-    char body[HTTP_MAX_PREPARE];
-    char resp[HTTP_MAX_PREPARE];
-    int got = r->llen;                   /* body 已随头读齐 */
-    int via_web = 0;
-    if (got > (int)sizeof body - 1) got = (int)sizeof body - 1;
-    memcpy(body, r->left, (unsigned)got);
-    body[got] = 0;
+    const char *body = r->left;          /* 大 body 在堆上，无 CL 时在请求缓冲里 */
+    int got = r->llen;
+    char *resp;
+    int cap;
+
     if (r->cl64 <= 0) {                  /* 诊断：无 CL 客户端长啥样 */
         char dbg[256];
         int a, b = 0;
@@ -1018,37 +1095,32 @@ static void h_prepare(HttpReq *r)
         http_respond(r->cn, 400, "Bad Request", "");
         return;
     }
-    /* Web 网页上传：浏览器在 prepare 的 query 里带 pin（官方 web share 口径）。
-     * 普通 LocalSend 发送方不带 pin，走原路径——网页共享开着也不影响正常收件。 */
-    {
-        char pin[16] = "";
-        qparam(r->query, "pin", pin, sizeof pin);
-        if (pin[0]) {
-            int wc = web_check_pin(pin, r->ip);
-            if (wc != 200) {
-                dlog("http: prepare web pin -> %d from %s", wc, r->ip);
-                http_respond(r->cn, wc, reason_of(wc), "");
-                return;
-            }
-            via_web = 1;                 /* 停共享时这份请求要跟着作废 */
-            {
-                char ua[192] = "";
-                hdr_copy(r->buf, r->he, "user-agent", ua, sizeof ua);
-                web_upload_note(r->ip, ua);
-            }
-        }
-    }
     if (!recv_ops_ready()) {
         http_respond(r->cn, 500, "Internal Server Error", "");
         return;
     }
+    /* 回执按"文件数 ×（转义 fileId + token + 标点）"估容量：2048 文件约
+     * 213KB（32 字节 id + 64 字节 token），1MB 上限足够；真的装不下时接收侧
+     * 会明确报错，绝不发半截 JSON。 */
+    cap = count_json_files(body) * 512 + 4096;
+    if (cap < 8192) cap = 8192;
+    if (cap > HTTP_MAX_PREPARE_RESP) cap = HTTP_MAX_PREPARE_RESP;
+    resp = (char *)malloc((size_t)cap);
+    if (!resp) {
+        dlog("http: prepare response alloc %d failed", cap);
+        note_reject(HTTP_REJ_NOMEM);
+        http_respond(r->cn, 507, reason_of(507), "");
+        return;
+    }
+    resp[0] = 0;
     {
         int code = g_recv->prepare(body, r->ip, r->cn->peer_fp,
-                                   (const HttpPeer *)r->cn, via_web,
-                                   resp, (int)sizeof resp);
+                                   (const HttpPeer *)r->cn, r->via_web,
+                                   resp, cap);
         dlog("http: prepare -> %d (tls=%d)", code, r->cn->tls);
         http_respond(r->cn, code, reason_of(code), resp);
     }
+    free(resp);
 }
 
 /* POST /api/localsend/v2/upload —— 裸文件字节流，经流回调边收边交给接收模块 */
@@ -1295,6 +1367,10 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
     const char *query = NULL;
     const char *left;
     int llen;
+    int is_prepare = 0;
+    int prep_gate = 0;              /* 已持有 prepare 单并发闸门 */
+    int req_via_web = 0;
+    char *pbody = NULL;             /* prepare 大清单的堆缓冲（handler 返回后 free） */
 
     /* 本连接 fd 由 spawn_conn 置为非阻塞（与全仓 scan/update/net 同一口径）：
      * recv 无数据立刻返回 EWOULDBLOCK，由 conn_read 20ms 轮询到各自 deadline。
@@ -1361,40 +1437,128 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
     hdr_value(buf, he, "content-length", &cl64);
     if (cl64 < 0) cl64 = 0;
 
+    is_prepare = (strcmp(route, "/api/localsend/v2/prepare-upload") == 0);
+    /* prepare 的前置校验与单并发闸门，全部放在读 body 之前：
+     *  - chunked 清单本机不解析（要按块头逐段解），明确 411，不能当空 body；
+     *  - 声明长度超 4MB 直接 413，不白收再拒；
+     *  - 网页 PIN 先校验，无权限的请求不占大缓冲；
+     *  - 闸门覆盖"读 body + 等 UI 决定"整段（handler 返回才释放）。 */
+    if (is_prepare && strcmp(method, "POST") == 0) {
+        if (http_hdr_chunked(buf, he)) {
+            dlog("http: prepare chunked not supported from %s", rip);
+            http_respond(cn, 411, reason_of(411), "");
+            drain_brief(cn);
+            return;
+        }
+        if (cl64 > HTTP_MAX_PREPARE_BODY) {
+            dlog("http: prepare body %lld > cap %d from %s",
+                 (long long)cl64, HTTP_MAX_PREPARE_BODY, rip);
+            note_reject(HTTP_REJ_TOO_LARGE);
+            http_respond(cn, 413, reason_of(413), "");
+            drain_declared_body(cn, cl64);
+            return;
+        }
+        {
+            char pin[16] = "";
+            qparam(query, "pin", pin, sizeof pin);
+            if (pin[0]) {
+                int wc = web_check_pin(pin, rip);
+                if (wc != 200) {
+                    dlog("http: prepare web pin -> %d from %s", wc, rip);
+                    http_respond(cn, wc, reason_of(wc), "");
+                    return;
+                }
+                req_via_web = 1;         /* 停共享时这份请求要跟着作废 */
+                {
+                    char ua[192] = "";
+                    hdr_copy(buf, he, "user-agent", ua, sizeof ua);
+                    web_upload_note(rip, ua);
+                }
+            }
+        }
+        if (!prep_gate_try()) {
+            dlog("http: prepare busy (another prepare in flight) from %s", rip);
+            note_reject(HTTP_REJ_BUSY);
+            http_respond(cn, 409, "Conflict", "");
+            return;
+        }
+        prep_gate = 1;
+    }
+
+    /* 默认：body 就在请求缓冲里（小请求体）。 */
+    left = buf + he + 4;
+    llen = n - (he + 4);
+    if (llen < 0) llen = 0;
+
     /* 小请求体（register/prepare/info/cancel）头齐后把 body 尽量读齐进 buf：
      * - 客户端常把 body 与头分开发送，头循环一收齐就处理会拿到空 body；
      * - 有的客户端不送 Content-Length（EOF/keep-alive 式），只能靠"收到过
      *   数据后再出现空窗"来判定 body 结束，不能因为无 CL 就判 400；
-     * - upload 是大文件流，绝不进 buf，走下面的流式回调。 */
+     * - upload 是大文件流，绝不进 buf，走下面的流式回调；
+     * - prepare 声明了 Content-Length 的大清单走堆缓冲（4MB 上限），
+     *   无 CL 的旧客户端仍用这个 32KB 兼容窗口。 */
     if (strcmp(route, "/api/localsend/v2/upload") != 0) {
-        /* 已收过数据后只再等 ~400ms 空窗（判定 body 完）；未收过则等到
-         * 总截止（3s），但"无 CL 且还没收到任何体"时不空等，直接走。 */
-        SceLong64 dl = sceKernelGetSystemTimeWide()
-                     + (SceLong64)HTTP_RECV_TIMEOUT_S * 1000000LL;
-        int want = cl64 > 0 ? (int)(he + 4 + cl64) : HTTP_MAX_REQ - 1;
-        int had = 0;
-        if (want > HTTP_MAX_REQ - 1) {
-            /* 声明的 body 超出缓冲上限：正常客户端在非 upload 路由上不会发这么大
-             * 的请求，出现即说明对端异常（或 Content-Length 被读错）。截断后
-             * handler 多半报 400，这里点明真因，省得对着"400 bad request"倒查。 */
-            dlog("http: %s req body %lld > cap %d, truncated",
-                 route, (long long)cl64, HTTP_MAX_REQ - 1);
-            want = HTTP_MAX_REQ - 1;
-        }
-        while (n < want) {
-            SceLong64 lim;
-            int r;
-            if (!had && cl64 <= 0) break;      /* 明确无体（无 CL）不空等 */
-            lim = had ? sceKernelGetSystemTimeWide() + 400000LL : dl;
-            r = conn_read(cn, buf + n, want - n, lim, 0);
-            if (r > 0) { n += r; buf[n] = 0; had = 1; continue; }
-            break;                             /* 关闭/空窗超时/换代：补读结束 */
+        if (is_prepare && prep_gate && cl64 > 0) {
+            int want = (int)cl64;
+            int already = n - (he + 4);
+            SceLong64 dl = sceKernelGetSystemTimeWide() + HTTP_PREPARE_US;
+            if (already < 0) already = 0;
+            if (already > want) already = want;
+            pbody = (char *)malloc((size_t)want + 1);
+            if (!pbody) {
+                dlog("http: prepare body alloc %d failed", want);
+                note_reject(HTTP_REJ_NOMEM);
+                http_respond(cn, 507, reason_of(507), "");
+                goto out;
+            }
+            memcpy(pbody, buf + he + 4, (unsigned)already);
+            llen = already;
+            while (llen < want) {
+                int r = conn_read(cn, pbody + llen, want - llen, dl, 0);
+                if (r > 0) { llen += r; continue; }
+                break;                       /* 关闭/超时/换代 */
+            }
+            pbody[llen] = 0;
+            if (llen < want) {
+                dlog("http: prepare body short %d/%d from %s", llen, want, rip);
+                http_respond(cn, 400, "Bad Request", "");
+                goto out;
+            }
+            left = pbody;
+        } else {
+            /* 无 CL 时的判定：已收到的 body 也算"收到过数据"，之后按 400ms
+             * 空窗判完；只有"没有 CL 且一个字节都没收到"的非 prepare 请求
+             * 才立刻走（GET /info 等不能在 3s 里干等）。no-CL 的 POST prepare
+             * 是兼容老客户端的场合，先给 400ms 等首段数据。 */
+            int wait_more = cl64 > 0 ||
+                            (is_prepare && strcmp(method, "POST") == 0);
+            SceLong64 dl = sceKernelGetSystemTimeWide()
+                         + (cl64 > 0 ? (SceLong64)HTTP_RECV_TIMEOUT_S * 1000000LL
+                                     : 400000LL);
+            int want = cl64 > 0 ? (int)(he + 4 + cl64) : HTTP_MAX_REQ - 1;
+            int had = llen > 0;
+            if (want > HTTP_MAX_REQ - 1) {
+                /* 声明的 body 超出缓冲上限：正常客户端在非 upload 路由上不会发这么大
+                 * 的请求，出现即说明对端异常（或 Content-Length 被读错）。截断后
+                 * handler 多半报 400，这里点明真因，省得对着"400 bad request"倒查。 */
+                dlog("http: %s req body %lld > cap %d, truncated",
+                     route, (long long)cl64, HTTP_MAX_REQ - 1);
+                want = HTTP_MAX_REQ - 1;
+            }
+            while (n < want) {
+                SceLong64 lim;
+                int r;
+                if (!had && !wait_more) break;      /* 明确无体（无 CL）不空等 */
+                lim = had ? sceKernelGetSystemTimeWide() + 400000LL : dl;
+                r = conn_read(cn, buf + n, want - n, lim, 0);
+                if (r > 0) { n += r; buf[n] = 0; had = 1; continue; }
+                break;                             /* 关闭/空窗超时/换代：补读结束 */
+            }
+            left = buf + he + 4;
+            llen = n - (he + 4);
+            if (llen < 0) llen = 0;
         }
     }
-
-    left = buf + he + 4;
-    llen = n - (he + 4);
-    if (llen < 0) llen = 0;
 
     if (method[0] && route[0]) {
         if (strcmp(route, "/heartbeat") != 0)   /* 每 2 秒一条，不打日志 */
@@ -1416,6 +1580,7 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
         r.left = left;
         r.llen = llen;
         r.cl64 = cl64;
+        r.via_web = req_via_web;
 
         if (strcmp(method, "GET") == 0 &&
             strcmp(route, "/api/localsend/v2/info") == 0)
@@ -1449,6 +1614,12 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
         else
             http_respond(cn, 404, "Not Found", "{\"error\":\"not found\"}");
     }
+
+out:
+    /* handler 返回后才释放：4MB 清单在"等 UI 决定"的 60s 里一直驻留，
+     * 闸门也持有到这一刻，保证同一时间只有一份大 body。 */
+    if (prep_gate) prep_gate_leave();
+    free(pbody);
 }
 
 /* ---------- accept 线程 + 连接 worker ----------
@@ -1693,6 +1864,8 @@ int http_start(void)
     if (g_conn_mtx < 0)              /* 连接登记表锁：随服务器首次启动创建，
                                       * 跨 stop/start 复用（stop 不销毁） */
         g_conn_mtx = sceKernelCreateMutex("psvsend_conn", 0, 0, NULL);
+    if (g_prep_mtx < 0)              /* prepare 单并发闸门（同上，跨重启复用） */
+        g_prep_mtx = sceKernelCreateMutex("psvsend_prep", 0, 0, NULL);
     if (g_own_mtx < 0)               /* 本机身份解析锁：必须早于任何连接线程
                                       * 创建（own_identity 不再惰性建锁） */
         g_own_mtx = sceKernelCreateMutex("psvsend_tlsown", 0, 0, NULL);

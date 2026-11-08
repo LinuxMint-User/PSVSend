@@ -116,9 +116,12 @@ static struct {
     char fp[65];             /* 对端叶证书 SHA-256（TLS 才有；明文为空） */
     int  n;                  /* 已解析的条目数（≤ RECV_FILES_MAX） */
     int  cap;                /* f/inc 的容量 */
-    int  overflow;           /* 超上限被丢弃的可用文件数（确认页明示用） */
+    int  overflow;           /* 超上限被丢弃的可用文件数（M3 起改为整份拒绝，恒为 0，
+                              * 字段保留给旧 UI 快照兼容） */
     int  skipped;            /* 非法路径/目录条目等跳过数 */
     int  path_skipped;       /* 按当前保存目录超预算、接受时会跳过的条目数 */
+    int  cfg_limit;           /* 设置里的接收文件上限（M3 固定 64，M5 接 config） */
+    int  eff_limit;           /* 本次实际生效档位（文件数超过 cfg 时临时提升） */
     PendFile *f;
     unsigned char *inc;      /* bitset：bit i = 第 i 条勾选 */
 } g_pend;
@@ -184,6 +187,7 @@ static int  g_clear_pending = 0;
 static unsigned g_gen = 0;
 static int  g_pend_result = 0;      /* 0=未决 1=接受 2=拒绝 3=超时 */
 static int  g_peer_gone_evt = 0;    /* 上一份 pending 因"发送方断开"消失（UI 一次性取走） */
+static int  g_reject_evt = 0;       /* 最近一次 prepare 被拒原因（HTTP_REJ_*，UI 一次性取走） */
 static volatile int g_abort = 0;    /* 用户中止请求（http 收体循环轮询） */
 static SceUID g_mtx = -1;
 /* 本会话保存目录：accept 前由 UI 用 recv_set_dir 设定（临时、不入 config）；
@@ -198,6 +202,27 @@ static volatile SceLong64 g_pend_dl;
 
 static void lock(void)   { if (g_mtx >= 0) sceKernelLockMutex(g_mtx, 1, NULL); }
 static void unlock(void) { if (g_mtx >= 0) sceKernelUnlockMutex(g_mtx, 1); }
+
+/* 接收文件数档位：设置值默认 64（M5 才接 config），实际生效档位在文件数超过
+ * 设置值时临时提升到最小可容纳档（64/128/256/512/1024/2048），不改设置本身。 */
+#define RECV_FILES_LIMIT_CFG 64
+static int files_limit_cfg(void) { return RECV_FILES_LIMIT_CFG; }
+static int files_limit_raise(int need)
+{
+    static const int tier[] = { 64, 128, 256, 512, 1024, 2048 };
+    int i;
+    for (i = 0; i < (int)(sizeof tier / sizeof tier[0]); i++)
+        if (need <= tier[i]) return tier[i];
+    return RECV_FILES_MAX;
+}
+
+/* 拒绝原因事件：http 层在无锁上下文回调，这里补锁；锁内代码直接写 g_reject_evt。 */
+static void reject_note_http(int reason)
+{
+    lock();
+    g_reject_evt = reason;
+    unlock();
+}
 static uint64_t now_us(void) { return (uint64_t)sceKernelGetSystemTimeWide(); }
 
 /* ---------- pending / session 动态数组生命周期（均需持 g_mtx） ---------- */
@@ -1373,6 +1398,8 @@ int recv_pending_summary(RecvPendingSummary *out)
             out->trunc = trunc;
             out->total = tot;
             out->selected_size = ssz;
+            out->cfg_limit = g_pend.cfg_limit;
+            out->eff_limit = g_pend.eff_limit;
         }
         r = 1;
     }
@@ -1458,6 +1485,16 @@ int recv_pending_peer_gone_take(void)
     lock();
     r = g_peer_gone_evt;
     g_peer_gone_evt = 0;
+    unlock();
+    return r;
+}
+
+int recv_reject_take(void)
+{
+    int r;
+    lock();
+    r = g_reject_evt;
+    g_reject_evt = 0;
     unlock();
     return r;
 }
@@ -1756,6 +1793,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
      * 无嵌套；结束后发送状态若翻转，最多多拒/多收一次，对端重试即可。 */
     if (xfer_active()) {
         dlog("recv: prepare refused, PSV sending (xfer active)");
+        reject_note_http(HTTP_REJ_BUSY);
         return 409;
     }
 
@@ -1764,11 +1802,15 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
      * 只要不是 PH_NONE（有待决定/活动/终态未清场）就立即 409 礼貌拒绝。 */
     lock();
     if (g_phase != PH_NONE) {
+        g_reject_evt = HTTP_REJ_BUSY;
         unlock();
         return 409;
     }
     pend_free_locked();
     g_phase = PH_PENDING;                    /* 先占位：锁内的并发 prepare 409 */
+    g_pend.cfg_limit = files_limit_cfg();
+    g_pend.eff_limit = g_pend.cfg_limit;
+    g_pend.overflow = 0;
     g_pend_web = via_web ? 1 : 0;            /* 网页 PIN 来的请求：停共享时跟着作废 */
     my_gen = ++g_gen;                        /* 本次占位的身份（见 g_gen） */
     g_peer_gone_evt = 0;                     /* 上一份的"对方取消"标志不得串到本份 */
@@ -1815,12 +1857,18 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
             if (p && json_val_str(p, sh, sizeof sh) && strlen(sh) != 64)
                 sh[0] = 0;
 
-            if (n >= RECV_FILES_MAX) {       /* 超过硬上限：丢弃并计数 */
-                g_pend.overflow++;
-                continue;
+            if (n >= RECV_FILES_MAX) {
+                /* 超过硬上限：整份拒绝（不再"丢弃多余、照收前 2048"——对端以为
+                 * 全发了，实际少收一半且无任何提示）。413 让发送方明确看到失败。 */
+                dlog("recv: prepare rejected, > %d files from %s",
+                     RECV_FILES_MAX, ip ? ip : "?");
+                g_reject_evt = HTTP_REJ_TOO_MANY;
+                code = 413;
+                break;
             }
             if (!pend_reserve_locked(n + 1)) {
-                code = 500;                  /* 内存不足：整份请求收掉 */
+                g_reject_evt = HTTP_REJ_NOMEM;
+                code = 507;                  /* 内存不足：整份请求收掉 */
                 break;
             }
             snprintf(g_pend.f[n].fileid, sizeof g_pend.f[n].fileid, "%s", it.key);
@@ -1849,15 +1897,15 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
         return 204;
     }
     g_pend.n = n;
+    if (n > g_pend.cfg_limit)                /* 超过设置值：按最小档临时提升 */
+        g_pend.eff_limit = files_limit_raise(n);
     pend_recheck_paths_locked();
     g_pend_result = 0;
     g_pend_hold = 0;                         /* 新请求从满窗开始（上一份的暂停状态不得串过来） */
     g_pend_dl = (SceLong64)now_us() + RECV_DECIDE_TIMEOUT_US;
-    dlog("recv: prepare %d files (%d skipped) from %s (%s)", n,
-         g_pend.skipped + g_pend.path_skipped, alias, g_pend.ip);
-    if (g_pend.overflow)
-        dlog("recv: %d more file(s) exceed the cap %d, will be dropped",
-             g_pend.overflow, RECV_FILES_MAX);
+    dlog("recv: prepare %d files (%d skipped) from %s (%s), limit %d/%d", n,
+         g_pend.skipped + g_pend.path_skipped, alias, g_pend.ip,
+         g_pend.cfg_limit, g_pend.eff_limit);
     unlock();
 
     /* 等 UI 决定：轮询（本连接占一个 http worker；期间其他连接由各自的 worker
@@ -2989,6 +3037,8 @@ static int link_thr(SceSize args, void *argp)
     g_pend.fp[0] = 0;
     g_pend.n = n;
     g_pend.overflow = 0;
+    g_pend.cfg_limit = files_limit_cfg();
+    g_pend.eff_limit = n > g_pend.cfg_limit ? files_limit_raise(n) : g_pend.cfg_limit;
     for (i = 0; i < n; i++) {
         snprintf(g_pend.f[i].fileid, sizeof g_pend.f[i].fileid, "%s", tmp[i].id);
         snprintf(g_pend.f[i].name, sizeof g_pend.f[i].name, "%s", tmp[i].name);
@@ -3196,6 +3246,7 @@ static const HttpRecvOps s_http_ops = {
     recv_http_upload,       /* upload ：经 http 层流回调边收边写盘 */
     recv_http_cancel,       /* cancel ：发送方放弃会话 */
     recv_abort_pending,     /* abort_pending：用户中止查询 */
+    reject_note_http,       /* reject_note：http 层自拒的 prepare 原因 */
 };
 
 const HttpRecvOps *recv_http_ops(void)

@@ -55,6 +55,17 @@ int http_chunked_decode(char *body, int len);
  * include proto 层（此前 http.c→receive.h 与 transfer.c→http.h 构成依赖环）。 */
 typedef int (*http_stream_fn)(void *ctx, unsigned char *buf, int max);
 
+/* prepare 被拒的原因（UI 一次性取走，主页红色细条显示）。
+ * http 层只能判出"清单过大 / 内存不足 / 闸门忙"，接收侧的"文件数超限"
+ * 由 proto/receive.c 用同一组值上报，UI 只需关心这一套编码。 */
+enum {
+    HTTP_REJ_NONE = 0,
+    HTTP_REJ_TOO_MANY = 1,   /* 文件数超过 RECV_FILES_MAX（2048） */
+    HTTP_REJ_TOO_LARGE = 2,  /* 清单 body 超过 4MB 硬上限 */
+    HTTP_REJ_BUSY = 3,       /* 已有 prepare 在处理 / 接收侧忙 */
+    HTTP_REJ_NOMEM = 4       /* 内存不足 */
+};
+
 /* 不透明句柄：一条正在服务的连接（只有 http.c 知道它的内部结构）。
  * prepare 挂起等用户决定期间，用它探测对端是否已经放弃（见 http_peer_gone）。 */
 typedef struct HttpPeer HttpPeer;
@@ -78,6 +89,9 @@ typedef struct {
     int  (*cancel)(const char *query, const char *ip);
     /* 收 body 轮询时查"用户是否请求中止"（返回 1 后 http 层尽快收手） */
     bool (*abort_pending)(void);
+    /* http 层自己拒掉 prepare 时上报原因（HTTP_REJ_*）；可为 NULL。
+     * 接收侧把它与自己的拒绝原因合并成同一条一次性事件供 UI 取走。 */
+    void (*reject_note)(int reason);
 } HttpRecvOps;
 
 /* 注册接收侧处理集（api.c 启动时调一次；未注册时相关路由回 500） */

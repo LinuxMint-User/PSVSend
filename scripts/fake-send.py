@@ -33,6 +33,15 @@ GET /api/localsend/v2/info，能回 member info 的才算 LocalSend 设备。
   python3 scripts/fake-send.py --port 53317,4567
       扫描/连接多个端口（接收端口被改过时用）
 
+M3 边界用例（prepare 读取/拒绝）：
+  --count 2048 --size 0 --prepare-only   2048 个文件的清单应被接受（确认页）
+  --count 2049 --size 0                  应回 413（文件数超过 2048，整份拒绝）
+  --manifest-pad 4300000                 把清单撑到 4.1MB → 应回 413（清单过大）
+  --prepare-short                        只发一半清单就 FIN → 应回 400（读短）
+  --prepare-nocl                         清单不带 Content-Length → 走旧兼容路径
+  --prepare-chunked                      清单用 chunked → 应回 411
+  --prepare-concurrent 3                 同时发 3 份 → 1 份进入等待，其余 409
+
 前提：PC 与 PSV 同一局域网；PSV 上的 PSVSend 已启动。
 """
 
@@ -169,6 +178,46 @@ def post_half(ip, port, path, body):
     return None
 
 
+def raw_exchange(ip, port, head, body=b"", half=False, timeout=15):
+    """裸 socket 发请求（可造无 Content-Length / 短 body / chunked），
+    发完 shutdown(WR) 让对端按 EOF 判完，返回 (status, raw)。"""
+    s = socket.create_connection((ip, port), timeout=timeout)
+    try:
+        s.sendall(head)
+        if body:
+            s.sendall(body[: len(body) // 2] if half else body)
+        try:
+            s.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+        data = b""
+        while True:
+            try:
+                b = s.recv(8192)
+            except socket.timeout:
+                break
+            except Exception:
+                break          # 对端回完响应就 close，RST 时忽略已收到的内容
+            if not b:
+                break
+            data += b
+        line = data.split(b"\r\n", 1)[0].decode(errors="replace")
+        try:
+            status = int(line.split()[1])
+        except Exception:
+            status = None
+        return status, data
+    finally:
+        s.close()
+
+
+def head_of(ip, port, extra=b""):
+    return ("POST %s/prepare-upload HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Content-Type: application/json\r\n"
+            "Connection: close\r\n" % (API, ip, port)).encode() + extra + b"\r\n"
+
+
 # ---------------- 工具 ----------------
 
 def id_list(s):
@@ -206,6 +255,21 @@ def main():
     ap.add_argument("--no-sha", action="store_true", help="清单里 sha256 全部给 null")
     ap.add_argument("--parallel", type=int, default=1,
                     help="并发上传数（默认 1；官方客户端会并发，可试 3）")
+    # ---- M3 prepare 边界用例 ----
+    ap.add_argument("--prepare-only", action="store_true",
+                    help="只发 prepare（收到 200 后不再上传），用于测文件数/清单大小")
+    ap.add_argument("--manifest-pad", type=int, default=0,
+                    help="在清单里加一个 pad 字符串撑大 body（测 4MB 上限）")
+    ap.add_argument("--prepare-short", action="store_true",
+                    help="prepare 只发一半 body 就 FIN（期望 400）")
+    ap.add_argument("--prepare-nocl", action="store_true",
+                    help="prepare 不带 Content-Length（期望走旧兼容路径）")
+    ap.add_argument("--prepare-chunked", action="store_true",
+                    help="prepare 用 Transfer-Encoding: chunked（期望 411）")
+    ap.add_argument("--prepare-concurrent", type=int, default=0,
+                    help="同时发 N 份 prepare（期望 1 份进入等待，其余 409）")
+    ap.add_argument("--prepare-wait", type=int, default=5,
+                    help="并发 prepare 模式的等待秒数（默认 5）")
     args = ap.parse_args()
 
     # ---- 0. 确定目标 ----
@@ -269,7 +333,48 @@ def main():
         },
         "files": metas,
     }
+    if args.manifest_pad:
+        doc["pad"] = "x" * args.manifest_pad   # 测 4MB 清单上限用，接收侧忽略未知字段
     body = json.dumps(doc).encode()
+
+    # ---- 1.5 M3 prepare 边界用例（在正常流程之前短路） ----
+    if args.prepare_concurrent:
+        def one(_i):
+            try:
+                return post(ip, port, API + "/prepare-upload", body,
+                            "application/json", timeout=args.prepare_wait)[0]
+            except Exception as e:
+                return "wait/%s" % type(e).__name__   # 超时=赢得等待（等 UI 决定）
+
+        with concurrent.futures.ThreadPoolExecutor(args.prepare_concurrent) as ex:
+            got = list(ex.map(one, range(args.prepare_concurrent)))
+        print("[fake-send] 并发 prepare ×%d → %s" % (args.prepare_concurrent, got))
+        print("[fake-send] 期望：1 份进入等待（wait/...），其余 409")
+        return 0
+
+    if args.prepare_short:
+        st, data = raw_exchange(
+            ip, port,
+            head_of(ip, port, ("Content-Length: %d\r\n" % len(body)).encode()),
+            body, half=True)
+        print("[fake-send] 短 body prepare → HTTP %s %s"
+              % (st, data[:80].decode(errors="replace")))
+        return 0 if st == 400 else 1
+
+    if args.prepare_nocl:
+        st, data = raw_exchange(ip, port, head_of(ip, port), body)
+        print("[fake-send] 无 Content-Length prepare → HTTP %s %s"
+              % (st, data[:160].decode(errors="replace")))
+        return 0 if st in (200, 403, 409) else 1
+
+    if args.prepare_chunked:
+        chunked = b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n"
+        st, data = raw_exchange(
+            ip, port,
+            head_of(ip, port, b"Transfer-Encoding: chunked\r\n"), chunked)
+        print("[fake-send] chunked prepare → HTTP %s %s"
+              % (st, data[:80].decode(errors="replace")))
+        return 0 if st == 411 else 1
 
     print("[fake-send] prepare-upload → %s:%d（请在 PSV 上点 Accept）" % (ip, port))
     sys.stdout.flush()
@@ -281,8 +386,11 @@ def main():
         return 1
     print("[fake-send] prepare <- HTTP %d %s" % (code, rsp[:200].decode(errors="replace")))
     if code != 200:
-        print("[fake-send] 对端未接受（403=拒绝/超时，409=正忙），结束")
+        print("[fake-send] 对端未接受（403=拒绝/超时，409=正忙，413=超限/过大），结束")
         return 1
+    if args.prepare_only:
+        print("[fake-send] --prepare-only：已拿到回执，不再上传")
+        return 0
 
     try:
         res = json.loads(rsp)

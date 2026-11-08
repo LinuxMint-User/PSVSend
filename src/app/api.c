@@ -413,6 +413,11 @@ int api_recv_peer_gone_take(void)
     return recv_pending_peer_gone_take();
 }
 
+int api_recv_reject_take(void)
+{
+    return recv_reject_take();
+}
+
 void api_recv_set_include(const bool inc[RECV_MAX_FILES])
 {
     recv_set_include(inc);

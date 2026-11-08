@@ -40,11 +40,13 @@ typedef struct {
     char peer_fp[65];
     int  count;                  /* 解析出的可用条目数（含 path_ok=false 的） */
     int  selected;               /* 勾选且路径预算可用的文件数 */
-    int  overflow;               /* 超过 RECV_FILES_MAX 被丢弃的个数 */
+    int  overflow;               /* 旧字段：M3 起超限整份拒绝，恒为 0 */
     int  skipped;                /* 非法路径/目录条目/路径超预算等跳过数 */
     int  trunc;                  /* 名字被缩短过的条目数 */
     SceOff total;                /* 全部条目的期望字节数 */
     SceOff selected_size;        /* 勾选且可收文件的期望字节数 */
+    int  cfg_limit;              /* 设置里的接收文件上限（M3 固定 64，M5 接 config） */
+    int  eff_limit;              /* 本次实际生效档位（文件数超过 cfg 时临时提升） */
 } RecvPendingSummary;
 
 typedef struct {
@@ -149,7 +151,9 @@ int recv_pending_pull(RecvPending *out);
  * 官方发送方在等接受的阶段取消时是 abort 掉 prepare 请求（关连接），
  * 不会、也无法调 /cancel——那时 sessionId 还没生成。 */
 int recv_pending_peer_gone_take(void);
-
+/* 最近一次 prepare 被拒的原因（HTTP_REJ_*，一次性：取走即清零）。
+ * 覆盖文件数超限 / 清单过大 / 忙 / 内存不足，UI 在主页细条上短时提示。 */
+int recv_reject_take(void);
 /* 兼容包装：同步前 RECV_MAX_FILES 行的勾选（其余行保持默认选中）。 */
 void recv_set_include(const bool inc[RECV_MAX_FILES]);
 

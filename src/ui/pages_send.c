@@ -40,6 +40,8 @@ static uint64_t dev_scan_end_us = 0;
 static int      dev_scan_was = 0;
 static int      dev_scan_last_found = 0;
 static uint64_t dev_hint_us = 0;
+static uint64_t dev_warn_us = 0;    /* 接收请求被拒的红色提示截止时刻 */
+static int      dev_warn_reason = 0;/* HTTP_REJ_*（最近一次） */
 static int sw_focus = 0;           /* 发送等待页焦点：0=取消/完成，1=验证（仅 https 对端） */
 
 static void start_send(int dev_idx);
@@ -191,6 +193,32 @@ static void dev_strip(void)
         w_text(28, STRIP_Y, 0.9f, theme->text_dim, "%s",
                tr("Generating device identity (first run)..."));
         return;
+    }
+
+    /* 接收请求被拒（文件数超限 / 清单过大 / 忙 / 内存不足）：红色细条短时提示。
+     * 后端一次性给出原因，这里取走后保留 8s；不在主页时事件留在后端，回来再显示。 */
+    {
+        int rej = api_recv_reject_take();
+        if (rej) {
+            dev_warn_reason = rej;
+            dev_warn_us = now + 8000000ull;
+        }
+        if (dev_warn_us && now < dev_warn_us) {
+            const char *m = NULL;
+            switch (dev_warn_reason) {
+            case HTTP_REJ_TOO_MANY:  m = tr("Too many files (max 2048)"); break;
+            case HTTP_REJ_TOO_LARGE: m = tr("File list too large (max 4 MB)"); break;
+            case HTTP_REJ_BUSY:      m = tr("Busy: another receive request is pending"); break;
+            case HTTP_REJ_NOMEM:     m = tr("Not enough memory to receive"); break;
+            default: break;
+            }
+            if (m) {
+                tips_reset();
+                w_text(28, STRIP_Y, 0.9f, theme->danger, "%s", m);
+                return;
+            }
+        }
+        dev_warn_us = 0;
     }
 
     if (dev_hint_us && now < dev_hint_us) {

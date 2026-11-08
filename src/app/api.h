@@ -81,6 +81,8 @@ int  api_recv_status_window(int base, int max, RecvStatusRow *out);
 int  api_recv_pending_pull(RecvPending *out);
 /* 上一份待确认请求是否因"发送方放弃（断开连接）"而消失；一次性，取走即清零 */
 int  api_recv_peer_gone_take(void);
+/* 最近一次 prepare 被拒的原因（HTTP_REJ_*，一次性）；主页红色细条用 */
+int  api_recv_reject_take(void);
 /* 同步"本次勾选接收的文件"（下标与 pending 一致） */
 void api_recv_set_include(const bool inc[RECV_MAX_FILES]);
 /* 接受前逐文件指定"保存名"（idx 与 pending 一致；空串=保持原名） */
