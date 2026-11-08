@@ -62,6 +62,7 @@
 | 文件处理 | **大文件永不整读入内存**，一律流式（收：边收边写盘；发：边读边发） | 内存红线 |
 | 传输分块 | 16~64KB 缓冲 | PSV socket / sceIoRead 的大块缓冲限制 |
 | 应用数据目录 | `ux0:data/psvsend/`（含 `downloads/` 接收目录），首次启动 `sceIoMkdir` 幂等创建 | 符合 PSV 惯例，homebrew 有写权限 |
+| 传输期间电源 | 传输中每 1 秒 `sceKernelPowerTick(DISABLE_AUTO_SUSPEND)` + `sceKernelPowerTick(DISABLE_OLED_OFF)`，**不动变暗计时器** | 熄屏 → 系统待机 → Wi-Fi 断 → 传输必断；只续期"关闭 / 待机"两个计时器即可，允许变暗省电（d262） |
 
 ## 4. 后端设计
 
@@ -139,8 +140,10 @@ int  api_recv_set_root_action(int idx, int action, const char *new_name);
 void api_recv_decide(bool accept);
 int  api_recv_status_summary(RecvStatusSummary *out);
 int  api_recv_status_window(int base, int max, RecvStatusRow *out);
+unsigned api_recv_pending_gen(void);   /* 待决定请求的占位序号（区分"刚接受的那笔"） */
 void api_recv_abort(void);
 void api_recv_clear(void);
+void api_keep_awake_tick(void);        /* UI 主循环每帧调用：传输中续期熄屏/待机计时器 */
 
 // 后端 → 前端（回调只塞事件队列）
 void on_devices_changed(void);
@@ -197,6 +200,13 @@ void on_session_done(void);
 - **UI**（`PAGE_WEB`）：三个入口——主页 START（已选 >0 直接开分享）、页头地球按钮、设置 › 操作 › 网页共享。选择态列出将分享的文件；运行态显示 URL / PIN / 模式 / 会话数 / 来源列表 + 圆形长按按钮。**停止共享改为长按 0.7 秒**（按钮或返回键，短按无效；触摸蓄满后抬手不再合成 tap），替代原来的确认弹窗。
 - **与接收模块的衔接**：浏览器上传走同一条 `prepare-upload`，用 `via_web` 标记来源（带有效 PIN 才算），确认页可直接盖在共享页上（`pages_tick` 的可打断页加入 `PAGE_WEB`）；停共享时 `web_stop()` 后 `recv_cancel_web()` 作废网页发起的待确认 / 进行中上传。确认页收尾按 `return_from_recv()` 回到来源页（共享页仅在仍运行时回到共享页）。
 - **不做**：目录浏览、多段 Range、打包下载；浏览器后台标签页定时器降频（约 1 次 / 分钟），切到后台期间在线状态会暂时显示为 0。
+
+### 4.9 传输期间的电源与接收会话接管（d262–d268）
+
+- **保持亮屏**（`api_keep_awake_tick()`，UI 主循环每帧调用，内部 1 秒节流）：判定"传输中"的口径是——发送 `XferInfo.active`；接收存在 pending 或状态为 `READY / RECEIVING / FINALIZING`；网页下载 `WebSnap.active_dl > 0`（空闲心跳不算）。命中时调 `sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND)` 与 `…_DISABLE_OLED_OFF`，**不调** `…_DISABLE_OLED_DIMMING`：屏幕照常变暗，但不会关闭、不会自动挂起。空闲时不干预，计时器回归系统默认。真机验证：512 × 256KB / 约 11 分钟，全程暗屏不熄灭，`watch` 心跳无断档。
+- **旧会话接管**（`recv_http_prepare` 入口）：接收侧只有一个会话槽，旧会话停在终态（DONE / PARTIAL / CANCEL / FAIL / TIMEOUT）或空闲超过 120 秒且无 worker 持有时，新 prepare 直接清掉旧会话再受理，不再让用户"先进进度页再退出"才能收下一批。正在收体、拉取或最终化时仍回 409。
+- **接受瞬间的竞态**：`recv_decide(true)` 之后，http 线程还要几十毫秒才把 `PH_PENDING` 换成 `PH_ACTIVE`。UI 的"旧会话没了但有新请求 → 退回接收前页面"判断必须比对 `recv_pending_gen()`（每次新 prepare 占位 +1），否则这段窗口会被当成另一笔新请求：界面退回设备页、再弹一次已过期的确认页（d265 修复）。
+- **预检目录快照**：接受前的冲突预检原先逐个顶层 `sceIoGetstat`，而 ux0 的 FAT/exFAT 按路径 stat 是**目录线性扫描**（1700+ 文件的目录单次约 280ms），32 个平铺文件要卡 9 秒。改为一次 `sceIoDread` 建名字快照再查表，只有确实存在的名字才补一次 stat；真机 8983ms → 650ms。仍未解决的是**每文件**落盘时的同类路径查找（`downloads` 很大时小文件约 1 秒 / 个），属已知代价，暂不优化。
 
 ## 5. 前端设计
 
