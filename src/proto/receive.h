@@ -2,9 +2,12 @@
  * 对方(发送方)按我们 announce 里的 http 端口 POST 过来：
  *   prepare-upload  文件清单 JSON → 挂起等 UI 接受/拒绝（回 200 {sessionId,files{id:token}}
  *                   或 403；已有活动会话时 409）
- *   upload?sessionId&fileId&token  裸文件字节流 → 边收边写盘保存目录（临时文件
- *                   <名>.psvsend.tmp，收完改名；sha256 校验失败 422）。保存目录：config saveDir
- *                   持久默认，UI 可在接受前 recv_set_dir 覆盖为本次目录（内存态）。
+ *   upload?sessionId&fileId&token  裸文件字节流 → 边收边写盘：顶层目录的文件先写
+ *                   暂存根 <目录名>.psvsend-part/（内部直接还原相对路径），收完
+ *                   由 finalize 线程整体改名/合并到保存目录；平铺文件写
+ *                   <名>.psvsend.tmp 后改名。sha256 校验失败 422。保存目录：
+ *                   config saveDir 持久默认，UI 可在接受前 recv_set_dir 覆盖为
+ *                   本次目录（内存态）。
  *                   **单文件失败只影响该文件**（与官方一致）：写盘/校验/落盘等错误
  *                   不终止会话，其余文件照收；全部收尾后若有失败，会话终态为
  *                   RECV_ST_PARTIAL。断流/取消/超时仍是会话级（对端已不可达）。
@@ -94,6 +97,7 @@ typedef enum {
     RECV_ST_NONE = 0,    /* 无活动会话（UI 可回主页） */
     RECV_ST_READY,       /* 已接受，等对方开始传 */
     RECV_ST_RECEIVING,   /* 上传中 */
+    RECV_ST_FINALIZING,  /* 文件已收完，正在把暂存根整理到最终位置（不可取消） */
     RECV_ST_DONE,        /* 全部文件收完 */
     RECV_ST_FAIL,        /* 传输失败（中断/校验/写盘） */
     RECV_ST_CANCEL,      /* 发送方放弃 */

@@ -39,11 +39,11 @@
 #define RECV_DECIDE_TIMEOUT_US (60 * 1000000LL)  /* prepare 等 UI 决定的上限 */
 #define RECV_IDLE_TIMEOUT_US   (120 * 1000000LL) /* 接受后/文件间没动静 → TIMEOUT */
 #define RECV_CHUNK             65536             /* 流式写盘缓冲（每个 upload 各自一份，见下） */
-/* 收体中临时文件名后缀。曾用 ".part"：落盘正式名沿用对端原名，对端若发来一个
- * 正好叫 "x.part" 的文件，它会被正常保存成正式文件，而开机清扫按后缀匹配又会
- * 把它当残留删掉——永久丢数据。改成一个正常文件名里基本不会出现的后缀。
+/* 收体中临时文件名后缀见 recv_path.h 的 RP_PART_SUFFIX。曾用 ".part"：落盘
+ * 正式名沿用对端原名，对端若发来一个正好叫 "x.part" 的文件，它会被正常保存成
+ * 正式文件，而开机清扫按后缀匹配又会把它当残留删掉——永久丢数据。改成一个
+ * 正常文件名里基本不会出现的后缀。
  * 注：不再顺带清扫旧版遗留的 *.part（宁可留垃圾也不误删用户文件）。 */
-#define RECV_PART_SUFFIX       ".psvsend.tmp"
 #define RECV_BLOCKS            3         /* 收体轮转缓冲块数（每块 RECV_CHUNK） */
 #define RECV_SLOTS             8         /* 收体流水线槽位上限（= 并发 upload 上限） */
 
@@ -68,7 +68,7 @@ typedef struct {
     char name[192];                /* 展示用 basename（兼容旧 UI） */
     char rel[RP_REL_MAX + 1];      /* 实际落盘相对路径（可能含 '/'） */
     char final[RP_PATH_MAX + 1];   /* 正式路径 */
-    char part[RP_PATH_MAX + 1];    /* 临时路径（final + RECV_PART_SUFFIX） */
+    char part[RP_PATH_MAX + 1];    /* 临时路径（final + RP_PART_SUFFIX） */
     SceOff size;                   /* 期望字节数 */
     SceOff got;                    /* 已收字节（锁保护） */
     char sha256[65];               /* 期望 sha256（准备报文里给了才校验，空串=不校验） */
@@ -123,6 +123,23 @@ static struct {
     unsigned char *inc;      /* bitset：bit i = 第 i 条勾选 */
 } g_pend;
 
+/* ---- M2 暂存根 ----
+ * 每个接收顶层目录一个暂存根 <save_dir>/<top>.psvsend-part[/inner]，收完后由
+ * finalize 线程整体 rename（目标不存在）或逐项合并（目标已存在）。平铺文件
+ * 没有暂存根，直接写 <save_dir>/<name>.psvsend.tmp 后 rename。
+ * roots 只登记目录型顶层；每项单独 malloc，保证 PathSet 的键指针在数组扩容时
+ * 仍然有效（键指向 r->top）。 */
+typedef struct {
+    char top[RP_COMP_MAX + 1];        /* 最终顶层目录名 */
+    char stage_name[RP_COMP_MAX + 1]; /* 暂存根名（同名已存在时自动 "top (k)"） */
+    int  nfiles;                      /* 归入该根的文件数 */
+} SessRoot;
+
+typedef struct {
+    int fidx;                         /* g_sess.f 下标 */
+    int ridx;                         /* g_sess.roots 下标；-1=顶层平铺文件 */
+} SessZero;
+
 /* 活动会话（PH_ACTIVE）：f 按实际参与文件数动态分配 */
 static struct {
     char session[40];     /* sessionId（hex） */
@@ -138,6 +155,11 @@ static struct {
     SceOff got_total;     /* 已收总字节（锁保护） */
     uint64_t start_us;    /* 接受时刻 */
     uint64_t last_us;     /* 接受/最近一次收体开始时刻（空闲超时判定用） */
+    SessRoot **roots;     /* 目录型顶层的暂存根（按首次出现顺序） */
+    int  nroots, roots_cap;
+    SessZero *zeros;      /* 0 字节文件：finalize 时统一创建 */
+    int  nzeros, zeros_cap;
+    int  fin_attempted;   /* 已进入最终化：recv_clear 不再递归删暂存根 */
 } g_sess;
 
 static int  g_phase = PH_NONE;      /* 当前生命周期 */
@@ -235,6 +257,15 @@ static bool pend_reserve_locked(int need)
 
 static void sess_free_locked(void)
 {
+    int i;
+    for (i = 0; i < g_sess.nroots; i++) free(g_sess.roots[i]);
+    free(g_sess.roots);
+    g_sess.roots = NULL;
+    g_sess.nroots = g_sess.roots_cap = 0;
+    free(g_sess.zeros);
+    g_sess.zeros = NULL;
+    g_sess.nzeros = g_sess.zeros_cap = 0;
+    g_sess.fin_attempted = 0;
     free(g_sess.f);
     g_sess.f = NULL;
     g_sess.n = 0;
@@ -259,22 +290,89 @@ static const char *path_base(const char *rel)
     return slash ? slash + 1 : rel;
 }
 
-/* M1 直接写最终路径（暂存根由 M2 接管）；part = final + RECV_PART_SUFFIX。 */
-static bool compute_paths(const char *rel, char *final, size_t fsz,
-                          char *part, size_t psz)
+/* rel → 暂存内最终路径 / 实际写入路径。
+ * inner 为空 = 顶层平铺文件（没有暂存根）；否则 stage_name 是该顶层的暂存根名
+ * （可能带 " (k)"，见 SessRoot）。所有拼接失败都返回 false，绝不静默截断。 */
+static bool compute_paths(const char *rel, const char *stage_name,
+                          char *final, size_t fsz, char *part, size_t psz)
 {
     char top[RP_COMP_MAX + 1];
     const char *inner;
-    size_t l, sl;
 
     split_top_inner(rel, top, sizeof top, &inner);
-    if (!rp_final_path(g_dir, top, inner[0] ? inner : NULL, final, fsz))
+    if (!inner[0]) {
+        return rp_final_path(g_dir, top, NULL, final, fsz) &&
+               rp_flat_part_path(g_dir, top, part, psz);
+    }
+    return rp_stage_file_path(g_dir, stage_name, inner, final, fsz) &&
+           rp_stage_part_path(g_dir, stage_name, inner, part, psz);
+}
+
+/* 暂存根下是否有被遗弃槽位（ZOMBIE）仍持有的临时文件。这类根不能删、也不能
+ * 复用：槽位线程退出后会按记录路径 sceIoRemove，误删新会话的同名临时文件。 */
+static bool stage_has_zombie(const char *root)
+{
+    int i;
+    size_t n = strlen(root);
+    bool hit = false;
+
+    if (g_reap_mtx < 0) return false;
+    sceKernelLockMutex(g_reap_mtx, 1, NULL);
+    for (i = 0; i < RECV_SLOTS; i++) {
+        RecvSlot *s = &g_slots[i];
+        if (s->state != SLOT_ZOMBIE || !s->part[0]) continue;
+        if (strncmp(s->part, root, n) == 0 && s->part[n] == '/') {
+            hit = true;
+            break;
+        }
+    }
+    sceKernelUnlockMutex(g_reap_mtx, 1);
+    return hit;
+}
+
+/* 为顶层目录挑一个可用的暂存根名并建目录：
+ * 优先 "<top>.psvsend-part"；同名已存在（上次残留/用户自己的同名目录）时
+ * 自动改用 "<top> (k).psvsend-part"，绝不删除未知数据。 */
+static bool stage_pick_name(const char *top, char *out, size_t outsz)
+{
+    char cand[RP_COMP_MAX + 1];
+    char path[RP_PATH_MAX + 1];
+    SceIoStat st;
+    int k;
+
+    if (out && outsz) out[0] = 0;
+    /* 保存目录不存在时不要空转 1000 次 mkdir */
+    if (sceIoGetstat(g_dir, &st) < 0 || !(st.st_mode & SCE_S_IFDIR))
         return false;
-    l = strlen(final);
-    sl = strlen(RECV_PART_SUFFIX);
-    if (l + sl >= psz) { final[0] = 0; part[0] = 0; return false; }
-    memcpy(part, final, l);
-    memcpy(part + l, RECV_PART_SUFFIX, sl + 1);
+    for (k = 0; k <= 999; k++) {
+        if (k == 0) snprintf(cand, sizeof cand, "%s", top);
+        else if (!rp_unique_name(top, k, cand, sizeof cand)) return false;
+        if (!rp_stage_root_path(g_dir, cand, path, sizeof path)) continue;
+        if (sceIoGetstat(path, &st) >= 0) continue;      /* 已存在：避让 */
+        if (stage_has_zombie(path)) continue;            /* 遗弃槽位仍持有其中文件 */
+        if (sceIoMkdir(path, 0777) >= 0) {
+            snprintf(out, outsz, "%s", cand);
+            return true;
+        }
+        /* mkdir 失败：父目录不存在（保存目录无效）或同名竞态，继续试 */
+    }
+    return false;
+}
+
+static bool sess_zero_add_locked(int fidx, int ridx)
+{
+    SessZero *nz;
+    int nc;
+    if (g_sess.nzeros >= g_sess.zeros_cap) {
+        nc = g_sess.zeros_cap ? g_sess.zeros_cap * 2 : 16;
+        nz = (SessZero *)realloc(g_sess.zeros, (size_t)nc * sizeof *nz);
+        if (!nz) return false;
+        g_sess.zeros = nz;
+        g_sess.zeros_cap = nc;
+    }
+    g_sess.zeros[g_sess.nzeros].fidx = fidx;
+    g_sess.zeros[g_sess.nzeros].ridx = ridx;
+    g_sess.nzeros++;
     return true;
 }
 
@@ -309,8 +407,17 @@ static void pend_recheck_paths_locked(void)
     int i, bad = 0;
     for (i = 0; i < g_pend.n; i++) {
         char rel[RP_REL_MAX + 1];
-        g_pend.f[i].path_ok = pend_item_rel_locked(i, rel, sizeof rel) &&
-                              path_budget_ok(rel);
+        char top[RP_COMP_MAX + 1];
+        const char *inner;
+        bool ok = pend_item_rel_locked(i, rel, sizeof rel);
+
+        if (ok) {
+            split_top_inner(rel, top, sizeof top, &inner);
+            /* 顶层名以保留后缀结尾：会与暂存根/开机清扫撞名。M5 提供改名
+             * 提示；在那之前一律跳过（不覆盖、不误删）。嵌套层安全。 */
+            if (rp_reserved_name(top)) ok = false;
+        }
+        g_pend.f[i].path_ok = ok && path_budget_ok(rel);
         if (!g_pend.f[i].path_ok) bad++;
     }
     g_pend.path_skipped = bad;
@@ -460,6 +567,44 @@ static bool pathset_add_n(PathSet *ps, const char *s, int len)
 static bool pathset_add(PathSet *ps, const char *s)
 {
     return pathset_add_n(ps, s, (int)strlen(s));
+}
+
+/* 取得/创建顶层目录的暂存根，返回 roots 下标。
+ * 返回 -1 = 内存不足（*oom=1）；-2 = 建不了暂存根（跳过该顶层）。 */
+static int root_get_or_create_locked(PathSet *tops, const char *top, bool *oom)
+{
+    int idx = pathset_find(tops, top), nc;
+    SessRoot *r;
+    SessRoot **nr;
+
+    *oom = false;
+    if (idx >= 0) return idx;
+    if (g_sess.nroots >= g_sess.roots_cap) {
+        nc = g_sess.roots_cap ? g_sess.roots_cap * 2 : 8;
+        nr = (SessRoot **)realloc(g_sess.roots, (size_t)nc * sizeof *nr);
+        if (!nr) { *oom = true; return -1; }
+        g_sess.roots = nr;
+        g_sess.roots_cap = nc;
+    }
+    r = (SessRoot *)calloc(1, sizeof *r);
+    if (!r) { *oom = true; return -1; }
+    snprintf(r->top, sizeof r->top, "%s", top);
+    if (!stage_pick_name(top, r->stage_name, sizeof r->stage_name)) {
+        dlog("recv: cannot create stage root for %s", top);
+        free(r);
+        return -2;
+    }
+    idx = g_sess.nroots;
+    g_sess.roots[idx] = r;
+    g_sess.nroots++;
+    if (!pathset_add(tops, r->top)) {          /* 键指向 r->top，扩容不影响 */
+        g_sess.nroots--;
+        free(r);
+        *oom = true;
+        return -1;
+    }
+    dlog("recv: stage root %s (top %s)", r->stage_name, r->top);
+    return idx;
 }
 
 /* rel 的任一父目录是文件（入站"文件挡目录"） */
@@ -748,13 +893,18 @@ static void cleanup_parts(void)
             sceIoRemove(g_sess.f[i].part);
 }
 
+static void rm_stage_roots_locked(void);      /* 见下：finalize 辅助区 */
+
 /* recv_clear 曾因收体未结束而推迟清场 → 在本 worker 收尾处补做（持锁调用）。
  * 必须等所有 busy 都清零再动手：此时 g_sess 不会再被任何 worker 访问，
- * 复位 g_phase 后新 prepare 覆盖 g_sess 才是安全的。 */
+ * 复位 g_phase 后新 prepare 覆盖 g_sess 才是安全的。
+ * 最终化（FINALIZING）期间同样推迟：finalize 线程还在用 g_sess/暂存根。 */
 static void clear_pending_finish_locked(void)
 {
     if (!g_clear_pending || any_busy_locked()) return;
+    if (g_sess.state == RECV_ST_FINALIZING) return;
     cleanup_parts();
+    if (!g_sess.fin_attempted) rm_stage_roots_locked();
     sess_free_locked();
     g_phase = PH_NONE;
     g_pend_hold = 0;
@@ -773,6 +923,291 @@ static void sess_terminal(int state, const char *err)
     if (err) {
         snprintf(g_sess.err, sizeof g_sess.err, "%s", err);
         dlog("recv: session end st=%d err=%s", state, err);
+    }
+}
+
+/* ---------------- M2 最终化（暂存根 → 最终位置） ----------------
+ * 全部文件收尾后由独立线程做 IO，不持 g_lock；finalize 期间 recv_abort /
+ * recv_http_cancel / recv_clear / 空闲超时全部绕开（见各入口的 FINALIZING 判断）。
+ * 目标不存在 → 整个暂存根 rename（原子）；已存在 → 逐项合并，文件/类型冲突加
+ * " (k)"。多顶层各自独立，成功的不回滚；失败的暂存根保留给下次启动清扫。 */
+
+static bool str_ends_ci(const char *s, const char *suffix)
+{
+    size_t ls = strlen(s), lf = strlen(suffix);
+    return ls >= lf && rp_name_cmp(s + ls - lf, suffix) == 0;
+}
+
+/* 递归删除（跳过 . / ..）。用于取消/超时的暂存根清理与开机清扫。 */
+static void rm_tree(const char *path)
+{
+    SceIoStat st;
+    SceUID d;
+    SceIoDirent de;
+
+    if (sceIoGetstat(path, &st) < 0) return;
+    if (!(st.st_mode & SCE_S_IFDIR)) { sceIoRemove(path); return; }
+    d = sceIoDopen(path);
+    if (d >= 0) {
+        memset(&de, 0, sizeof de);
+        while (sceIoDread(d, &de) > 0) {
+            char child[RP_PATH_MAX + 1];
+            if (strcmp(de.d_name, ".") == 0 || strcmp(de.d_name, "..") == 0)
+                continue;
+            if (snprintf(child, sizeof child, "%s/%s", path, de.d_name) >=
+                (int)sizeof child)
+                continue;
+            rm_tree(child);
+        }
+        sceIoDclose(d);
+    }
+    sceIoRmdir(path);
+}
+
+#define FIN_MAX_DEPTH (RP_MAX_DEPTH + 2)
+
+/* 把 src 目录内容逐项并入 dst（dst 已存在）。同名文件/类型冲突用 " (k)"；
+ * 返回 false = 有项没能移动（src 保留未移动的部分）。 */
+static bool merge_dir(const char *src, const char *dst, int depth)
+{
+    SceUID d;
+    SceIoDirent de;
+    bool ok = true;
+
+    if (depth > FIN_MAX_DEPTH) return false;
+    d = sceIoDopen(src);
+    if (d < 0) return false;
+    memset(&de, 0, sizeof de);
+    while (sceIoDread(d, &de) > 0) {
+        char sp[RP_PATH_MAX + 1], dp[RP_PATH_MAX + 1];
+        SceIoStat dt, nt;
+        bool sdir, ddir;
+
+        if (strcmp(de.d_name, ".") == 0 || strcmp(de.d_name, "..") == 0)
+            continue;
+        if (snprintf(sp, sizeof sp, "%s/%s", src, de.d_name) >= (int)sizeof sp ||
+            snprintf(dp, sizeof dp, "%s/%s", dst, de.d_name) >= (int)sizeof dp) {
+            ok = false;
+            continue;
+        }
+        if (sceIoGetstat(dp, &dt) < 0) {
+            if (sceIoRename(sp, dp) < 0) ok = false;
+            continue;
+        }
+        sdir = (de.d_stat.st_mode & SCE_S_IFDIR) != 0;
+        ddir = (dt.st_mode & SCE_S_IFDIR) != 0;
+        if (sdir && ddir) {
+            if (!merge_dir(sp, dp, depth + 1)) ok = false;
+        } else {
+            char nn[RP_COMP_MAX + 1], np[RP_PATH_MAX + 1];
+            int k;
+            bool moved = false;
+            for (k = 1; k <= 999; k++) {
+                if (!rp_unique_name(de.d_name, k, nn, sizeof nn)) break;
+                if (snprintf(np, sizeof np, "%s/%s", dst, nn) >= (int)sizeof np)
+                    continue;
+                if (sceIoGetstat(np, &nt) < 0) {
+                    if (sceIoRename(sp, np) == 0) moved = true;
+                    break;
+                }
+            }
+            if (!moved) ok = false;
+        }
+    }
+    sceIoDclose(d);
+    sceIoRmdir(src);        /* 合并完应为空；失败时非空，rmdir 失败即保留 */
+    return ok;
+}
+
+/* 单个目录型顶层的收尾：目标不存在 → 整体 rename；已存在 → 逐项合并。
+ * 返回 false = 该根失败（暂存根保留，交给下次启动清扫）。 */
+static bool finish_root(const SessRoot *r)
+{
+    char stage[RP_PATH_MAX + 1], target[RP_PATH_MAX + 1];
+    SceIoStat st;
+
+    if (!r->stage_name[0]) return true;
+    if (!rp_stage_root_path(g_dir, r->stage_name, stage, sizeof stage) ||
+        !rp_final_path(g_dir, r->top, NULL, target, sizeof target))
+        return false;
+    if (sceIoGetstat(stage, &st) < 0)
+        return true;                       /* 没建过/已处理：无文件可搬 */
+    if (stage_has_zombie(stage))
+        return false;                      /* 有遗弃槽位仍在写：整根保留，别搬半成品 */
+    if (r->nfiles == 0) {                  /* 空根：直接删掉 */
+        sceIoRmdir(stage);
+        return true;
+    }
+    if (sceIoGetstat(target, &st) < 0)
+        return sceIoRename(stage, target) == 0;
+    if (!(st.st_mode & SCE_S_IFDIR))
+        return false;                      /* 目标被同名文件占用：留给 M5 重命名流程 */
+    return merge_dir(stage, target, 0);
+}
+
+static bool create_zero_file(const char *path)
+{
+    SceUID fd;
+    if (!mk_parents(path)) return false;
+    fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd < 0) return false;
+    sceIoClose(fd);
+    return true;
+}
+
+/* 顶层平铺 0 字节文件：在保存目录里选一个不冲突的名字并创建。 */
+static bool create_zero_flat(const char *name)
+{
+    char cand[RP_COMP_MAX + 1], path[RP_PATH_MAX + 1];
+    SceIoStat st;
+    int k;
+
+    for (k = 0; k <= 999; k++) {
+        if (k == 0) snprintf(cand, sizeof cand, "%s", name);
+        else if (!rp_unique_name(name, k, cand, sizeof cand)) return false;
+        if (!rp_final_path(g_dir, cand, NULL, path, sizeof path)) return false;
+        if (sceIoGetstat(path, &st) >= 0) continue;
+        return create_zero_file(path);
+    }
+    return false;
+}
+
+/* 0 字节文件统一在 finalize 创建：目录内的写进暂存根（随后随根搬走），
+ * 平铺的直接落保存目录。 */
+static bool create_zero_staged(const char *rel, const char *stage_name)
+{
+    char top[RP_COMP_MAX + 1], path[RP_PATH_MAX + 1];
+    const char *inner;
+
+    split_top_inner(rel, top, sizeof top, &inner);
+    if (!inner[0]) return create_zero_flat(top);
+    if (!rp_stage_file_path(g_dir, stage_name, inner, path, sizeof path))
+        return false;
+    return create_zero_file(path);
+}
+
+static SceUID g_fin_thr = -1;
+
+static void fin_reap(void)
+{
+    if (g_fin_thr >= 0 && thread_exited(g_fin_thr)) {
+        sceKernelDeleteThread(g_fin_thr);
+        g_fin_thr = -1;
+    }
+}
+
+static int fin_thread(SceSize args, void *argp)
+{
+    int i, roots_ok = 0, roots_bad = 0, zero_bad = 0;
+    unsigned char *zok = NULL;
+
+    (void)args; (void)argp;
+    if (g_sess.nzeros > 0)
+        zok = (unsigned char *)calloc((size_t)g_sess.nzeros, 1);
+
+    for (i = 0; i < g_sess.nzeros; i++) {
+        int fidx = g_sess.zeros[i].fidx;
+        int ridx = g_sess.zeros[i].ridx;
+        const char *stage = (ridx >= 0 && ridx < g_sess.nroots)
+                                ? g_sess.roots[ridx]->stage_name : "";
+        bool ok = create_zero_staged(g_sess.f[fidx].rel, stage);
+        if (zok) zok[i] = ok ? 1 : 0;
+        if (!ok) zero_bad++;
+    }
+    for (i = 0; i < g_sess.nroots; i++) {
+        if (finish_root(g_sess.roots[i])) roots_ok++;
+        else roots_bad++;
+    }
+
+    lock();
+    if (g_phase == PH_ACTIVE && g_sess.state == RECV_ST_FINALIZING) {
+        int failed = 0, done = 0;
+        for (i = 0; i < g_sess.nzeros && zok; i++)
+            if (!zok[i]) g_sess.f[g_sess.zeros[i].fidx].st = 3;
+        for (i = 0; i < g_sess.n; i++) {
+            if (g_sess.f[i].st == 3) failed++;
+            else if (g_sess.f[i].st == 1) done++;
+        }
+        g_sess.cur = -1;
+        g_sess.err[0] = 0;
+        if (roots_bad > 0 && roots_ok == 0)
+            sess_terminal(RECV_ST_FAIL, "文件整理失败（暂存已保留）");
+        else if (roots_bad > 0)
+            sess_terminal(RECV_ST_PARTIAL, "部分文件夹整理失败（暂存已保留）");
+        else if (failed > 0 && done == 0)
+            sess_terminal(RECV_ST_FAIL, "文件接收失败");
+        else if (failed > 0 || zero_bad > 0)
+            sess_terminal(RECV_ST_PARTIAL, "部分文件接收失败");
+        else
+            sess_terminal(RECV_ST_DONE, NULL);
+        dlog("recv: finalize done roots ok=%d bad=%d zero_bad=%d done=%d failed=%d",
+             roots_ok, roots_bad, zero_bad, done, failed);
+        clear_pending_finish_locked();     /* 最终化期间被推迟的清场在这里补做 */
+    }
+    unlock();
+    free(zok);
+    return 0;
+}
+
+/* 进入最终化（持锁调用）。线程启动失败也必须收尾成 FAIL，不能卡在 FINALIZING。 */
+static void finalize_start_locked(void)
+{
+    SceUID t;
+
+    if (g_sess.fin_attempted) return;
+    g_sess.fin_attempted = 1;
+    if (g_sess.nroots == 0 && g_sess.nzeros == 0) {
+        int i, failed = 0;
+        for (i = 0; i < g_sess.n; i++)
+            if (g_sess.f[i].st == 3) failed++;
+        g_sess.cur = -1;
+        g_sess.err[0] = 0;
+        if (failed) sess_terminal(RECV_ST_PARTIAL, "部分文件接收失败");
+        else        sess_terminal(RECV_ST_DONE, NULL);
+        return;
+    }
+    g_sess.state = RECV_ST_FINALIZING;
+    g_sess.cur = -1;
+    g_sess.last_us = now_us();
+    fin_reap();
+    /* 合并是递归目录遍历，栈留足（深度 ≤18，每层约 4KB） */
+    t = sceKernelCreateThread("psvsend_fin", fin_thread, 0x40, 0x40000, 0,
+                              SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
+    if (t < 0) {
+        dlog("recv: finalize thread create fail 0x%08X", (unsigned)t);
+        sess_terminal(RECV_ST_FAIL, "无法启动文件整理");
+        return;
+    }
+    if (sceKernelStartThread(t, 0, NULL) < 0) {
+        sceKernelDeleteThread(t);
+        dlog("recv: finalize thread start fail");
+        sess_terminal(RECV_ST_FAIL, "无法启动文件整理");
+        return;
+    }
+    g_fin_thr = t;
+    dlog("recv: finalizing %d root(s), %d zero file(s)", g_sess.nroots,
+         g_sess.nzeros);
+}
+
+/* 取消/超时/文件失败时清场：递归删掉本次建的暂存根（含已落盘的半成品）。
+ * finalize 已尝试过则不删（成功已搬走；失败按计划保留给下次启动清扫）。 */
+static void rm_stage_roots_locked(void)
+{
+    int i;
+    char path[RP_PATH_MAX + 1];
+
+    for (i = 0; i < g_sess.nroots; i++) {
+        SessRoot *r = g_sess.roots[i];
+        if (!r->stage_name[0]) continue;
+        if (!rp_stage_root_path(g_dir, r->stage_name, path, sizeof path))
+            continue;
+        if (stage_has_zombie(path)) {
+            /* 遗弃槽位还持有其中的临时文件：删掉会让它退出时误删新会话的
+             * 同名文件。保留整根，交给下次启动清扫（那时已无 zombie）。 */
+            dlog("recv: keep stage %s (zombie holds it)", r->stage_name);
+            continue;
+        }
+        rm_tree(path);
     }
 }
 
@@ -853,8 +1288,7 @@ void recv_init(void)
 {
     SceUID d;
     SceIoDirent de;
-    char p[512];
-    size_t sl = strlen(RECV_PART_SUFFIX);
+    char p[RP_PATH_MAX + 1];
     if (g_mtx < 0)
         g_mtx = sceKernelCreateMutex("psvsend_recv", 0, 0, NULL);
     if (g_mtx < 0) return;
@@ -879,18 +1313,30 @@ void recv_init(void)
     g_sess.skipped = 0;
     dir_cache_reset_locked();
     unlock();
-    /* 清扫上次异常退出残留的临时文件（接收中断只会留下 <名>.psvsend.tmp，不会
-     * 留下正式文件；只扫当前默认/设置目录——临时目录里的崩溃残留是孤儿，不追扫）。
+    /* 清扫上次异常退出残留（只扫当前默认/设置目录顶层）：
+     *   - *.psvsend-part 目录（M2 暂存根，可能带 " (k)"）→ 递归删除；
+     *   - *.psvsend.tmp 文件 / .psvsend-tmp-* → 删除。
+     * 正式文件不带这些后缀，所以不会误删已收完的内容。用户自己正好有同名
+     * 文件/目录的取舍见 TODO「后缀即保留名」：视为残留，这是既定设计。
      * 注：不清理旧版遗留的 *.part —— 那正是"对端发来叫 x.part 的合法文件被当
      * 残留删掉"的根源（见 RECV_PART_SUFFIX 处说明）。 */
     d = sceIoDopen(g_dir);
     if (d >= 0) {
         memset(&de, 0, sizeof de);
         while (sceIoDread(d, &de) > 0) {
-            size_t l = strlen(de.d_name);
-            if (l > sl &&
-                strcmp(de.d_name + l - sl, RECV_PART_SUFFIX) == 0) {
-                snprintf(p, sizeof p, "%s/%s", g_dir, de.d_name);
+            bool isdir;
+            if (strcmp(de.d_name, ".") == 0 || strcmp(de.d_name, "..") == 0)
+                continue;
+            if (snprintf(p, sizeof p, "%s/%s", g_dir, de.d_name) >=
+                (int)sizeof p)
+                continue;
+            isdir = (de.d_stat.st_mode & SCE_S_IFDIR) != 0;
+            if (isdir && str_ends_ci(de.d_name, RP_STAGE_SUFFIX)) {
+                rm_tree(p);
+                dlog("recv: init removed stale stage %s", de.d_name);
+            } else if (!isdir &&
+                       (str_ends_ci(de.d_name, RP_PART_SUFFIX) ||
+                        strncmp(de.d_name, ".psvsend-tmp-", 13) == 0)) {
                 sceIoRemove(p);
                 dlog("recv: init removed stale %s", de.d_name);
             }
@@ -1086,9 +1532,14 @@ int recv_decide_left_s(void)
 void recv_abort(void)
 {
     lock();
-    if (g_phase == PH_ACTIVE && any_busy_locked()) {
+    if (g_phase != PH_ACTIVE || g_sess.state == RECV_ST_FINALIZING) {
+        /* 最终化期间不可取消：暂存根正在被 rename/合并，打断会留下半成品 */
+        unlock();
+        return;
+    }
+    if (any_busy_locked()) {
         g_abort = 1;                       /* 收体循环下一块检测到 */
-    } else if (g_phase == PH_ACTIVE && !sess_is_terminal(g_sess.state)) {
+    } else if (!sess_is_terminal(g_sess.state)) {
         cleanup_parts();
         sess_terminal(RECV_ST_CANCEL, "用户取消");
     }
@@ -1119,8 +1570,10 @@ static bool recv_abort_pending(void)
 
 /* 由 g_pend 组装活动会话（推送会话与扫码拉取会话共用）。
  *  - 只收 UI 勾选且路径预算可用的文件；
- *  - 锁内只做纯内存映射（不 stat、不 mkdir、不建 0 字节文件），磁盘同名
- *    冲突留到 upload 真正写盘时再解析（见 resolve_disk_conflict_locked）；
+ *  - 目录型顶层在锁内建一次暂存根（每个顶层一次 stat/mkdir，不是每文件）；
+ *    同名已存在则自动 " (k).psvsend-part"，绝不删未知数据；
+ *  - 0 字节文件只登记、不建文件（finalize 统一建），避免 2048 次锁内 IO；
+ *  - 平铺文件的磁盘同名冲突留到 upload 真正写盘时再解析；
  *  - session_id 为空串 = 本地生成（推送会话），否则用对方给的（拉取会话）；
  *  - via_web 仅决定"停止网页共享时是否连带中止"。
  * 返回参与文件数；0 = 全被勾掉/全部跳过，调用方自行把 phase 复位。调用者持锁。 */
@@ -1129,7 +1582,7 @@ static int build_session_locked(const char *session_id, int via_web)
     int i, m = 0, has_pending = 0, skipped = 0, oom = 0;
     SceOff tot = 0;
     RFile *arr;
-    PathSet files, dirs;
+    PathSet files, dirs, tops;
 
     sess_free_locked();
     memset(&g_sess, 0, sizeof g_sess);
@@ -1151,7 +1604,12 @@ static int build_session_locked(const char *session_id, int via_web)
         dlog("recv: session alloc failed (%d files)", g_pend.n);
         return 0;
     }
-    if (!pathset_init(&files) || !pathset_init(&dirs)) {
+    if (!pathset_init(&files)) {
+        free(arr);
+        dlog("recv: pathset alloc failed");
+        return 0;
+    }
+    if (!pathset_init(&dirs) || !pathset_init(&tops)) {
         pathset_free(&files);
         pathset_free(&dirs);
         free(arr);
@@ -1164,10 +1622,12 @@ static int build_session_locked(const char *session_id, int via_web)
         char rel[RP_REL_MAX + 1];
         char cand[RP_REL_MAX + 1];
         char base_rel[RP_REL_MAX + 1];
+        char ctop[RP_COMP_MAX + 1];
+        const char *cinner;
         char final[RP_PATH_MAX + 1];
         char part[RP_PATH_MAX + 1];
-        int k = 0;
-        bool ok = false;
+        int ridx = -1, k = 0;
+        bool ok = false, oomr = false;
 
         if (!pend_inc_get(i)) continue;
         if (!g_pend.f[i].path_ok) { skipped++; continue; }
@@ -1194,7 +1654,16 @@ static int build_session_locked(const char *session_id, int via_web)
             if (!path_budget_ok(cand)) break;
         }
         if (!ok) { skipped++; continue; }
-        if (!compute_paths(cand, final, sizeof final, part, sizeof part)) {
+
+        split_top_inner(cand, ctop, sizeof ctop, &cinner);
+        if (cinner[0]) {                         /* 目录型：先拿到暂存根 */
+            ridx = root_get_or_create_locked(&tops, ctop, &oomr);
+            if (ridx == -1) { oom = 1; break; }
+            if (ridx < 0) { skipped++; continue; }
+        }
+        if (!compute_paths(cand,
+                           ridx >= 0 ? g_sess.roots[ridx]->stage_name : "",
+                           final, sizeof final, part, sizeof part)) {
             skipped++;
             continue;
         }
@@ -1209,11 +1678,16 @@ static int build_session_locked(const char *session_id, int via_web)
         snprintf(f->part, sizeof f->part, "%s", part);
         f->size = g_pend.f[i].size;
         snprintf(f->sha256, sizeof f->sha256, "%s", g_pend.f[i].sha256);
-        /* 0 字节文件：接受时不再锁内建文件（M2 由 finalize 统一建）。
-         * 这里先标完成，避免会话永远等不到 upload；对端若发空体 upload，
-         * upload 入口按"已完成 + size==0"幂等回 200。 */
+        /* 0 字节文件：只登记给 finalize 统一创建；先标完成，避免会话永远等
+         * 不到 upload。对端若仍发空体 upload，入口按"已完成 + size==0"回 200。 */
         f->st = (f->size == 0) ? 1 : 0;
-        if (f->st == 0) has_pending = 1;
+        if (f->st == 0) {
+            has_pending = 1;
+        } else if (!sess_zero_add_locked(m, ridx)) {
+            oom = 1;
+            break;
+        }
+        if (ridx >= 0) g_sess.roots[ridx]->nfiles++;
 
         /* 键指向 f->rel（数组在循环内不移动，且 set 在 realloc 收缩前释放） */
         if (!add_ancestors(&dirs, f->rel) || !pathset_add(&files, f->rel)) {
@@ -1225,15 +1699,14 @@ static int build_session_locked(const char *session_id, int via_web)
     }
     pathset_free(&files);
     pathset_free(&dirs);
+    pathset_free(&tops);
 
-    if (oom) {
-        free(arr);
-        dlog("recv: session build aborted (pathset alloc failed)");
-        return 0;
-    }
-    if (m == 0) {
-        free(arr);
+    if (oom || m == 0) {
+        /* 回滚本次新建的暂存根（都还没写入任何文件）后释放会话 */
+        rm_stage_roots_locked();
+        sess_free_locked();
         g_sess.skipped = skipped;
+        if (oom) dlog("recv: session build aborted (alloc failed)");
         return 0;
     }
     if (m < g_pend.n) {
@@ -1249,7 +1722,8 @@ static int build_session_locked(const char *session_id, int via_web)
     g_sess.start_us = now_us();
     g_sess.last_us = g_sess.start_us;
     g_abort = 0;
-    g_sess.state = has_pending ? RECV_ST_READY : RECV_ST_DONE;
+    g_sess.state = has_pending ? RECV_ST_READY : RECV_ST_RECEIVING;
+    if (!has_pending) finalize_start_locked();   /* 全空文件也要走最终化 */
     return m;
 }
 
@@ -1269,6 +1743,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
 
     if (respsz > 0) resp[0] = 0;
     reap_zombies();                          /* 先回收旧僵尸槽位，避免复用其临时路径 */
+    fin_reap();                              /* 回收上一次会话的最终化线程 */
 
     infov = json_get_val(body, "info");
     filesv = json_get_val(body, "files");
@@ -1459,9 +1934,14 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
              * 失败，绝不能把截断的 JSON 当 200 发出去（对端会解析失败/少收）。 */
             if (o >= respsz - 2) {
                 dlog("recv: prepare response buffer too small (%d files)", m);
-                sess_free_locked();
-                g_phase = PH_NONE;
                 code = 500;
+                /* 全空文件会话可能已在最终化：绝不能 free 正在被线程使用的
+                 * g_sess/暂存根，让它照常收尾（对端看到 500 会重试）。 */
+                if (g_sess.state != RECV_ST_FINALIZING) {
+                    rm_stage_roots_locked();
+                    sess_free_locked();
+                    g_phase = PH_NONE;
+                }
             }
         }
         if (code == 200)
@@ -1502,7 +1982,7 @@ static bool hex_eq_nocase(const char *a, const unsigned char *b, int n)
 static void sess_fail_locked(const char *err)
 {
     cleanup_parts();
-    if (!sess_is_terminal(g_sess.state))
+    if (!sess_is_terminal(g_sess.state) && g_sess.state != RECV_ST_FINALIZING)
         sess_terminal(RECV_ST_FAIL, err);
 }
 
@@ -1512,23 +1992,16 @@ static void sess_fail_locked(const char *err)
  *   g_abort 只收掉"还没结束"的会话（与旧行为一致：已收满的文件优先算完成）。 */
 static void check_all_done_locked(void)
 {
-    int i, all = 1, failed = 0;
-    if (sess_is_terminal(g_sess.state)) return;
+    int i, all = 1;
+    if (sess_is_terminal(g_sess.state) || g_sess.state == RECV_ST_FINALIZING)
+        return;
     for (i = 0; i < g_sess.n; i++) {
         if (g_sess.f[i].st == 0) { all = 0; break; }
-        if (g_sess.f[i].st == 3) failed++;
     }
     if (all) {
-        if (failed) {
-            sess_terminal(RECV_ST_PARTIAL,
-                          g_sess.err[0] ? g_sess.err : "部分文件接收失败");
-            dlog("recv: session %s partial (%d/%d files failed)",
-                 g_sess.session, failed, g_sess.n);
-        } else {
-            sess_terminal(RECV_ST_DONE, NULL);
-            dlog("recv: session %s done (%d files, %lld B)", g_sess.session,
-                 g_sess.n, (long long)g_sess.got_total);
-        }
+        /* 全部到终态（含失败）：进入最终化，把暂存根整体搬到最终位置。
+         * 成功/失败/部分成功由 finalize 线程收尾时统一判定（见 fin_thread）。 */
+        finalize_start_locked();
     } else if (g_abort) {
         /* 还有文件没收：用户取消 → 整会话收尾（已完成的文件保留） */
         cleanup_parts();
@@ -1568,7 +2041,9 @@ static bool session_has_rel_locked(const RFile *self, const char *rel)
 
 /* 真正写盘前解析磁盘同名冲突（持锁调用）：磁盘上已有、临时路径正被遗弃槽位
  * 占用、或与会话内其他文件撞名 → 最后一个组件加 " (k)"。找不到可用名返回
- * false（该文件按失败处理）。 */
+ * false（该文件按失败处理）。
+ * 目录内的文件写在本次新建的暂存根里，不会与磁盘既有文件撞名，合并时的重名
+ * 由 finalize 统一加 " (k)"；因此这里只处理顶层平铺文件。 */
 static bool resolve_disk_conflict_locked(RFile *f)
 {
     char base_rel[RP_REL_MAX + 1];
@@ -1578,6 +2053,7 @@ static bool resolve_disk_conflict_locked(RFile *f)
     SceIoStat st;
     int k = 0;
 
+    if (strchr(f->rel, '/')) return true;
     snprintf(base_rel, sizeof base_rel, "%s", f->rel);
     for (;;) {
         if (k == 0)
@@ -1585,7 +2061,7 @@ static bool resolve_disk_conflict_locked(RFile *f)
         else if (!rel_with_unique(base_rel, k, cand, sizeof cand))
             return false;
         if (!path_budget_ok(cand)) return false;
-        if (!compute_paths(cand, final, sizeof final, part, sizeof part))
+        if (!compute_paths(cand, "", final, sizeof final, part, sizeof part))
             return false;
         if (sceIoGetstat(final, &st) < 0 &&
             !part_in_zombie(part) &&
@@ -2065,6 +2541,7 @@ static int recv_http_cancel(const char *query, const char *ip)
     lock();
     if (g_phase == PH_ACTIVE && sid[0] &&
         strcmp(g_sess.session, sid) == 0 &&
+        g_sess.state != RECV_ST_FINALIZING &&   /* 最终化期间忽略：数据已收完 */
         !sess_is_terminal(g_sess.state)) {   /* 已终态就忽略：别把 DONE 改写成 CANCEL，
                                               * 更别覆盖 FAIL/TIMEOUT 的失败原因 */
         if (any_busy_locked()) {
@@ -2345,26 +2822,21 @@ static void link_download(const char *host, int port, const char *sid)
     }
 
     lock();
+    g_sess_pull = 0;                     /* 下载线程收尾：不再持有 g_sess */
     if (g_abort) {
-        cleanup_parts();
-        if (!sess_is_terminal(g_sess.state))
-            sess_terminal(RECV_ST_CANCEL, "用户取消");
-    } else {
-        int k, failed = 0;
-        for (k = 0; k < g_sess.n; k++) {
+        if (g_sess.state != RECV_ST_FINALIZING) {
+            cleanup_parts();
+            if (!sess_is_terminal(g_sess.state))
+                sess_terminal(RECV_ST_CANCEL, "用户取消");
+        }
+    } else if (g_sess.state != RECV_ST_FINALIZING &&
+               !sess_is_terminal(g_sess.state)) {
+        int k;
+        for (k = 0; k < g_sess.n; k++)
             if (g_sess.f[k].st == 0) g_sess.f[k].st = 3;   /* 未开始的按失败收尾 */
-            if (g_sess.f[k].st == 3) failed++;
-        }
-        if (!sess_is_terminal(g_sess.state)) {
-            if (failed)
-                sess_terminal(RECV_ST_PARTIAL,
-                              g_sess.err[0] ? g_sess.err : "部分文件下载失败");
-            else
-                sess_terminal(RECV_ST_DONE, NULL);
-        }
+        check_all_done_locked();          /* 全部到终态 → 进入最终化 */
     }
     g_sess.cur = -1;
-    g_sess_pull = 0;                     /* 此后 recv_clear 可以正常清场 */
     dlog("recv: link session %s end st=%d", g_sess.session, g_sess.state);
     clear_pending_finish_locked();
     unlock();
@@ -2589,6 +3061,7 @@ static int link_thr(SceSize args, void *argp)
 static void status_idle_check_locked(void)
 {
     uint64_t now = now_us();
+    if (g_sess.state == RECV_ST_FINALIZING) return;   /* 最终化不算空闲 */
     if (!any_busy_locked() && !sess_is_terminal(g_sess.state) &&
         now - g_sess.last_us > (uint64_t)RECV_IDLE_TIMEOUT_US) {
         sess_terminal(RECV_ST_TIMEOUT, "等待对方传输超时");
@@ -2680,8 +3153,16 @@ int recv_status_pull(RecvStatus *out)
 void recv_clear(void)
 {
     reap_zombies();                      /* 会话收尾顺手回收已退出的僵尸槽位 */
+    fin_reap();
     lock();
     if (g_phase == PH_ACTIVE) {
+        if (g_sess.state == RECV_ST_FINALIZING) {
+            /* 最终化在跑：线程还在用 g_sess/暂存根，不能拆。推迟到它收尾时
+             * 补做（clear_pending_finish_locked），避免会话永远卡在 PH_ACTIVE。 */
+            g_clear_pending = 1;
+            unlock();
+            return;
+        }
         if (any_busy_locked()) {             /* 收体进行中：别硬清，先请中止。
                                               * 清场与复位 phase 推迟到最后一个 worker
                                               * 收尾时（clear_pending_finish_locked） */
@@ -2691,6 +3172,9 @@ void recv_clear(void)
             return;
         }
         cleanup_parts();
+        /* 取消/超时/失败的会话：暂存根整体删掉。finalize 失败时保留（下次启动
+         * 清扫）——那里面可能有已合并失败但未搬走的文件。 */
+        if (!g_sess.fin_attempted) rm_stage_roots_locked();
         sess_free_locked();
     } else if (g_phase == PH_PENDING) {
         g_pend_result = 2;                   /* http 等待循环醒来按拒绝处理 */
