@@ -55,6 +55,7 @@ typedef struct {
     int    client_count;
     WebClient clients[WEB_MAX_CLIENTS];
     int    sessions;              /* 已建立下载会话数 */
+    int    active_dl;             /* 正在进行的下载数（空闲会话不算） */
     int    requests;              /* 本次运行累计请求数 */
     /* 当前/最近一次下载 */
     int    cur;                   /* 文件下标（-1=无） */

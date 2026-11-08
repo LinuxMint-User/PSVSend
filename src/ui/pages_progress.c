@@ -12,6 +12,7 @@
 #include "ui/pages_internal.h"
 #include "ui/theme.h"
 #include "core/i18n.h"
+#include "core/dlog.h"
 #include "app/api.h"
 
 /* 传输页：文件列表区域与总进度布局（发送/接收共用）。
@@ -231,10 +232,22 @@ void page_progress_render(void)
                 g_app.prog_cancel = true;
                 msg = tr("Session was not created (request expired).");
                 msg_col = theme->danger;
+                {   /* 每笔传输只打一次：定位"接受后进度页报过期"的现场 */
+                    static uint64_t dbg_start = 0;
+                    if (dbg_start != g_app.prog_start) {
+                        dbg_start = g_app.prog_start;
+                        dlog("ui: progress no session, pending=0, elapsed=%llu ms",
+                             (unsigned long long)
+                                 ((sceKernelGetSystemTimeWide() - g_app.prog_start) / 1000));
+                    }
+                }
             }
         }
     }
-    if (active < 0 && g_app.prog_total > 0) active = g_app.prog_total - 1;
+    /* 不要在 "没有正在进行的文件" 时兜底高亮末行：文件是一个个传的，每完成一个
+     * 到下一个开始之间 cur 会短暂为 -1，兜底会把这几十~几百毫秒的空档画成
+     * "末行高亮"，观感上就是高亮反复跳到列表末尾再跳回当前文件。真正进行中才
+     * 高亮 == 语义本来也如此（行高亮另受 prog_running 约束）。 */
 
     /* 列表可视区滚动夹紧（惯性先推进） */
     {

@@ -11,6 +11,7 @@
 #include "ui/pages_internal.h"
 #include "ui/theme.h"
 #include "core/config.h"
+#include "core/dlog.h"
 #include "core/i18n.h"
 #include "app/ime.h"
 #include "app/api.h"
@@ -36,6 +37,7 @@ static int recv_included(void)
 
 /* ================= 接收请求确认（真实：后端 PENDING 会话） ================= */
 static bool g_recv_expired = false;  /* 请求 60s 没人响应、已被后端作废 */
+static unsigned recv_acc_gen = 0;    /* 刚接受那一笔的占位序号（见 api_recv_pending_gen） */
 static bool g_recv_peer_gone = false;/* 请求消失是因为发送方撤销（关掉 prepare 连接） */
 static uint64_t g_recv_supp_ms = 0;  /* 决定后抑制重弹到：毫秒时间戳 */
 static PageId recv_back = PAGE_DEVICES; /* 弹确认页前所在的页（收尾回程目标） */
@@ -743,7 +745,9 @@ static void do_accept(void)
     rename_pop = false;
     rc_phase = RC_NONE;
     api_recv_decide(true);           /* 唤醒后端：组会话、回 200 给发送方 */
+    recv_acc_gen = api_recv_pending_gen();
     g_app.page = PAGE_PROGRESS;
+    dlog("ui: accept ok selected=%d total=%d -> progress", s.selected, s.count);
 }
 
 static void start_recv(void)
@@ -1287,8 +1291,12 @@ void pages_tick(void)
     if (page_ime_busy()) return;
     /* 旧会话已结束 / 被网页端释放，但用户还停在进度页：若此时已经有新的
      * 待确认请求，必须先退回接收前页面。否则下面的 PAGE_PROGRESS 分支会把
-     * 新请求挡在门外，用户再按返回时还会顺手把新请求清掉。 */
-    if (g_app.page == PAGE_PROGRESS && api_recv_pending_summary(NULL) == 1) {
+     * 新请求挡在门外，用户再按返回时还会顺手把新请求清掉。
+     * 必须比对占位序号：点接受后后端还要几十毫秒才把 PH_PENDING 换成
+     * PH_ACTIVE，这期间 pending 仍是"我刚接受的那一笔"，无条件当新请求会把
+     * 界面误退回设备页、再弹一次已过期的确认页（d263 真机现象）。 */
+    if (g_app.page == PAGE_PROGRESS && api_recv_pending_summary(NULL) == 1 &&
+        api_recv_pending_gen() != recv_acc_gen) {
         RecvStatusSummary st;
         if (api_recv_status_summary(&st) != 1) return_from_recv();
     }

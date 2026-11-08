@@ -60,6 +60,7 @@ static struct {
 
     int   cur;                        /* 当前下载文件下标（-1=无） */
     int   cur_sess;                   /* 正在下载的会话下标（-1=无）：刷新其在线时间 */
+    int   active_dl;                  /* 正在进行的下载数（含并发；空闲会话不算） */
     char  cur_name[128];
     SceOff cur_size;
     SceOff cur_got;
@@ -85,6 +86,7 @@ void web_init(void)
     memset(&W, 0, sizeof W);
     W.cur = -1;
     W.cur_sess = -1;
+    W.active_dl = 0;
     W.sp_us = now_us();
 }
 
@@ -149,6 +151,7 @@ void web_start_download(const WebEntry *files, int n)
     W.requests = 0;
     W.cur = -1;
     W.cur_sess = -1;
+    W.active_dl = 0;
     W.cur_name[0] = 0;
     W.cur_size = W.cur_got = W.done = W.sp_bytes = 0;
     W.sp_us = now_us();
@@ -177,6 +180,7 @@ void web_start_upload(void)
     W.requests = 0;
     W.cur = -1;
     W.cur_sess = -1;
+    W.active_dl = 0;
     W.cur_name[0] = 0;
     W.cur_size = W.cur_got = W.done = W.sp_bytes = 0;
     W.sp_us = now_us();
@@ -199,6 +203,7 @@ void web_stop(void)
     W.pin[0] = 0;
     W.cur = -1;
     W.cur_sess = -1;
+    W.active_dl = 0;
     W.cur_name[0] = 0;
     W.cur_size = W.cur_got = W.done = W.sp_bytes = 0;
     W.speed = 0;
@@ -249,6 +254,7 @@ void web_snapshot(WebSnap *out)
         out->client_count = n;
     }
     out->sessions = live;
+    out->active_dl = W.active_dl;
     out->requests = W.requests;
     out->cur = W.cur;
     snprintf(out->cur_name, sizeof out->cur_name, "%s", W.cur_name);
@@ -589,6 +595,7 @@ int web_download_begin(int idx, SceOff size)
     int g;
     lock();
     W.cur = idx;
+    W.active_dl++;
     snprintf(W.cur_name, sizeof W.cur_name, "%s",
              (idx >= 0 && idx < W.n) ? W.files[idx].name : "");
     W.cur_size = size;
@@ -626,6 +633,7 @@ void web_download_end(int gen)
 {
     lock();
     if ((unsigned)gen == W.gen) {
+        if (W.active_dl > 0) W.active_dl--;
         W.done += W.cur_got;
         W.cur = -1;
         W.cur_got = 0;

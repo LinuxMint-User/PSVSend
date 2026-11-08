@@ -18,6 +18,9 @@ void api_start(void);
 
 /* UI 主循环每帧调用：500ms 节流喂 announce 节奏。必须跑在主线程。 */
 void api_tick(void);
+/* UI 主循环每帧调用：发送/接收/网页传输进行中时保持亮屏（允许系统变暗，
+ * 但取消 OLED 关闭与自动挂起计时器）。内部 1s 节流，空闲时不干预。 */
+void api_keep_awake_tick(void);
 /* UI 主循环每帧在 swap 之后调用：断网时每 4s 发一包 UDP"活性刺激"唤醒
  * 待机省电断开的 Wi-Fi（sendto 只可靠在主线程；Wi-Fi 重连时可能阻塞数秒，
  * 故放在一帧渲染完之后）。必须跑在主线程。 */
@@ -100,6 +103,9 @@ void api_recv_decide_hold(int on);
 void api_recv_decide_touch(void);
 /* 确认页倒计时剩余整秒；-1 = 无请求/暂停中（不显示） */
 int  api_recv_decide_left_s(void);
+/* 当前待决定请求的占位序号（见 recv_pending_gen）：UI 用它区分"刚接受的那笔"
+ * 与"之后真的来了新请求"，避免接受后几十毫秒的建会话窗口被误判成新请求。 */
+unsigned api_recv_pending_gen(void);
 /* 用户中止进行中的接收 */
 void api_recv_abort(void);
 /* 会话结束展示完毕，清场回空闲 */

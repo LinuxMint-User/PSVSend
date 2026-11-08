@@ -17,6 +17,7 @@
  *    一遍上次崩溃遗留的 *.psvsend.tmp。 */
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>              /* strcasecmp（目录名不区分大小写比较） */
 #include <stdlib.h>
 #include <unistd.h>               /* getentropy */
 #include <psp2/io/fcntl.h>
@@ -740,6 +741,61 @@ static bool pend_roots_build_locked(void)
     return true;
 }
 
+/* ---- 保存目录的顶层名字快照 -----------------------------------------
+ * ux0（FAT/exFAT）按路径 stat 是目录线性扫描：downloads 堆到 1700+ 个文件后，
+ * 单次 sceIoGetstat 约 280ms，32 个平铺文件逐个 stat 会把"按接受"卡住 9 秒。
+ * 改为一次 dirent 遍历把顶层名字读进内存再查名字；只有确实存在的名字才需要
+ * 再 stat 一次（区分目录/文件），通常只有冲突的那几个。 */
+typedef struct {
+    char **v;
+    int    n, cap;
+} DirNames;
+
+static void dirnames_free(DirNames *d)
+{
+    int i;
+    for (i = 0; i < d->n; i++) free(d->v[i]);
+    free(d->v);
+    d->v = NULL;
+    d->n = d->cap = 0;
+}
+
+/* 返回 1=成功读到名字（空目录也算成功），0=目录打不开（调用方回退逐个 stat）。 */
+static int dirnames_load(DirNames *d, const char *dir)
+{
+    SceUID dfd;
+    SceIoDirent ent;
+
+    d->v = NULL;
+    d->n = d->cap = 0;
+    dfd = sceIoDopen(dir);
+    if (dfd < 0) return 0;
+    while (sceIoDread(dfd, &ent) > 0) {
+        char *cp;
+        if (!strcmp(ent.d_name, ".") || !strcmp(ent.d_name, "..")) continue;
+        if (d->n >= d->cap) {
+            int nc = d->cap ? d->cap * 2 : 64;
+            char **nv = (char **)realloc(d->v, (size_t)nc * sizeof *nv);
+            if (!nv) break;
+            d->v = nv;
+            d->cap = nc;
+        }
+        cp = strdup(ent.d_name);
+        if (!cp) break;
+        d->v[d->n++] = cp;
+    }
+    sceIoDclose(dfd);
+    return 1;
+}
+
+static int dirnames_has(const DirNames *d, const char *name)
+{
+    int i;
+    for (i = 0; i < d->n; i++)
+        if (!strcasecmp(d->v[i], name)) return 1;
+    return 0;
+}
+
 /* 只 stat 唯一目录路径：
  *   1) 每个顶层一次（目标是否存在 / 是目录还是文件）；
  *   2) 仅对“目标已存在同名目录”的顶层，逐个子目录一次——被同名文件挡住的
@@ -748,11 +804,14 @@ static bool pend_roots_build_locked(void)
 static void pend_roots_precheck_locked(void)
 {
     PathSet dirs;
+    DirNames dn;
+    int dn_ok;
     int i, r;
     int bulk = g_pend.n > 64;          /* 大批量平铺文件不逐个 stat/弹窗 */
     int bulk_logged = 0;
 
     if (!pend_roots_build_locked()) return;
+    dn_ok = dirnames_load(&dn, g_dir);  /* 失败则回退逐个 stat */
 
     for (r = 0; r < g_pend.nroots; r++) {
         PendRoot *rt = &g_pend.roots[r];
@@ -782,12 +841,18 @@ static void pend_roots_precheck_locked(void)
             rt->action = RECV_ROOT_ACT_NONE;
             continue;
         }
-        if (sceIoGetstat(target, &st) < 0) {
-            rt->conflict = RECV_ROOT_CF_NONE;
-        } else if (rt->is_dir && (st.st_mode & SCE_S_IFDIR)) {
-            rt->conflict = RECV_ROOT_CF_DIR;
-        } else {
-            rt->conflict = RECV_ROOT_CF_OCCUPIED;
+        {
+            /* 先查名字快照：不在目录里就不用 stat（省掉一次整目录线性扫描）。 */
+            const char *base = strrchr(target, '/');
+            int exists = dn_ok ? dirnames_has(&dn, base ? base + 1 : target) : 1;
+
+            if (!exists || sceIoGetstat(target, &st) < 0) {
+                rt->conflict = RECV_ROOT_CF_NONE;
+            } else if (rt->is_dir && (st.st_mode & SCE_S_IFDIR)) {
+                rt->conflict = RECV_ROOT_CF_DIR;
+            } else {
+                rt->conflict = RECV_ROOT_CF_OCCUPIED;
+            }
         }
         /* 默认动作：目录默认 Merge（目标不存在时 finalize 走整体 rename）；
          * 平铺文件无需动作；有冲突的条目必须由用户选 Merge/Rename/Skip。 */
@@ -808,6 +873,8 @@ static void pend_roots_precheck_locked(void)
             rt->action = RECV_ROOT_ACT_MERGE;
     }
 
+    /* 快照只用于第一遍；嵌套检查要按子路径 stat，用不上它。 */
+    dirnames_free(&dn);
     /* 第二遍：嵌套目录。只对“目标已存在同名目录”的根做，避免无谓 stat。 */
     if (!pathset_init(&dirs)) return;
     for (i = 0; i < g_pend.n; i++) {
@@ -1786,6 +1853,17 @@ int recv_pending_summary(RecvPendingSummary *out)
     return r;
 }
 
+/* 当前占位序号（见 g_gen）。UI 在接受后用它确认"pending 还是我刚接受那份"，
+ * 避免后端还没建好会话的几十毫秒里被误判成新请求。 */
+unsigned recv_pending_gen(void)
+{
+    unsigned r;
+    lock();
+    r = g_gen;
+    unlock();
+    return r;
+}
+
 int recv_pending_window(int base, int max, RecvPendingRow *out)
 {
     int i, n = 0;
@@ -2247,6 +2325,35 @@ static int build_session_locked(const char *session_id, int via_web)
     return m;
 }
 
+/* 丢弃一个"已经结束但 UI 还没清场"的活动会话（持锁调用）。
+ * 背景：进度页显示中按一次返回只会 recv_abort 成 CANCEL，人仍留在页面上；而
+ * prepare 只认 PH_NONE，于是下一次传输会一直吃 409，直到用户再按一次返回真正
+ * 触发 recv_clear。这里让 prepare 自己接管：终态会话、或发送方失联超过空闲阈值
+ * 的会话直接清掉。正在收体（worker 持有 g_sess）或正在最终化的不碰——那会拆掉
+ * 别人正在用的数据。
+ * 返回 1 = 已清场（g_phase 回到 PH_NONE），调用方可继续受理新的 prepare。 */
+static int drop_stale_session_locked(void)
+{
+    if (g_phase != PH_ACTIVE) return 0;
+    if (g_sess.state == RECV_ST_FINALIZING) return 0;
+    if (any_busy_locked()) return 0;
+    if (!sess_is_terminal(g_sess.state) &&
+        now_us() - g_sess.last_us <= (uint64_t)RECV_IDLE_TIMEOUT_US)
+        return 0;
+
+    dlog("recv: drop stale session=%s state=%d", g_sess.session, g_sess.state);
+    cleanup_parts();
+    if (!g_sess.fin_attempted) rm_stage_roots_locked();
+    sess_free_locked();
+    dir_cache_reset_locked();
+    g_phase = PH_NONE;
+    g_pend_hold = 0;
+    g_abort = 0;
+    g_clear_pending = 0;
+    g_sess_web = 0;
+    return 1;
+}
+
 /* prepare-upload：解析 → 挂起等 UI（≤60s）→ 回 HTTP 码并填 resp（200 时 JSON） */
 static int recv_http_prepare(const char *body, const char *ip, const char *peer_fp,
                              const HttpPeer *peer, int via_web, int no_cl,
@@ -2281,9 +2388,11 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
     }
 
     /* 检查+占位必须持锁原子完成：http 现在多连接并发，若先查后占分两次
-     * 加锁，两个并发 prepare 可能同时通过检查互相覆盖 g_pend。因此进锁后
-     * 只要不是 PH_NONE（有待决定/活动/终态未清场）就立即 409 礼貌拒绝。 */
+     * 加锁，两个并发 prepare 可能同时通过检查互相覆盖 g_pend。进锁后先让
+     * drop_stale_session_locked 接管已结束/失联的旧会话，剩下的非 PH_NONE
+     * （待决定 / 正在收 / 最终化）才 409 礼貌拒绝。 */
     lock();
+    drop_stale_session_locked();             /* 上一笔已结束/失联：直接接管，不 409 */
     if (g_phase != PH_NONE) {
         g_reject_evt = HTTP_REJ_BUSY;
         unlock();

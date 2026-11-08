@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <psp2/kernel/threadmgr/thread.h>
+#include <psp2/kernel/processmgr.h>
 #include "core/config.h"
 #include "net/net.h"
 #include "net/http.h"
@@ -162,6 +163,49 @@ void api_tick(void)
     last_ms = now;
     if ((++n % 8) == 0) watch_keepalive();   /* 每 ~4s 探一次巡检线程的存活 */
     disc_tick_announce();
+}
+
+/* 传输中是否仍需保持亮屏。只看"确实在跑"的链路：
+ *  - 发送线程 active 覆盖预扫 / 等对方接受 / 上传；
+ *  - 接收 pending 覆盖确认页（对方正等着，熄屏会把请求拖到超时）；
+ *  - READY / RECEIVING / FINALIZING 覆盖已接受、收体与整理；
+ *  - 网页下载看 active_dl 计数，空闲共享页（只有心跳）不算。 */
+static int keep_awake_needed(void)
+{
+    XferInfo xi;
+    RecvStatusSummary rs;
+    WebSnap ws;
+
+    api_send_info(&xi);
+    if (xi.active) return 1;
+    if (api_recv_pending_summary(NULL) == 1) return 1;
+    if (api_recv_status_summary(&rs) == 1 &&
+        (rs.state == RECV_ST_READY || rs.state == RECV_ST_RECEIVING ||
+         rs.state == RECV_ST_FINALIZING))
+        return 1;
+    if (api_web_mode() == WEB_MODE_DOWNLOAD) {
+        api_web_snapshot(&ws);
+        if (ws.active_dl > 0) return 1;
+    }
+    return 0;
+}
+
+void api_keep_awake_tick(void)
+{
+    static uint64_t last_ms = 0;
+    uint64_t now;
+
+    if (!keep_awake_needed()) {
+        last_ms = 0;                 /* 空闲/终态：下次一有传输就立刻生效 */
+        return;
+    }
+    now = (uint64_t)sceKernelGetSystemTimeWide() / 1000;
+    if (now - last_ms < 1000) return;
+    last_ms = now;
+    /* 只续"OLED 关闭"和"自动挂起"两条计时器；不碰 DEFAULT（会连变暗一起取消），
+     * 也不碰 DISABLE_OLED_DIMMING——传输期间仍允许按系统设置变暗省电。 */
+    sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+    sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF);
 }
 
 /* UI 主循环每帧调用（一帧渲染完、swap 之后）：断网时的"活性刺激"。
@@ -465,6 +509,11 @@ void api_recv_decide_touch(void)
 int api_recv_decide_left_s(void)
 {
     return recv_decide_left_s();
+}
+
+unsigned api_recv_pending_gen(void)
+{
+    return recv_pending_gen();
 }
 
 void api_recv_abort(void)

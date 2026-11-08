@@ -210,6 +210,10 @@ void recv_decide_hold(int on);
 void recv_decide_touch(void);
 /* 确认页倒计时：剩余整秒；-1 = 无待决定请求或正在暂停（不该显示数字）。 */
 int  recv_decide_left_s(void);
+/* 当前"待决定请求"的占位序号：每次新 prepare 占位 +1，接受/拒绝后不再变。
+ * UI 用来区分"我刚点接受的那一笔"和"之后真的来了另一笔新请求"——接受后后端
+ * 还有几十毫秒才建好会话，这期间若无条件把 pending 当新请求会导致界面误退回。 */
+unsigned recv_pending_gen(void);
 
 /* 用户中止进行中的接收：正在流式收体时置标志让 http 线程尽快收尾
  * （删临时文件、回 CANCEL 态），空闲（READY/文件间）时立即生效。 */
