@@ -747,7 +747,6 @@ static void do_accept(void)
     api_recv_decide(true);           /* 唤醒后端：组会话、回 200 给发送方 */
     recv_acc_gen = api_recv_pending_gen();
     g_app.page = PAGE_PROGRESS;
-    dlog("ui: accept ok selected=%d total=%d -> progress", s.selected, s.count);
 }
 
 static void start_recv(void)

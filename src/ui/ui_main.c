@@ -594,13 +594,6 @@ void ui_run(void)
         api_tick();          /* announce 节奏（500ms 节流；sendto 只在主线程可靠） */
         api_keep_awake_tick();  /* 传输中保持亮屏（允许变暗，不熄屏/不挂起） */
         pages_tick();        /* 检测新到待决定的接收请求 → 弹接收确认页 */
-        {   /* 页面切换打点（低频）：排查"接受后仍停在确认页/进度页报过期"类问题 */
-            static int dbg_page = -1;
-            if ((int)g_app.page != dbg_page) {
-                dlog("ui: page %d -> %d", dbg_page, (int)g_app.page);
-                dbg_page = (int)g_app.page;
-            }
-        }
         /* 基准页被强制切走（如新接收请求弹出）时把摄像头停掉，别让它在后台
          * 一直占着摄像头/CPU；正常返回路径在页面里已经停过，这里是兜底。 */
         if (g_app.page != PAGE_CAM_BENCH && cam_bench_running())
