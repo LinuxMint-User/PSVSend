@@ -78,6 +78,7 @@ typedef struct {
     int  st;                       /* 0=等待 1=完成 2=跳过 3=失败 */
     bool busy;                     /* 本文件正在流式收体（同会话多文件可并发，各自独立） */
     bool orphan;                   /* 收体流水线被遗弃：临时文件由槽位接管，cleanup_parts 跳过 */
+    bool overwrite;                /* 顶层平铺文件：用户选“覆盖”，落盘时替换同名旧文件 */
 } RFile;
 
 /* ---- 收体流水线槽位 ------------------------------------------------
@@ -794,6 +795,9 @@ static void pend_roots_precheck_locked(void)
             rt->action = RECV_ROOT_ACT_NONE;
         if (rt->action == RECV_ROOT_ACT_MERGE && !rt->is_dir)
             rt->action = RECV_ROOT_ACT_NONE;
+        if (rt->action == RECV_ROOT_ACT_OVERWRITE &&
+            (rt->is_dir || rt->conflict != RECV_ROOT_CF_OCCUPIED))
+            rt->action = RECV_ROOT_ACT_NONE;
         if (rt->action == RECV_ROOT_ACT_MERGE &&
             (rt->conflict == RECV_ROOT_CF_OCCUPIED ||
              rt->conflict == RECV_ROOT_CF_NESTED ||
@@ -1460,13 +1464,18 @@ static bool create_zero_flat(const char *name)
 
 /* 0 字节文件统一在 finalize 创建：目录内的写进暂存根（随后随根搬走），
  * 平铺的直接落保存目录。 */
-static bool create_zero_staged(const char *rel, const char *stage_name)
+static bool create_zero_staged(const char *rel, const char *stage_name,
+                               bool overwrite)
 {
     char top[RP_COMP_MAX + 1], path[RP_PATH_MAX + 1];
     const char *inner;
 
     split_top_inner(rel, top, sizeof top, &inner);
-    if (!inner[0]) return create_zero_flat(top);
+    if (!inner[0]) {
+        if (overwrite && rp_final_path(g_dir, top, NULL, path, sizeof path))
+            return create_zero_file(path);
+        return create_zero_flat(top);
+    }
     if (!rp_stage_file_path(g_dir, stage_name, inner, path, sizeof path))
         return false;
     return create_zero_file(path);
@@ -1497,7 +1506,8 @@ static int fin_thread(SceSize args, void *argp)
         int ridx = g_sess.zeros[i].ridx;
         const char *stage = (ridx >= 0 && ridx < g_sess.nroots)
                                 ? g_sess.roots[ridx]->stage_name : "";
-        bool ok = create_zero_staged(g_sess.f[fidx].rel, stage);
+        bool ok = create_zero_staged(g_sess.f[fidx].rel, stage,
+                                     g_sess.f[fidx].overwrite);
         if (zok) zok[i] = ok ? 1 : 0;
         if (!ok) zero_bad++;
     }
@@ -1912,6 +1922,14 @@ int recv_set_root_action(int idx, int action, const char *new_name)
                 rt->action = RECV_ROOT_ACT_SKIP;
                 r = RECV_ROOT_OK;
                 break;
+            case RECV_ROOT_ACT_OVERWRITE:
+                if (rt->is_dir || rt->conflict != RECV_ROOT_CF_OCCUPIED) {
+                    r = RECV_ROOT_E_STATE;
+                } else {
+                    rt->action = RECV_ROOT_ACT_OVERWRITE;
+                    r = RECV_ROOT_OK;
+                }
+                break;
             case RECV_ROOT_ACT_RENAME:
                 r = root_rename_locked(idx, new_name);
                 break;
@@ -2099,7 +2117,7 @@ static int build_session_locked(const char *session_id, int via_web)
         char final[RP_PATH_MAX + 1];
         char part[RP_PATH_MAX + 1];
         int ridx = -1, k = 0;
-        bool ok = false, oomr = false;
+        bool ok = false, oomr = false, overwrite = false;
 
         if (!pend_inc_get(i)) continue;
         if (!g_pend.f[i].path_ok) { skipped++; continue; }
@@ -2132,6 +2150,7 @@ static int build_session_locked(const char *session_id, int via_web)
                     skipped++;
                     continue;
                 }
+                overwrite = (rt->action == RECV_ROOT_ACT_OVERWRITE);
                 if (!rel_replace_top(rel, root_eff_name(rt),
                                      eff_rel, sizeof eff_rel)) {
                     skipped++;
@@ -2169,6 +2188,7 @@ static int build_session_locked(const char *session_id, int via_web)
 
         f = &arr[m];
         memset(f, 0, sizeof *f);
+        f->overwrite = overwrite && cinner[0] == '\0';
         snprintf(f->fileid, sizeof f->fileid, "%s", g_pend.f[i].fileid);
         gen_hex(f->token, 16);
         snprintf(f->rel, sizeof f->rel, "%s", cand);
@@ -2580,6 +2600,13 @@ static bool resolve_disk_conflict_locked(RFile *f)
     int k = 0;
 
     if (strchr(f->rel, '/')) return true;
+    if (f->overwrite) {
+        /* 覆盖：保留原名，不再找 (k)；但要避开其他会话遗留的临时文件，
+         * 免得写入时把别人未收完的数据截断。 */
+        if (part_in_zombie(f->part)) return false;
+        if (session_has_rel_locked(f, f->rel)) return false;
+        return true;
+    }
     snprintf(base_rel, sizeof base_rel, "%s", f->rel);
     for (;;) {
         if (k == 0)
@@ -2746,6 +2773,14 @@ static SceUID open_direct_bulk(RFile *f)
     }
 }
 
+/* 落盘提交：overwrite 的顶层平铺文件先删掉同名旧文件，再把临时文件改名过去。
+ * 旧文件在收完且校验通过之后才删，失败时原文件保持不动。 */
+static int commit_file_rename(RFile *f)
+{
+    if (f->overwrite) sceIoRemove(f->final);
+    return sceIoRename(f->part, f->final);
+}
+
 /* 小文件直写：不开槽位/线程，在当前 http worker 里收完、校验、改名。
  * 失败语义与流水线路径保持一致（单文件写失败只算该文件；断流是会话级）。 */
 static int upload_inline(RFile *f, SceUID fd, http_stream_fn fn, void *ctx,
@@ -2835,7 +2870,7 @@ static int upload_inline(RFile *f, SceUID fd, http_stream_fn fn, void *ctx,
         unlock();
         return 422;
     }
-    if (!direct && sceIoRename(f->part, f->final) < 0) {
+    if (!direct && commit_file_rename(f) < 0) {
         lock();
         file_fail_locked(f, "文件落盘失败");
         clear_pending_finish_locked();
@@ -2930,7 +2965,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
      * 大批量小文件例外：直写最终名并在 open_direct_bulk 里判冲突，省掉每个
      * 文件一次 ~1s 的 rename（ux0 大目录的主要瓶颈）。 */
     direct = g_sess.bulk && f->size >= 0 && f->size <= RECV_INLINE_MAX &&
-             !strchr(f->rel, '/');
+             !f->overwrite && !strchr(f->rel, '/');
     if (!direct && !resolve_disk_conflict_locked(f)) {
         file_fail_locked(f, "无法分配文件名");
         unlock();
@@ -3207,7 +3242,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         unlock();
         return 422;
     }
-    if (sceIoRename(f->part, f->final) < 0) {
+    if (commit_file_rename(f) < 0) {
         lock();
         file_fail_locked(f, "文件落盘失败");
         clear_pending_finish_locked();
@@ -3237,15 +3272,21 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
 static int recv_http_cancel(const char *query, const char *ip)
 {
     char sid[64];
+    bool release_web = false;
     (void)ip;
     query_get(query, "sessionId", sid, sizeof sid);
     lock();
     if (g_phase == PH_ACTIVE && sid[0] &&
         strcmp(g_sess.session, sid) == 0 &&
-        g_sess.state != RECV_ST_FINALIZING &&   /* 最终化期间忽略：数据已收完 */
-        !sess_is_terminal(g_sess.state)) {   /* 已终态就忽略：别把 DONE 改写成 CANCEL，
-                                              * 更别覆盖 FAIL/TIMEOUT 的失败原因 */
-        if (any_busy_locked()) {
+        g_sess.state != RECV_ST_FINALIZING) {
+        if (sess_is_terminal(g_sess.state)) {
+            /* 网页上传页在开始下一次发送前会调 cancel 释放上一次已完成的会话；
+             * 只针对网页来源，桌面客户端的历史 cancel 不改变 UI 上的完成展示。 */
+            if (g_sess_web) {
+                release_web = true;
+                dlog("recv: web session %s released", g_sess.session);
+            }
+        } else if (any_busy_locked()) {
             /* 正在流式收体（http 并发连接）：直接清场会删掉收体中那些
              * 临时文件；置中止位，让收体循环在锁内统一收尾（与 UI 取消一致） */
             g_abort = 1;
@@ -3258,6 +3299,7 @@ static int recv_http_cancel(const char *query, const char *ip)
         }
     }
     unlock();
+    if (release_web) recv_clear();
     return 200;                              /* 协议：cancel 恒回 200 */
 }
 
@@ -3471,7 +3513,7 @@ static void link_download(const char *host, int port, const char *sid)
             rc = -4;                         /* 清单与实际长度不符 */
 
         if (rc == 0) {
-            if (sceIoRename(f->part, f->final) < 0) {
+            if (commit_file_rename(f) < 0) {
                 lock();
                 file_fail_locked(f, "文件落盘失败");
                 unlock();
@@ -3858,6 +3900,7 @@ void recv_clear(void)
     g_pend_hold = 0;
     g_abort = 0;
     g_clear_pending = 0;
+    g_sess_web = 0;
     dir_cache_reset_locked();
     unlock();
 }

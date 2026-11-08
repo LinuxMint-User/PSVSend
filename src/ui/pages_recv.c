@@ -424,6 +424,7 @@ static bool rc_load(int idx, RecvRootRow *out)
 static int rc_root_btns(const RecvRootRow *r)
 {
     if (r->is_dir && r->conflict == RECV_ROOT_CF_DIR) return 3;
+    if (!r->is_dir && r->conflict == RECV_ROOT_CF_OCCUPIED) return 3;
     return 2;
 }
 
@@ -431,6 +432,11 @@ static const char *rc_root_label(const RecvRootRow *r, int i)
 {
     if (r->is_dir && r->conflict == RECV_ROOT_CF_DIR) {
         if (i == 0) return tr("Merge");
+        if (i == 1) return tr("Rename");
+        return tr("Skip");
+    }
+    if (!r->is_dir && r->conflict == RECV_ROOT_CF_OCCUPIED) {
+        if (i == 0) return tr("Overwrite");
         if (i == 1) return tr("Rename");
         return tr("Skip");
     }
@@ -477,7 +483,8 @@ static void rc_open_next(int start)
         rc_cur = row;
         rc_cur_nested = false;
         rc_phase = RC_ROOT;
-        rc_sel = 0;
+        /* 平铺文件冲突的默认项是 Rename：Overwrite 会删旧文件，不能作为默认。 */
+        rc_sel = (!row.is_dir && row.conflict == RECV_ROOT_CF_OCCUPIED) ? 1 : 0;
         rc_err = 0;
         return;
     }
@@ -568,6 +575,11 @@ static void rc_activate(int btn)
             if (btn == 0)      rc_apply_action(rc_cur_idx, RECV_ROOT_ACT_MERGE);
             else if (btn == 1) rc_begin_rename(rc_cur_idx, false);
             else               rc_apply_action(rc_cur_idx, RECV_ROOT_ACT_SKIP);
+        } else if (!rc_cur.is_dir &&
+                   rc_cur.conflict == RECV_ROOT_CF_OCCUPIED) {
+            if (btn == 0)      rc_apply_action(rc_cur_idx, RECV_ROOT_ACT_OVERWRITE);
+            else if (btn == 1) rc_begin_rename(rc_cur_idx, false);
+            else               rc_apply_action(rc_cur_idx, RECV_ROOT_ACT_SKIP);
         } else {
             if (btn == 0) rc_begin_rename(rc_cur_idx, false);
             else          rc_apply_action(rc_cur_idx, RECV_ROOT_ACT_SKIP);
@@ -592,13 +604,15 @@ static void rc_render(void)
         /* 系统键盘事务进行中：只留遮罩标题，防止底层按钮被点到 */
         card = w_modal_box(120);
         w_text(card.x + 24, card.y + 42, 1.2f, theme->text, "%s",
-               tr("Rename folder"));
+               rc_cur.is_dir ? tr("Rename folder") : tr("Rename file"));
         return;
     }
     card = w_modal_box(300);
-    if (rc_phase == RC_ROOT)        title = tr("Folder conflicts");
+    if (rc_phase == RC_ROOT)
+        title = rc_cur.is_dir ? tr("Folder conflicts") : tr("File conflicts");
     else if (rc_phase == RC_NESTED) title = tr("Nested folders conflict");
-    else                            title = tr("Rename folder");
+    else                            title = rc_cur.is_dir ? tr("Rename folder")
+                                                          : tr("Rename file");
     w_text(card.x + 24, card.y + 22, 1.3f, theme->text, "%s", title);
 
     shown = rc_cur.rname[0] ? rc_cur.rname : rc_cur.name;
@@ -607,6 +621,10 @@ static void rc_render(void)
     if (rc_phase == RC_ROOT) {
         if (rc_cur.conflict == RECV_ROOT_CF_DIR)
             snprintf(line, sizeof line, tr("%s already exists. Merge into it?"),
+                     shown);
+        else if (!rc_cur.is_dir &&
+                 rc_cur.conflict == RECV_ROOT_CF_OCCUPIED)
+            snprintf(line, sizeof line, tr("%s already exists. Overwrite it?"),
                      shown);
         else if (rc_cur.conflict == RECV_ROOT_CF_RESERVED)
             snprintf(line, sizeof line, "%s",
@@ -631,9 +649,11 @@ static void rc_render(void)
         if (rc_err == RECV_ROOT_E_OCCUPIED)
             msg = tr("A file with that name already exists.");
         else if (rc_err == RECV_ROOT_E_DUP)
-            msg = tr("Name is used by another incoming folder.");
+            msg = rc_cur.is_dir ? tr("Name is used by another incoming folder.")
+                                : tr("Name is used by another incoming file.");
         else
-            msg = tr("Invalid folder name.");
+            msg = rc_cur.is_dir ? tr("Invalid folder name.")
+                                : tr("Invalid file name.");
         w_text_clip(card.x + 24, card.y + 104, 1.0f, theme->danger, msg,
                     card.w - 48);
         w_text_mid(card.x + 24, card.y + 136, 1.0f, theme->text_dim,

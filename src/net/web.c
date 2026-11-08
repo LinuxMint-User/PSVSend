@@ -16,7 +16,10 @@
 #include "net/web.h"
 #include "net/http.h"
 #include "net/net.h"
+#include "core/config.h"
 #include "core/dlog.h"
+
+static void build_up_page(int limit);
 
 /* ================= 会话状态 ================= */
 
@@ -161,6 +164,8 @@ void web_start_download(const WebEntry *files, int n)
 void web_start_upload(void)
 {
     web_init();
+    /* 上传页里的“当前接收上限”在共享开始时定稿（共享期间无法改设置） */
+    build_up_page(config_recv_limit_clamp(g_cfg.recv_files_limit));
     lock();
     W.mode = WEB_MODE_UPLOAD;
     W.n = 0;
@@ -653,6 +658,23 @@ void web_download_end(int gen)
 "border:1px solid var(--line);background:#14161a;color:var(--tx);font-size:20px;" \
 "letter-spacing:6px;text-align:center}" \
 "input[type=file]{width:100%;font-size:14px;color:var(--tx)}" \
+".pick{margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}" \
+".pick:first-child{margin-top:0;padding-top:0;border-top:0}" \
+".pick input[type=file]{display:none}" \
+".choose{display:block;margin-top:10px;padding:12px;border:1px solid var(--ac);" \
+"border-radius:10px;background:transparent;color:var(--ac);text-align:center;font-size:15px;" \
+"font-weight:600;cursor:pointer}" \
+".picked{display:block;margin:10px 2px 0;font-size:13px;color:var(--dim)}" \
+".selhead{display:flex;align-items:center;justify-content:space-between;gap:10px;" \
+"margin-top:14px;font-size:13px;color:var(--dim)}" \
+".selhead button{width:auto;margin:0;padding:4px 10px;font-size:13px;border:1px solid var(--line);" \
+"background:transparent;color:var(--dim);border-radius:8px}" \
+".sellist{margin-top:6px;max-height:180px;overflow:auto}" \
+".selrow{display:flex;align-items:center;gap:10px;padding:7px 2px;border-top:1px solid var(--line);" \
+"font-size:13px}" \
+".selrow span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" \
+".selrow button{width:auto;margin:0;padding:2px 9px;font-size:14px;line-height:1.2;" \
+"border:1px solid var(--line);background:transparent;color:var(--dim);border-radius:6px}" \
 "button{width:100%;margin-top:12px;padding:12px;border:0;border-radius:10px;" \
 "background:var(--ac);color:#fff;font-size:16px;font-weight:600}" \
 "button:disabled{opacity:.5}.msg{min-height:20px;font-size:13px;color:var(--dim);margin-top:10px}" \
@@ -682,39 +704,73 @@ void web_download_end(int gen)
 "<option value=\"tw\">繁體中文</option><option value=\"ja\">日本語</option>" \
 "</select></footer></div><script>"
 
+/* 上传脚本里的 HARD 与 proto/receive.h 的 RECV_FILES_MAX（2048）同口径；
+ * 改接收上限时两边一起改（后端仍是最终裁决，超出会回 413）。 */
 #define HTML_STRINGS \
-"const T={" \
-"en:{d:'Download from PS Vita',u:'Send files to PS Vita',pin:'Enter the 4-digit PIN shown on PS Vita'," \
+"var HARD=2048,LIMIT=0;const T={" \
+"en:{d:'Download from PS Vita',u:'Send files or folders to PS Vita',pin:'Enter the 4-digit PIN shown on PS Vita'," \
 "go:'Connect',get:'Get',wrong:'Wrong PIN',many:'Too many attempts, wait 30 seconds'," \
 "off:'Sharing is not active',files:'Shared files',empty:'No files shared'," \
-"pick:'Choose files (up to 64)',send:'Send',wait:'Waiting for confirmation on PS Vita…'," \
+"pickFiles:'Choose files (up to '+HARD+')',pickDir:'Choose a folder (up to '+HARD+' files)'," \
+"send:'Send',wait:'Waiting for confirmation on PS Vita…'," \
 "reject:'Declined or timed out',busy:'PS Vita is busy, try again later',done:'All files sent'," \
-"part:'Some files failed',trunc:'Only the first 64 files are sent'," \
+"part:'Some files failed',none:'No files selected'," \
+"noneFiles:'No files selected',noneDir:'No folder selected'," \
+"picked:function(n){return 'Selected '+n+' file(s)';}," \
+"pickedDir:function(n){return 'Selected '+n+' file(s) from the folder';}," \
+"clear:'Clear all',remove:'Remove',more:function(n){return '+'+n+' more';}," \
+"toobig:'Too many files or the manifest is too large'," \
+"nomem:'PS Vita is low on memory; try fewer files'," \
+"capF:function(){return 'Receive limit: '+LIMIT+' file(s); larger batches are raised temporarily for this transfer.';}," \
 "foot:'Plain HTTP · only the files selected on PS Vita'," \
 "con:'Each file may use up to 16 connections. Download one or two at a time — three or more may briefly block this page.'}, " \
-"zh:{d:'从 PS Vita 下载文件',u:'把文件发送到 PS Vita',pin:'输入 PS Vita 上显示的 4 位 PIN'," \
+"zh:{d:'从 PS Vita 下载文件',u:'把文件或文件夹发送到 PS Vita',pin:'输入 PS Vita 上显示的 4 位 PIN'," \
 "go:'连接',get:'下载',wrong:'PIN 不正确',many:'尝试次数过多，请 30 秒后再试'," \
 "off:'共享未开启',files:'共享文件',empty:'没有共享文件'," \
-"pick:'选择文件（最多 64 个）',send:'发送',wait:'等待 PS Vita 确认…'," \
+"pickFiles:'选择文件（最多 '+HARD+' 个）',pickDir:'选择文件夹（最多 '+HARD+' 个文件）'," \
+"send:'发送',wait:'等待 PS Vita 确认…'," \
 "reject:'已拒绝或超时',busy:'PS Vita 正忙，请稍后再试',done:'全部发送完成'," \
-"part:'部分文件发送失败',trunc:'只发送前 64 个文件'," \
+"part:'部分文件发送失败',none:'没有选中文件'," \
+"noneFiles:'未选择文件',noneDir:'未选择文件夹'," \
+"picked:function(n){return '已选 '+n+' 个文件';}," \
+"pickedDir:function(n){return '已从文件夹选 '+n+' 个文件';}," \
+"clear:'全部清除',remove:'移除',more:function(n){return '还有 '+n+' 个';}," \
+"toobig:'文件过多或清单过大'," \
+"nomem:'PS Vita 内存不足，请减少文件数量'," \
+"capF:function(){return '当前接收上限 '+LIMIT+' 个；超过时本次自动提升。';}," \
 "foot:'明文 HTTP · 仅本次在 PS Vita 上选定的文件'," \
 "con:'每个文件最多占用 16 条连接；建议一次下 1~2 个，同时下三个以上可能让本页短暂无响应。'}, " \
-"tw:{d:'從 PS Vita 下載檔案',u:'把檔案傳送到 PS Vita',pin:'輸入 PS Vita 上顯示的 4 位 PIN'," \
+"tw:{d:'從 PS Vita 下載檔案',u:'把檔案或資料夾傳送到 PS Vita',pin:'輸入 PS Vita 上顯示的 4 位 PIN'," \
 "go:'連線',get:'下載',wrong:'PIN 不正確',many:'嘗試次數過多，請 30 秒後再試'," \
 "off:'共享尚未開啟',files:'共享檔案',empty:'沒有共享檔案'," \
-"pick:'選擇檔案（最多 64 個）',send:'傳送',wait:'等待 PS Vita 確認…'," \
+"pickFiles:'選擇檔案（最多 '+HARD+' 個）',pickDir:'選擇資料夾（最多 '+HARD+' 個檔案）'," \
+"send:'傳送',wait:'等待 PS Vita 確認…'," \
 "reject:'已拒絕或逾時',busy:'PS Vita 忙碌中，請稍後再試',done:'全部傳送完成'," \
-"part:'部分檔案傳送失敗',trunc:'只傳送前 64 個檔案'," \
+"part:'部分檔案傳送失敗',none:'沒有選取檔案'," \
+"noneFiles:'未選擇檔案',noneDir:'未選擇資料夾'," \
+"picked:function(n){return '已選 '+n+' 個檔案';}," \
+"pickedDir:function(n){return '已從資料夾選 '+n+' 個檔案';}," \
+"clear:'全部清除',remove:'移除',more:function(n){return '還有 '+n+' 個';}," \
+"toobig:'檔案過多或清單過大'," \
+"nomem:'PS Vita 記憶體不足，請減少檔案數量'," \
+"capF:function(){return '目前接收上限 '+LIMIT+' 個；超過時本次自動提升。';}," \
 "foot:'明文 HTTP · 僅本次在 PS Vita 上選定的檔案'," \
 "con:'每個檔案最多佔用 16 條連線；建議一次下 1~2 個，同時下三個以上可能讓本頁短暫無回應。'}, " \
-"ja:{d:'PS Vita からダウンロード',u:'PS Vita にファイルを送る',pin:'PS Vita に表示された 4 桁の PIN を入力'," \
+"ja:{d:'PS Vita からダウンロード',u:'PS Vita にファイルやフォルダーを送る',pin:'PS Vita に表示された 4 桁の PIN を入力'," \
 "go:'接続',get:'取得',wrong:'PIN が違います',many:'試行回数が多すぎます。30 秒後にお試しください'," \
 "off:'共有は開始されていません',files:'共有ファイル',empty:'共有ファイルはありません'," \
-"pick:'ファイルを選択（最大 64 個）',send:'送信',wait:'PS Vita の確認を待っています…'," \
+"pickFiles:'ファイルを選択（最大 '+HARD+' 個）',pickDir:'フォルダーを選択（最大 '+HARD+' ファイル）'," \
+"send:'送信',wait:'PS Vita の確認を待っています…'," \
 "reject:'拒否されたかタイムアウトしました',busy:'PS Vita は使用中です。後で再試行してください'," \
 "done:'すべて送信しました',part:'一部のファイルを送信できませんでした'," \
-"trunc:'最初の 64 個のファイルだけ送信します'," \
+"none:'ファイルが選択されていません'," \
+"noneFiles:'ファイルが選択されていません',noneDir:'フォルダーが選択されていません'," \
+"picked:function(n){return '選択中: '+n+' ファイル';}," \
+"pickedDir:function(n){return 'フォルダーから '+n+' ファイル選択中';}," \
+"clear:'すべて解除',remove:'削除',more:function(n){return '他 '+n+' 件';}," \
+"toobig:'ファイルが多すぎるか、リストが大きすぎます'," \
+"nomem:'PS Vita のメモリが不足しています。ファイル数を減らしてください'," \
+"capF:function(){return '現在の受信上限は '+LIMIT+' ファイルです。超える場合は今回のみ自動で引き上げます。';}," \
 "foot:'平文 HTTP · PS Vita で選んだファイルのみ'," \
 "con:'1 ファイルにつき最大 16 接続を使用します。同時に 1〜2 個までがおすすめです（3 個以上では本ページが一時的に応答しなくなる場合があります）。'}};" \
 "const L=(function(){var q=null;try{q=new URLSearchParams(location.search).get('lang');}" \
@@ -772,40 +828,75 @@ void web_download_end(int gen)
 "var qp=qpin();if(qp){$('pin').value=qp;stripPin();connect(qp);}else if(sid)connect('');"
 
 /* 上传面板的脚本：PIN → prepare-upload（等 PSV 确认）→ 逐文件 upload。
- * PIN 不落 sessionStorage、刷新必须重输：PIN 每次进页面重新生成，缓存旧值会让
- * "PSV 关掉共享再重开"后仍不弹输入框（旧 PIN 只在真正上传时才被 401 拒）。 */
+ * 文件与文件夹两条入口可以混合选择（后选的追加到同一份清单，不去掉前面的），
+ * 文件夹用 webkitRelativePath 作为 fileName，接收侧按相对路径还原目录结构。 */
 #define HTML_UP_JS \
-"var pin='';" \
+"LIMIT=@LIMIT@;var pin='',BUSY=false,SEL=[],LAST_SID='';" \
 "function progress(a,b){var p=b>0?Math.round(a*100/b):0;$('bar').style.display='';" \
 "$('bar').firstElementChild.style.width=p+'%';}" \
-"async function send(){var fl=$('files').files;if(!fl.length)return;" \
-"var arr=Array.prototype.slice.call(fl,0,64);" \
-"var files={};arr.forEach(function(f,i){files['f'+i]={fileName:f.name,size:f.size};});" \
+"function itemsOf(fl,rel){var o=[];for(var i=0;i<fl.length;i++){var f=fl[i];" \
+"o.push({f:f,n:rel?(f.webkitRelativePath||f.name):f.name,src:rel?1:0});}return o;}" \
+"function addItems(items){var seen={},i,it,k;" \
+"for(i=0;i<SEL.length;i++){it=SEL[i];seen[it.n+'|'+it.f.size+'|'+(it.f.lastModified||0)]=1;}" \
+"for(i=0;i<items.length;i++){it=items[i];k=it.n+'|'+it.f.size+'|'+(it.f.lastModified||0);" \
+"if(!seen[k]){if(SEL.length>=HARD){msg(T0.toobig,1);break;}seen[k]=1;SEL.push(it);}}" \
+"renderSel();}" \
+"function renderSel(){var box=$('selList'),n=SEL.length,nf=0,nd=0,i;" \
+"for(i=0;i<n;i++){if(SEL[i].src)nd++;else nf++;}box.innerHTML='';" \
+"$('selInfo').textContent=n?T0.picked(n):T0.none;" \
+"$('clearBtn').style.display=n?'':'none';" \
+"$('filesPicked').textContent=nf?T0.picked(nf):T0.noneFiles;" \
+"$('dirPicked').textContent=nd?T0.pickedDir(nd):T0.noneDir;" \
+"var show=n<8?n:8;for(var i=0;i<show;i++){var d=document.createElement('div');" \
+"d.className='selrow';var s=document.createElement('span');s.textContent=SEL[i].n;" \
+"s.title=SEL[i].n;var b=document.createElement('button');b.textContent='×';" \
+"b.title=T0.remove;b.setAttribute('data-i',i);d.appendChild(s);d.appendChild(b);" \
+"box.appendChild(d);}if(n>show){var m=document.createElement('div');m.className='selrow';" \
+"m.style.color='var(--dim)';m.textContent=T0.more(n-show);box.appendChild(m);}}" \
+"function clearSel(){SEL=[];$('files').value='';$('dir').value='';" \
+"renderSel();}" \
+"async function send(items){if(BUSY)return;if(!items.length){msg(T0.none,1);return;}" \
+"if(items.length>HARD){msg(T0.toobig,1);return;}" \
+"BUSY=true;$('sendBtn').disabled=true;" \
+"if(LAST_SID){try{await fetch('/api/localsend/v2/cancel?sessionId='+" \
+"encodeURIComponent(LAST_SID),{method:'POST'});}catch(e){}LAST_SID='';}" \
+"var files={};items.forEach(function(it,i){files['f'+i]={fileName:it.n,size:it.f.size};});" \
 "var body=JSON.stringify({info:{alias:'Web browser',deviceModel:'Browser',deviceType:'web'," \
 "fingerprint:'',port:0,protocol:'http',download:false},files:files});" \
-"msg(T0.wait);$('send').disabled=true;" \
+"msg(T0.wait);" \
 "try{var r=await fetch('/api/localsend/v2/prepare-upload?pin='+encodeURIComponent(pin)," \
 "{method:'POST',headers:{'Content-Type':'application/json'},body:body});" \
 "if(r.status===401){msg(T0.wrong,1);return;}if(r.status===429){msg(T0.many,1);return;}" \
-"if(r.status===409){msg(T0.busy,1);return;}if(r.status!==200){msg(T0.reject,1);return;}" \
-"var j=await r.json();var total=0;arr.forEach(function(f){total+=f.size;});" \
-"var done=0,bad=0;for(var i=0;i<arr.length;i++){var tok=j.files&&j.files['f'+i];" \
-"if(!tok)continue;var u='/api/localsend/v2/upload?sessionId='+encodeURIComponent(j.sessionId)+" \
+"if(r.status===409){msg(T0.busy,1);return;}if(r.status===413){msg(T0.toobig,1);return;}" \
+"if(r.status===507){msg(T0.nomem,1);return;}if(r.status!==200){msg(T0.reject,1);return;}" \
+"var j=await r.json();LAST_SID=j.sessionId;var total=0;" \
+"items.forEach(function(it){total+=it.f.size;});" \
+"var done=0,bad=0;for(var i=0;i<items.length;i++){done+=items[i].f.size;" \
+"var tok=j.files&&j.files['f'+i];if(!tok){progress(done,total);continue;}" \
+"var u='/api/localsend/v2/upload?sessionId='+encodeURIComponent(j.sessionId)+" \
 "'&fileId=f'+i+'&token='+encodeURIComponent(tok);" \
 "try{var ur=await fetch(u,{method:'POST',headers:{'Content-Type':'application/octet-stream'}," \
-"body:arr[i]});if(ur.status!==200)bad++;}catch(e){bad++;}" \
-"done+=arr[i].size;progress(done,total);if(bad)msg(T0.part,1);}" \
-"msg(bad?T0.part:T0.done,bad?1:2);" \
-"}catch(e){msg(T0.reject,1);}finally{$('send').disabled=false;}}" \
+"body:items[i].f});if(ur.status!==200)bad++;}catch(e){bad++;}" \
+"progress(done,total);if(bad)msg(T0.part,1);}" \
+"msg(bad?T0.part:T0.done,bad?1:2);if(!bad)clearSel();" \
+"}catch(e){msg(T0.reject,1);}finally{BUSY=false;$('sendBtn').disabled=false;}}" \
 "$('sub').textContent=T0.u;$('pinLabel').textContent=T0.pin;$('pinGo').textContent=T0.go;" \
-"$('pickLabel').textContent=T0.pick;$('send').textContent=T0.send;" \
-"$('foot').textContent=T0.foot;" \
+"$('chooseFilesLabel').textContent=T0.pickFiles;$('chooseDirLabel').textContent=T0.pickDir;" \
+"$('clearBtn').textContent=T0.clear;$('sendBtn').textContent=T0.send;" \
+"$('filesPicked').textContent=T0.noneFiles;$('dirPicked').textContent=T0.noneDir;" \
+"$('capTip').textContent=T0.capF();$('foot').textContent=T0.foot;renderSel();" \
 "$('pinGo').onclick=function(){pin=$('pin').value.replace(/\\D/g,'');" \
 "if(pin.length!==4){msg(T0.wrong,1);return;}" \
 "sessionStorage.removeItem('psvsend_pin');" \
 "$('pinCard').style.display='none';$('upCard').style.display='';msg('');};" \
 "$('pin').onkeydown=function(e){if(e.key==='Enter')$('pinGo').click();};" \
-"$('send').onclick=send;" \
+"$('sendBtn').onclick=function(){send(SEL);};" \
+"$('files').onchange=function(){addItems(itemsOf(this.files,false));this.value='';};" \
+"$('dir').onchange=function(){addItems(itemsOf(this.files,true));this.value='';};" \
+"$('selList').onclick=function(e){var b=e.target.closest?e.target.closest('button'):null;" \
+"if(!b)return;var i=parseInt(b.getAttribute('data-i'),10);if(isNaN(i))return;" \
+"SEL.splice(i,1);if(!SEL.length)clearSel();else renderSel();};" \
+"$('clearBtn').onclick=clearSel;" \
 "var qp=qpin();if(qp){$('pin').value=qp;stripPin();$('pinGo').click();}"
 
 #define HTML_DL_BODY \
@@ -822,14 +913,47 @@ void web_download_end(int gen)
 "autocomplete=\"one-time-code\" placeholder=\"••••\">" \
 "<button id=\"pinGo\"></button></div>" \
 "<div class=\"card\" id=\"upCard\" style=\"display:none\">" \
-"<label id=\"pickLabel\" for=\"files\"></label>" \
-"<input type=\"file\" id=\"files\" multiple> <button id=\"send\"></button>" \
+"<div class=\"pick\"><input type=\"file\" id=\"files\" multiple>" \
+"<label class=\"choose\" id=\"chooseFilesLabel\" for=\"files\"></label>" \
+"<div class=\"picked\" id=\"filesPicked\"></div></div>" \
+"<div class=\"pick\"><input type=\"file\" id=\"dir\" webkitdirectory directory multiple>" \
+"<label class=\"choose\" id=\"chooseDirLabel\" for=\"dir\"></label>" \
+"<div class=\"picked\" id=\"dirPicked\"></div></div>" \
+"<div class=\"selhead\"><span id=\"selInfo\"></span>" \
+"<button id=\"clearBtn\" style=\"display:none\"></button></div>" \
+"<div class=\"sellist\" id=\"selList\"></div>" \
+"<button id=\"sendBtn\"></button>" \
+"<p class=\"tip\" id=\"capTip\"></p>" \
 "<div class=\"bar\" id=\"bar\"><i></i></div></div>"
 
 static const char s_page_dl[] =
     HTML_HEAD HTML_DL_BODY HTML_TAIL HTML_STRINGS HTML_DL_JS "</script></body></html>";
-static const char s_page_up[] =
+static const char s_up_tmpl[] =
     HTML_HEAD HTML_UP_BODY HTML_TAIL HTML_STRINGS HTML_UP_JS "</script></body></html>";
+
+/* 上传页模板里的 @LIMIT@ 换成当前“接收文件上限”档位；模板比替换结果长，
+ * 缓冲区取模板大小，替换只会变短，不会截断。 */
+static char s_up_page[sizeof s_up_tmpl];
+
+static void build_up_page(int limit)
+{
+    static const char tok[] = "@LIMIT@";
+    const char *p = s_up_tmpl;
+    size_t n = 0;
+    while (*p && n + 1 < sizeof s_up_page) {
+        const char *q = strstr(p, tok);
+        size_t seg = q ? (size_t)(q - p) : strlen(p);
+        if (seg > sizeof s_up_page - 1 - n) seg = sizeof s_up_page - 1 - n;
+        memcpy(s_up_page + n, p, seg);
+        n += seg;
+        if (!q) break;
+        int w = snprintf(s_up_page + n, sizeof s_up_page - n, "%d", limit);
+        if (w < 0 || (size_t)w >= sizeof s_up_page - n) break;
+        n += (size_t)w;
+        p = q + sizeof tok - 1;
+    }
+    s_up_page[n] = 0;
+}
 
 /* 未开启共享时的 403 页（极简：说明状态 + 语言提示） */
 static const char s_page_off[] =
@@ -845,7 +969,7 @@ const char *web_page(int *len)
 {
     int m = web_mode();
     const char *p = m == WEB_MODE_DOWNLOAD ? s_page_dl
-                  : m == WEB_MODE_UPLOAD   ? s_page_up
+                  : m == WEB_MODE_UPLOAD   ? s_up_page
                   : s_page_off;
     if (len) *len = (int)strlen(p);
     return p;

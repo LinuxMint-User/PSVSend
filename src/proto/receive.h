@@ -87,7 +87,8 @@ enum {
     RECV_ROOT_ACT_NONE = 0,
     RECV_ROOT_ACT_MERGE = 1,     /* 目录合并（目标不存在时等价整体改名） */
     RECV_ROOT_ACT_RENAME = 2,    /* 顶层改名（所有路径跟着换新根） */
-    RECV_ROOT_ACT_SKIP = 3       /* 跳过整个顶层 */
+    RECV_ROOT_ACT_SKIP = 3,      /* 跳过整个顶层 */
+    RECV_ROOT_ACT_OVERWRITE = 4  /* 顶层平铺文件覆盖同名旧文件 */
 };
 enum {
     RECV_ROOT_CF_NONE = 0,

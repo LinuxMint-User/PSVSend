@@ -96,7 +96,7 @@ static void render_choose(void)
     w_row(r0, tr("Share selected files"), sub, web_sel == 0);
     w_add(WID_WEB_MODE0, r0);
     w_row(r1, tr("Receive in browser"),
-          tr("Send files from a browser to PS Vita"), web_sel == 1);
+          tr("Send files or folders from a browser to PS Vita"), web_sel == 1);
     w_add(WID_WEB_MODE1, r1);
 
     /* 触摸用户的启动入口（纯按键走确认键） */

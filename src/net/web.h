@@ -2,7 +2,8 @@
  *
  * 两种互斥模式（同一时刻 `/` 只服务一种）：
  *   WEB_MODE_DOWNLOAD  PSV → 浏览器：分享本次已选的 ≤64 个文件（不做目录浏览）
- *   WEB_MODE_UPLOAD    浏览器 → PSV：走 LocalSend 既有的 prepare-upload / upload
+ *   WEB_MODE_UPLOAD    浏览器 → PSV：走 LocalSend 既有的 prepare-upload / upload；
+ *                      可逐文件选，也可整文件夹上传（相对路径随 fileName 还原）
  *                      通道，PSV 侧照旧弹接收确认页（写盘闸门不变）
  *
  * 鉴权：4 位 PIN（每次进共享页生成，不落 config，退出即失效）；同一 IP 错 3 次
@@ -17,7 +18,7 @@
 #include <stdint.h>
 #include <psp2/types.h>
 
-#define WEB_MAX_FILES 64        /* 分享清单上限（与 UI 的 MAX_PICKED 同口径） */
+#define WEB_MAX_FILES 64        /* 下载分享清单上限（与 UI 的 MAX_PICKED 同口径）；上传走接收侧 2048 */
 #define WEB_MAX_SESS  4         /* 并发下载会话上限（多台设备各一条） */
 #define WEB_MAX_CLIENTS 4       /* 运行页"连接来源"最多列出的浏览器数（同 IP 只留一条） */
 #define WEB_PIN_LEN   4
