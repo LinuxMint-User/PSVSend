@@ -63,6 +63,7 @@ add_executable(${PROJECT_NAME}
     src/net/scan.c
     src/net/web.c
     src/proto/receive.c
+    src/proto/recv_path.c
     src/proto/transfer.c
     src/ui/ui_main.c
     src/ui/pages.c
