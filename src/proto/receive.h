@@ -19,10 +19,63 @@
 #include <stdint.h>
 #include <psp2/types.h>
 #include "net/http.h"      /* HttpRecvOps / http_stream_fn（注册给 http 层的处理集） */
+#include "proto/recv_path.h" /* RP_REL_MAX：相对路径窗口行缓冲 */
 
-#define RECV_MAX_FILES 64       /* 单次接收会话文件数上限（超出的在确认页明示丢弃） */
+/* 后端硬上限（单次接收会话；超出的在确认页明示丢弃）。
+ * RECV_MAX_FILES 是旧的全量快照/UI 窗口行数，仅用于 M1~M3 的兼容包装；
+ * M4 切到 summary/window 后下线。 */
+#define RECV_FILES_MAX 2048
+#define RECV_MAX_FILES 64
 
-/* UI：待确认请求快照（recv_pending_pull 锁内拷贝） */
+/* ---- M1 新契约：summary + 窗口 ----
+ * 后端按实际文件数动态分配，UI 不再整份拷贝；确认页/进度页只读 summary，
+ * 列表按 [base, base+max) 拉窗口。行内 name 是相对路径（可能含 '/'）。 */
+typedef struct {
+    char peer_alias[64];
+    char peer_type[24];
+    char peer_ip[16];
+    char peer_fp[65];
+    int  count;                  /* 解析出的可用条目数（含 path_ok=false 的） */
+    int  selected;               /* 勾选且路径预算可用的文件数 */
+    int  overflow;               /* 超过 RECV_FILES_MAX 被丢弃的个数 */
+    int  skipped;                /* 非法路径/目录条目/路径超预算等跳过数 */
+    int  trunc;                  /* 名字被缩短过的条目数 */
+    SceOff total;                /* 全部条目的期望字节数 */
+    SceOff selected_size;        /* 勾选且可收文件的期望字节数 */
+} RecvPendingSummary;
+
+typedef struct {
+    char name[RP_REL_MAX + 1];   /* 规整后的相对路径（落盘口径） */
+    SceOff size;
+    bool trunc;                  /* 名字过长被缩短过 */
+    bool selected;               /* 当前勾选状态 */
+    bool ok;                     /* 路径预算可用；false = 接受时会被跳过 */
+} RecvPendingRow;
+
+typedef struct {
+    int  state;                  /* RecvStateId */
+    char peer_alias[64];
+    int  count;                  /* 实际参与的文件数 */
+    int  cur;                    /* 正在收的文件下标（-1=无） */
+    int  done;                   /* st==1 的文件数 */
+    int  failed;                 /* st==3 的文件数 */
+    int  skipped;                /* 接受时跳过（非法/超预算/冲突）的文件数 */
+    SceOff total;
+    SceOff got_total;
+    uint64_t start_us;
+    char err[192];
+} RecvStatusSummary;
+
+typedef struct {
+    char name[RP_REL_MAX + 1];   /* 相对路径 */
+    SceOff size;
+    SceOff got;
+    unsigned char st;            /* 0=未完成 1=完成 3=失败 */
+} RecvStatusRow;
+
+/* ---- 旧全量快照（M1~M3 编译兼容；M4 下线） ---- */
+/* UI：待确认请求快照（recv_pending_pull 锁内拷贝；count 可大于 RECV_MAX_FILES，
+ * files 只填前 RECV_MAX_FILES 行） */
 typedef struct {
     char peer_alias[64];
     char peer_type[24];
@@ -67,8 +120,25 @@ typedef struct {
 /* 后端初始化（建锁 + 清扫上次中断残留的 *.psvsend.tmp）；api_start 调用 */
 void recv_init(void);
 
+/* ---- M1 新契约（M4 UI 切到这里；旧全量 pull 届时下线） ---- */
+/* 待决定请求的汇总；返回 1=有（out 可 NULL 仅探测） */
+int recv_pending_summary(RecvPendingSummary *out);
+/* 拷贝 pending 的 [base, base+max) 行；返回实际拷贝行数 */
+int recv_pending_window(int base, int max, RecvPendingRow *out);
+/* 确认页勾选：idx 为全局下标（0..count-1） */
+void recv_pending_toggle(int idx, bool on);
+/* 确认页逐文件改名：只改最后一级文件名（空串=恢复原名） */
+void recv_pending_rename(int idx, const char *name);
+
+/* 会话汇总；返回 1=有会话（含终态） */
+int recv_status_summary(RecvStatusSummary *out);
+/* 拷贝会话的 [base, base+max) 行；返回实际拷贝行数 */
+int recv_status_window(int base, int max, RecvStatusRow *out);
+
+/* ---- 旧全量快照（M1~M3 兼容；M4 下线） ---- */
 /* UI 轮询：有"等待决定"的接收请求？返回 1 并拷贝 out（out==NULL 时仅探测
- * 不拷贝，用 1/0 回答"有没有"）；0=无（含已消失/已超时） */
+ * 不拷贝，用 1/0 回答"有没有"）；0=无（含已消失/已超时）。
+ * 只填前 RECV_MAX_FILES 行；count 可能大于它。 */
 int recv_pending_pull(RecvPending *out);
 
 /* 上一份待确认请求是否因"发送方放弃"而消失（一次性：取走即清零）。
@@ -76,13 +146,10 @@ int recv_pending_pull(RecvPending *out);
  * 不会、也无法调 /cancel——那时 sessionId 还没生成。 */
 int recv_pending_peer_gone_take(void);
 
-/* UI 在决定前同步"本次勾选接收的文件"（下标与 pending 的 files 一致；
- * 未勾选的会在接受后被后端标记跳过、不出现在 prepare 响应里）。 */
+/* 兼容包装：同步前 RECV_MAX_FILES 行的勾选（其余行保持默认选中）。 */
 void recv_set_include(const bool inc[RECV_MAX_FILES]);
 
-/* UI 在接受前逐文件指定"保存名"（idx 与 pending.files 下标一致）：非空 =
- * 以此名落盘（后端会再 sanitize + 冲突排重），空串 = 保持对方原名。
- * 仅 PENDING 生效；不改名的文件不必调用。 */
+/* 兼容包装：等价 recv_pending_rename（idx 为全局下标）。 */
 void recv_set_name(int idx, const char *name);
 
 /* 名字 → 可落盘的单级文件名：按 ux0: 合法性净化 + 超长时"保后缀、截主名"，
@@ -134,7 +201,7 @@ int recv_link_error_take(void);
 /* 取消"连接中"的扫码链接（已出现的待决定/活动会话不归它管，走 recv_decide/abort） */
 void recv_link_cancel(void);
 
-/* UI 轮询会话状态；返回 1=有会话（含终态）0=空闲 */
+/* 兼容包装：只填前 RECV_MAX_FILES 行；返回 1=有会话（含终态）0=空闲 */
 int recv_status_pull(RecvStatus *out);
 
 /* 接收会话结束展示完毕，清场回空闲 */

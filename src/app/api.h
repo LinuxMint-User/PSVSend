@@ -69,7 +69,15 @@ void api_send_info(XferInfo *out);
  * 接收数据类型（RecvPending/RecvStatus/RECV_ST_ 枚举/RECV_MAX_FILES）随本契约
  * 暴露，UI 不再直接 include proto/receive.h。以下均为薄转发。 */
 
-/* 有"等待决定"的接收请求？1=有并拷贝 out（out==NULL 时仅探测） */
+/* M1 新契约：summary + 窗口（M4 UI 切到这些；旧全量 pull 届时下线） */
+int  api_recv_pending_summary(RecvPendingSummary *out);
+int  api_recv_pending_window(int base, int max, RecvPendingRow *out);
+void api_recv_pending_toggle(int idx, bool on);
+void api_recv_pending_rename(int idx, const char *name);
+int  api_recv_status_summary(RecvStatusSummary *out);
+int  api_recv_status_window(int base, int max, RecvStatusRow *out);
+
+/* 兼容包装（M4 下线）：有"等待决定"的接收请求？1=有并拷贝 out */
 int  api_recv_pending_pull(RecvPending *out);
 /* 上一份待确认请求是否因"发送方放弃（断开连接）"而消失；一次性，取走即清零 */
 int  api_recv_peer_gone_take(void);

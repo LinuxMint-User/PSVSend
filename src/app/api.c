@@ -372,6 +372,37 @@ void api_send_info(XferInfo *out)
 }
 
 /* ---- UI 门面：接收（均为薄转发，见 api.h） ---- */
+int api_recv_pending_summary(RecvPendingSummary *out)
+{
+    return recv_pending_summary(out);
+}
+
+int api_recv_pending_window(int base, int max, RecvPendingRow *out)
+{
+    return recv_pending_window(base, max, out);
+}
+
+void api_recv_pending_toggle(int idx, bool on)
+{
+    recv_pending_toggle(idx, on);
+}
+
+void api_recv_pending_rename(int idx, const char *name)
+{
+    recv_pending_rename(idx, name);
+}
+
+int api_recv_status_summary(RecvStatusSummary *out)
+{
+    return recv_status_summary(out);
+}
+
+int api_recv_status_window(int base, int max, RecvStatusRow *out)
+{
+    return recv_status_window(base, max, out);
+}
+
+/* 兼容包装（M4 下线） */
 int api_recv_pending_pull(RecvPending *out)
 {
     return recv_pending_pull(out);
