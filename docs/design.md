@@ -182,11 +182,11 @@ void on_session_done(void);
 4. `session.c` 状态机 + 确认/取消
 5. `http_client.c` 发送 → **官方 LocalSend App 真机对测**
 
-### 4.8 Web 网页端（web share，d208-d260）
+### 4.8 Web 网页端（web share，d208-d261）
 
 官方 LocalSend 的 web share 口径：别人用浏览器打开 PSV 的地址即可下载本次分享的文件，或把文件发到 PSV。定位是**局域网内的临时入口**，不是文件服务器。
 
-- **形态**：单个明文 HTTP 端口（与 LocalSend 同端口，TLS 只服务 LocalSend 客户端），网页（HTML/CSS/JS）编译进固件、不读外部 assets；英文打底，运行时按 `navigator.languages` 选简中 / 繁中 / 日文。两模式互斥：下载模式（分享本次已选文件）与上传模式（浏览器发文件或整个文件夹给 PSV）。上传页的文件与文件夹是两个选择入口、共用底部发送按钮，**可混合追加到同一份清单**（按相对路径 + 大小 + 修改时间去重）；已选项以列表展示（前 8 行 + 更多），支持逐项移除与全部清除，全部成功后自动清空。再次发送前会 `POST cancel` 释放上一次已完成的网页会话，避免下一次 `prepare-upload` 撞 409。
+- **形态**：单个明文 HTTP 端口（与 LocalSend 同端口，TLS 只服务 LocalSend 客户端），网页（HTML/CSS/JS）编译进固件、不读外部 assets；英文打底，运行时按 `navigator.languages` 选简中 / 繁中 / 日文。两模式互斥：下载模式（分享本次已选文件）与上传模式（浏览器发文件或整个文件夹给 PSV）。上传页的文件与文件夹是两个选择入口、共用底部发送按钮，**可混合追加到同一份清单**（按相对路径 + 大小 + 修改时间去重）；已选项以列表展示（前 8 行 + 更多），支持逐项移除与全部清除，全部成功后自动清空。再次发送前会 `POST cancel` 释放上一次已完成的网页会话，避免下一次 `prepare-upload` 撞 409；若 PSV 仍停在上一批的完成页，新请求到达时 `pages_tick` 会先退出旧进度页（不清场）再弹确认页，离开旧进度页也不会误清新 pending。
 - **路由**：`GET /`（单页）、`POST /api/localsend/v2/prepare-download?pin=`、`GET /api/localsend/v2/download?sessionId=&fileId=`、`POST /api/localsend/v2/prepare-upload?pin=`（复用接收链路）、`POST /heartbeat?sessionId=`（204，仅续在线时间、不计数不打日志）。
 - **会话与 PIN**（`net/web.c`，一把互斥锁串行）：`sessionId` 32 hex（`getentropy`），槽位 4、满了淘汰最老；PIN 4 位、每次进页面重新生成、不落 config、停共享即失效；会话绑来源 IP（不符回 403）。同一 IP 错 3 次起 429，**冷却 30 秒后自动清零**（否则输错一次就得回 PSV 停共享）。下载页把 `sessionId` 存 `sessionStorage`、刷新可免 PIN；**上传页不缓存任何凭据，刷新必须重输**。
 - **流式下载**：`sceIoOpen` + 64KiB 块 `conn_write`；`Content-Disposition`（ASCII 回退 + RFC 5987），64 位 `Content-Length`。**单段 Range**（`bytes=a-b` / `a-` / `-N`）回 206 + `Content-Range`，多段与越界按整段 200 回——支持 Range 是为了让 Gopeed 这类下载器走多连接路径（其单连接路径读错只标 `connFailed`，最终仍判"已完成"）。
