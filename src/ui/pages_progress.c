@@ -398,7 +398,11 @@ void page_progress_render(void)
 static void progress_leave(void)
 {
     if (g_app.prog_dir == 1) {
-        api_recv_clear();
+        /* 会话已经不存在（例如网页端开始下一次发送前释放了终态会话）时
+         * 不要再清场：此时可能已经建好下一次的 pending，无条件 clear 会把
+         * 新请求一起清掉，导致对方第二次传输失败。 */
+        RecvStatusSummary rs;
+        if (api_recv_status_summary(&rs) == 1) api_recv_clear();
         return_from_recv();      /* 从哪来回哪去（设备/文件/设置/网页共享） */
         return;
     }

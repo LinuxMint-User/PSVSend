@@ -1285,6 +1285,13 @@ void pages_tick(void)
      * 仍按旧页（设置页/接收设置页）处理，两边状态就指向不同的页了。请求留在
      * pending 里，等键盘关掉后下一帧照常弹。 */
     if (page_ime_busy()) return;
+    /* 旧会话已结束 / 被网页端释放，但用户还停在进度页：若此时已经有新的
+     * 待确认请求，必须先退回接收前页面。否则下面的 PAGE_PROGRESS 分支会把
+     * 新请求挡在门外，用户再按返回时还会顺手把新请求清掉。 */
+    if (g_app.page == PAGE_PROGRESS && api_recv_pending_summary(NULL) == 1) {
+        RecvStatusSummary st;
+        if (api_recv_status_summary(&st) != 1) return_from_recv();
+    }
     if (api_recv_pending_summary(NULL) != 1) {
         /* 请求不在了：若后端报"发送方断开了连接"，确认页要换成"对方已取消"
          * 而不是"已过期"。事件不管在哪页都取走，避免陈旧标志误判下一次超时。 */
