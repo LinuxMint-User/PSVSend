@@ -33,7 +33,7 @@ GET /api/localsend/v2/info，能回 member info 的才算 LocalSend 设备。
   python3 scripts/fake-send.py --port 53317,4567
       扫描/连接多个端口（接收端口被改过时用）
 
-M3 边界用例（prepare 读取/拒绝）：
+M3/M6 边界用例（prepare 读取 / 拒绝 / 路径形态）：
   --count 2048 --size 0 --prepare-only   2048 个文件的清单应被接受（确认页）
   --count 2049 --size 0                  应回 413（文件数超过 2048，整份拒绝）
   --manifest-pad 4300000                 把清单撑到 4.1MB → 应回 413（清单过大）
@@ -41,6 +41,14 @@ M3 边界用例（prepare 读取/拒绝）：
   --prepare-nocl                         清单不带 Content-Length → 走旧兼容路径
   --prepare-chunked                      清单用 chunked → 应回 411
   --prepare-concurrent 3                 同时发 3 份 → 1 份进入等待，其余 409
+
+  --layout tree                          嵌套路径（FakeDir/2026/07/...）→ 应还原目录
+  --layout case                          仅大小写不同的两个顶层 → 应合成一个根
+  --layout bad                           非法 / 越界路径（../、绝对、盘符、空组件等）
+                                         → 应跳过并计数，不落盘
+  --layout long                          单级 250 字节 / 总路径超 512 → 应跳过或截断计数
+  --layout reserved                      顶层带 .psvsend-part / .psvsend.tmp
+                                         → 顶层冲突，只能改名/跳过
 
 前提：PC 与 PSV 同一局域网；PSV 上的 PSVSend 已启动。
 """
@@ -238,6 +246,35 @@ def make_payload(seed, size):
     return bytes(buf)
 
 
+def layout_name(layout, i, stamp):
+    """按 --layout 生成清单里的 fileName（接收侧据此还原相对路径）。"""
+    n = i + 1
+    if layout == "tree":
+        return "FakeDir/2026/07/fake-%d-%d.bin" % (n, stamp)
+    if layout == "case":
+        top = "CaseOnly" if i % 2 == 0 else "caseonly"
+        return "%s/fake-%d-%d.bin" % (top, n, stamp)
+    if layout == "bad":
+        bad = [
+            "../evil-%d.txt" % n,          # 越界
+            "/abs-%d.txt" % n,             # 绝对路径
+            "a/../../b-%d.txt" % n,        # 中间越界
+            "C:\\win-%d.txt" % n,          # 盘符 + 反斜杠
+            "dir/./dot-%d.txt" % n,        # 当前目录组件
+            "",                             # 空名字
+            "a//b-%d.txt" % n,             # 空组件
+        ]
+        return bad[i % len(bad)]
+    if layout == "long":
+        if i % 2 == 0:
+            return ("L" * 250) + "-%d.bin" % n        # 单级 >191 字节
+        return "/".join(["D" * 120] * 5) + "/f-%d.bin" % n   # 相对路径 >512
+    if layout == "reserved":
+        top = "Reserved.psvsend-part" if i % 2 == 0 else "Reserved.psvsend.tmp"
+        return "%s/fake-%d-%d.bin" % (top, n, stamp)
+    return "fake-%d-%d.bin" % (n, stamp)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ip", help="PSV 的 IP；省略则自动扫描本机所在 /24")
@@ -270,6 +307,11 @@ def main():
                     help="同时发 N 份 prepare（期望 1 份进入等待，其余 409）")
     ap.add_argument("--prepare-wait", type=int, default=5,
                     help="并发 prepare 模式的等待秒数（默认 5）")
+    # ---- M6 清单路径形态 ----
+    ap.add_argument("--layout", default="flat",
+                    choices=["flat", "tree", "case", "bad", "long", "reserved"],
+                    help="fileName 形态：flat 平铺（默认）/ tree 嵌套目录 / "
+                         "case 仅大小写不同 / bad 非法路径 / long 超长 / reserved 保留后缀")
     args = ap.parse_args()
 
     # ---- 0. 确定目标 ----
@@ -298,6 +340,7 @@ def main():
 
     # ---- 1. 准备文件与清单 ----
     payloads, metas = [], {}
+    stamp = int(time.time()) % 100000
     for i in range(args.count):
         data = make_payload(i + 1, args.size)
         payloads.append(data)
@@ -309,7 +352,7 @@ def main():
             sha = hashlib.sha256(data).hexdigest()
         metas["f%d" % i] = {
             "id": "f%d" % i,
-            "fileName": "fake-%d-%d.bin" % (i, int(time.time()) % 100000),
+            "fileName": layout_name(args.layout, i, stamp),
             "size": len(data),
             "fileType": "application/octet-stream",
             "sha256": sha,
@@ -317,8 +360,8 @@ def main():
     for i in range(args.count):
         tag = " (BAD SHA)" if (i + 1) in args.bad_sha else \
               (" (SHORT)" if (i + 1) in args.short else "")
-        print("[fake-send]   f%d: %s %d B%s"
-              % (i, metas["f%d" % i]["fileName"], args.size, tag))
+        print("[fake-send]   f%d: [%s] %s %d B%s"
+              % (i, args.layout, metas["f%d" % i]["fileName"], args.size, tag))
 
     doc = {
         "info": {
