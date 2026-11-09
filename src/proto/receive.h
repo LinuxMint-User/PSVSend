@@ -178,6 +178,14 @@ int recv_set_root_name(int idx, const char *name);
 int recv_status_summary(RecvStatusSummary *out);
 /* 拷贝会话的 [base, base+max) 行；返回实际拷贝行数 */
 int recv_status_window(int base, int max, RecvStatusRow *out);
+/* 本次会话是否"单条剪贴板文本且已收完"：是则把**临时**内容路径写入 out 并返回 1
+ * （文本未保存前不落正式名，见 recv_text_save），供进度页自动打开只读预览页。
+ * 其它情况返回 0（不写 out）。 */
+int recv_text_path(char *out, int cap);
+/* 把当前文本消息存盘（重名自动追加 " (k)"）；成功返回 1 并写最终路径。 */
+int recv_text_save(char *out, int cap);
+/* 丢弃未保存的文本（预览页直接返回时调用）。 */
+void recv_text_discard(void);
 
 /* 上一份待确认请求是否因"发送方放弃"而消失（一次性：取走即清零）。
  * 官方发送方在等接受的阶段取消时是 abort 掉 prepare 请求（关连接），

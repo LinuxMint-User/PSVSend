@@ -25,6 +25,7 @@
 #include <psp2/io/dirent.h>
 #include <psp2/io/devctl.h>
 #include <psp2/kernel/cpu.h>
+#include <psp2/rtc.h>
 #include <psp2/kernel/threadmgr/thread.h>
 #include <psp2/kernel/threadmgr/mutex.h>
 #include <psp2/kernel/threadmgr/semaphore.h>
@@ -43,6 +44,9 @@
 /* ≤此大小的文件走单线程直写：每个文件新建 2 条线程 + 3 个信号量 + 192KB 缓冲，
  * 在 2048 个小文件时开销远大于数据本身（实测 16B 文件也要 ~1s/个）。 */
 #define RECV_INLINE_MAX        (256 * 1024)
+/* 剪贴板文本消息的体积上限（也保证它一定走单线程直写路径）：超过就按普通
+ * 文件收，不当作文本消息。256 KB 的"粘贴文字"已远超实际使用。 */
+#define RECV_TEXT_MAX          RECV_INLINE_MAX
 /* 收体中临时文件名后缀见 recv_path.h 的 RP_PART_SUFFIX。曾用 ".part"：落盘
  * 正式名沿用对端原名，对端若发来一个正好叫 "x.part" 的文件，它会被正常保存成
  * 正式文件，而开机清扫按后缀匹配又会把它当残留删掉——永久丢数据。改成一个
@@ -63,6 +67,7 @@ typedef struct {
     SceOff size;                   /* 期望字节数 */
     bool trunc;                    /* 名字过长被缩短过 */
     bool path_ok;                  /* 按当前保存目录算，路径预算内 */
+    bool is_text;                  /* 剪贴板文本消息（官方用随机 UUID.txt 发，见 prepare 解析） */
 } PendFile;
 
 /* 一个已接受的待收文件（按参与文件数动态分配） */
@@ -80,6 +85,7 @@ typedef struct {
     bool busy;                     /* 本文件正在流式收体（同会话多文件可并发，各自独立） */
     bool orphan;                   /* 收体流水线被遗弃：临时文件由槽位接管，cleanup_parts 跳过 */
     bool overwrite;                /* 顶层平铺文件：用户选“覆盖”，落盘时替换同名旧文件 */
+    bool is_text;                  /* 剪贴板文本消息（完成后可查看/复制） */
 } RFile;
 
 /* ---- 收体流水线槽位 ------------------------------------------------
@@ -1307,9 +1313,13 @@ static int disk_free_hot(SceOff *free_size)
 static void cleanup_parts(void)
 {
     int i;
-    for (i = 0; i < g_sess.n; i++)
-        if (g_sess.f[i].st != 1 && !g_sess.f[i].busy && !g_sess.f[i].orphan)
-            sceIoRemove(g_sess.f[i].part);
+    for (i = 0; i < g_sess.n; i++) {
+        RFile *f = &g_sess.f[i];
+        if (f->busy || f->orphan) continue;
+        /* 未完成的一律删；已完成的文本消息也删——它没改名，正式名本来就不存在，
+         * 临时文件活到会话结束（用户没点"保存"就是一次性丢弃）。 */
+        if (f->st != 1 || f->is_text) sceIoRemove(f->part);
+    }
 }
 
 static void rm_stage_roots_locked(void);      /* 见下：finalize 辅助区 */
@@ -2267,6 +2277,7 @@ static int build_session_locked(const char *session_id, int via_web)
         f = &arr[m];
         memset(f, 0, sizeof *f);
         f->overwrite = overwrite && cinner[0] == '\0';
+        f->is_text = g_pend.f[i].is_text;
         snprintf(f->fileid, sizeof f->fileid, "%s", g_pend.f[i].fileid);
         gen_hex(f->token, 16);
         snprintf(f->rel, sizeof f->rel, "%s", cand);
@@ -2354,6 +2365,112 @@ static int drop_stale_session_locked(void)
     return 1;
 }
 
+/* ---- 剪贴板文本消息 ------------------------------------------------
+ * 官方客户端发剪贴板文本时把它包成一个普通文件：fileName 是随机
+ * "<uuid>.txt"，fileType 为 text/*，并且**只有当这一批文件只有这一条文本时**
+ * 才把全文放进该文件的 preview 字段（AddMessageAction 的 FileDto.preview）。
+ * 因此判定用"preview 存在且解码后的字节数 == size"：普通 .txt（哪怕名字恰好
+ * 是 UUID）没有 preview，不会被误认；代价是"文本 + 其它文件混发"时官方不带
+ * preview，只能按普通文件收（内容不丢，只是不改名、不自动预览）。
+ * 命中后不直接落正式文件（与官方一致：文本只留在内存里供预览）：正文照常写进
+ * 临时文件（<clipboard-时间>.txt.psvsend.tmp），收完不改名；用户在预览页点
+ * "保存"才 rename 成正式名，直接返回则跟着会话一起清掉（见 cleanup_parts）。 */
+
+/* 文件名是否官方剪贴板消息的随机 UUID.txt 形态。只用于"要不要改名"：带
+ * preview 的命名 .txt（第三方客户端可能这么发）也当文本消息预览，但保留原名，
+ * 不去覆盖用户看得懂的文件名。 */
+static int is_uuid_txt_name(const char *name)
+{
+    static const int dash_at[4] = { 8, 13, 18, 23 };
+    int i, d = 0;
+
+    if (!name || strlen(name) != 40) return 0;     /* 36 位 uuid + ".txt" */
+    for (i = 0; i < 36; i++) {
+        if (d < 4 && i == dash_at[d]) {
+            if (name[i] != '-') return 0;
+            d++;
+            continue;
+        }
+        if (!((name[i] >= '0' && name[i] <= '9') ||
+              (name[i] >= 'a' && name[i] <= 'f') ||
+              (name[i] >= 'A' && name[i] <= 'F'))) return 0;
+    }
+    return name[36] == '.' &&
+           (name[37] | 0x20) == 't' && (name[38] | 0x20) == 'x' &&
+           (name[39] | 0x20) == 't';
+}
+
+/* preview 字符串解码后的字节数（-1 = 字段不是合法 JSON 字符串）。
+ * 只数长度、不复制内容：剪贴板文本可能很长。转义规则与 json_val_str 一致。 */
+static long long json_str_bytes(const char *v)
+{
+    long long n = 0;
+    int i;
+
+    if (!v || *v != '"') return -1;
+    for (i = 1; v[i]; i++) {
+        unsigned char c = (unsigned char)v[i];
+        if (c == '"') return n;
+        if (c != '\\') { n++; continue; }
+        i++;
+        switch (v[i]) {
+        case '"': case '\\': case '/': case 'b': case 'f':
+        case 'n': case 'r': case 't':
+            n++;
+            break;
+        case 'u': {
+            unsigned cp = 0, lo = 0;
+            int k;
+
+            for (k = 1; k <= 4; k++) {
+                unsigned char h = (unsigned char)v[i + k];
+                cp <<= 4;
+                if (h >= '0' && h <= '9') cp |= h - '0';
+                else if (h >= 'a' && h <= 'f') cp |= h - 'a' + 10;
+                else if (h >= 'A' && h <= 'F') cp |= h - 'A' + 10;
+                else return -1;
+            }
+            i += 4;
+            if (cp >= 0xD800 && cp <= 0xDBFF) {
+                /* 代理对（emoji 等）：后面必须紧跟 \uDC00-\uDFFF，UTF-8 占 4 字节 */
+                if (v[i + 1] != '\\' || v[i + 2] != 'u') return -1;
+                for (k = 1; k <= 4; k++) {
+                    unsigned char h = (unsigned char)v[i + 2 + k];
+                    lo <<= 4;
+                    if (h >= '0' && h <= '9') lo |= h - '0';
+                    else if (h >= 'a' && h <= 'f') lo |= h - 'a' + 10;
+                    else if (h >= 'A' && h <= 'F') lo |= h - 'A' + 10;
+                    else return -1;
+                }
+                if (lo < 0xDC00 || lo > 0xDFFF) return -1;
+                i += 6;
+                n += 4;
+            } else if (cp < 0x80) n += 1;
+            else if (cp < 0x800) n += 2;
+            else n += 3;              /* 含孤立低代理，仅用于长度比对 */
+            break;
+        }
+        default:
+            return -1;                /* 非法转义 */
+        }
+    }
+    return -1;                        /* 未闭合 */
+}
+
+/* 文本消息的落盘名：clipboard-YYYYMMDD-HHMMSS.txt。同一批里多条文本会重名，
+ * 交给会话内的同名去重追加 " (k)"。取不到系统时间时退回 clipboard.txt。 */
+static void text_msg_name(char *out, int cap)
+{
+    SceDateTime t;
+
+    if (sceRtcGetCurrentClockLocalTime(&t) == 0 && t.year >= 2000 &&
+        t.month >= 1 && t.month <= 12 && t.day >= 1 && t.day <= 31)
+        snprintf(out, cap, "clipboard-%04d%02d%02d-%02d%02d%02d.txt",
+                 t.year, t.month, t.day, t.hour, t.minute, t.second);
+    else
+        snprintf(out, cap, "clipboard.txt");
+}
+
 /* prepare-upload：解析 → 挂起等 UI（≤60s）→ 回 HTTP 码并填 resp（200 时 JSON） */
 static int recv_http_prepare(const char *body, const char *ip, const char *peer_fp,
                              const HttpPeer *peer, int via_web, int no_cl,
@@ -2362,7 +2479,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
     const char *infov, *filesv, *p;
     JsonIter it;
     char alias[64];
-    long long sz;
+    long long sz, pvlen;
     int n = 0, code = 200, r;
     unsigned my_gen = 0;                     /* 本次占位的序号（见 g_gen） */
     bool pend_accept;
@@ -2419,8 +2536,9 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
 
     if (json_iter_first(filesv, &it)) {
         do {
-            char raw[RP_REL_MAX + 2], rel[RP_REL_MAX + 1], sh[65];
+            char raw[RP_REL_MAX + 2], rel[RP_REL_MAX + 1], sh[65], ft[40];
             bool cut = false;
+            int is_text = 0;
             size_t rl;
 
             raw[0] = rel[0] = sh[0] = 0;
@@ -2444,6 +2562,22 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
             if (rp_parse_relpath(raw, rel, sizeof rel, NULL, &cut) != RP_OK) {
                 g_pend.skipped++;
                 continue;
+            }
+            /* 剪贴板文本强判定：preview 的解码字节数必须等于 size（见上方说明）。 */
+            ft[0] = 0;
+            p = json_get_val(it.val, "fileType");
+            if (p) json_val_str(p, ft, sizeof ft);
+            pvlen = (strncmp(ft, "text/", 5) == 0)
+                        ? json_str_bytes(json_get_val(it.val, "preview")) : -1;
+            is_text = pvlen > 0 && pvlen == sz && sz <= RECV_TEXT_MAX;
+            if (strncmp(ft, "text/", 5) == 0)
+                dlog("recv: text entry %s name=%s preview=%lld size=%lld text=%d",
+                     ft, rel, pvlen, sz, is_text);
+            if (is_text && is_uuid_txt_name(rel)) {
+                char tn[64];
+                text_msg_name(tn, sizeof tn);
+                snprintf(rel, sizeof rel, "%s", tn);
+                cut = false;
             }
             p = json_get_val(it.val, "sha256");
             if (p && json_val_str(p, sh, sizeof sh) && strlen(sh) != 64)
@@ -2470,6 +2604,7 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
             snprintf(g_pend.f[n].sha256, sizeof g_pend.f[n].sha256, "%s", sh);
             g_pend.f[n].rname[0] = 0;
             g_pend.f[n].path_ok = false;
+            g_pend.f[n].is_text = is_text != 0;
             pend_inc_set(n, true);
             n++;
         } while (json_iter_next(&it));
@@ -2979,7 +3114,8 @@ static int upload_inline(RFile *f, SceUID fd, http_stream_fn fn, void *ctx,
         unlock();
         return 422;
     }
-    if (!direct && commit_file_rename(f) < 0) {
+    /* 剪贴板文本先留在临时文件里，等用户在预览页点"保存"才改正式名。 */
+    if (!direct && !f->is_text && commit_file_rename(f) < 0) {
         lock();
         file_fail_locked(f, "文件落盘失败");
         clear_pending_finish_locked();
@@ -3074,7 +3210,7 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
      * 大批量小文件例外：直写最终名并在 open_direct_bulk 里判冲突，省掉每个
      * 文件一次 ~1s 的 rename（ux0 大目录的主要瓶颈）。 */
     direct = g_sess.bulk && f->size >= 0 && f->size <= RECV_INLINE_MAX &&
-             !f->overwrite && !strchr(f->rel, '/');
+             !f->overwrite && !f->is_text && !strchr(f->rel, '/');
     if (!direct && !resolve_disk_conflict_locked(f)) {
         file_fail_locked(f, "无法分配文件名");
         unlock();
@@ -3920,6 +4056,73 @@ static void status_idle_check_locked(void)
         now - g_sess.last_us > (uint64_t)RECV_IDLE_TIMEOUT_US) {
         sess_terminal(RECV_ST_TIMEOUT, "等待对方传输超时");
     }
+}
+
+int recv_text_path(char *out, int cap)
+{
+    int r = 0;
+
+    lock();
+    if (g_phase == PH_ACTIVE && g_sess.f && g_sess.n == 1 &&
+        g_sess.f[0].is_text && g_sess.f[0].st == 1) {
+        /* 文本消息还没"保存"：内容在临时文件里（见 cleanup_parts 的说明） */
+        if (out && cap > 0) snprintf(out, cap, "%s", g_sess.f[0].part);
+        r = 1;
+    }
+    unlock();
+    return r;
+}
+
+/* 把当前文本消息存盘：临时文件 rename 成正式名（重名自动追加 " (k)"）。
+ * 返回 1 成功（out 写最终路径），0=不可保存/失败。 */
+int recv_text_save(char *out, int cap)
+{
+    char cand[RP_PATH_MAX + 1], base[RP_COMP_MAX + 1];
+    int r = 0, k;
+    const char *dot, *slash;
+    int stem;
+
+    if (out && cap > 0) out[0] = 0;
+    lock();
+    if (g_phase != PH_ACTIVE || !g_sess.f || g_sess.n != 1 ||
+        !g_sess.f[0].is_text || g_sess.f[0].st != 1 || g_sess.f[0].busy) {
+        unlock();
+        return 0;
+    }
+    /* 正式名去重：clipboard-….txt → clipboard-….txt (k)。prefix 部分原样保留，
+     * 只在 ".txt" 前插序号，保证扩展名不被截断。 */
+    slash = strrchr(g_sess.f[0].final, '/');
+    snprintf(base, sizeof base, "%s", slash ? slash + 1 : g_sess.f[0].final);
+    dot = strrchr(base, '.');
+    stem = dot ? (int)(dot - base) : (int)strlen(base);
+    for (k = 0; k < 100; k++) {
+        SceIoStat st;
+
+        if (k == 0)
+            snprintf(cand, sizeof cand, "%s", g_sess.f[0].final);
+        else
+            snprintf(cand, sizeof cand, "%s/%.*s (k%d)%s", g_dir,
+                     stem, base, k, dot ? dot : "");
+        if (sceIoGetstat(cand, &st) >= 0) continue;     /* 已存在：换下一个 */
+        if (sceIoRename(g_sess.f[0].part, cand) != 0) continue;
+        snprintf(g_sess.f[0].final, sizeof g_sess.f[0].final, "%s", cand);
+        if (out && cap > 0) snprintf(out, cap, "%s", cand);
+        r = 1;
+        break;
+    }
+    if (r) dlog("recv: text saved -> %s", out ? out : g_sess.f[0].final);
+    unlock();
+    return r;
+}
+
+/* 丢弃未保存的文本（预览页返回时调用）。已保存的不会再删。 */
+void recv_text_discard(void)
+{
+    lock();
+    if (g_phase == PH_ACTIVE && g_sess.f && g_sess.n == 1 && g_sess.f[0].is_text &&
+        g_sess.f[0].st == 1 && !g_sess.f[0].busy)
+        sceIoRemove(g_sess.f[0].part);
+    unlock();
 }
 
 int recv_status_summary(RecvStatusSummary *out)

@@ -85,6 +85,12 @@ int  api_recv_set_root_action(int idx, int action, const char *new_name);
 int  api_recv_set_root_name(int idx, const char *name);
 int  api_recv_status_summary(RecvStatusSummary *out);
 int  api_recv_status_window(int base, int max, RecvStatusRow *out);
+/* 本次会话是"单条剪贴板文本且已收完"时，返回 1 并写入**临时**内容路径（自动预览用） */
+int  api_recv_text_path(char *out, int cap);
+/* 把当前文本消息存盘（重名自动追加 " (k)"）；成功返回 1 并写最终路径 */
+int  api_recv_text_save(char *out, int cap);
+/* 丢弃未保存的文本（用户直接返回预览页时调用） */
+void api_recv_text_discard(void);
 
 /* 上一份待确认请求是否因"发送方放弃（断开连接）"而消失；一次性，取走即清零 */
 int  api_recv_peer_gone_take(void);

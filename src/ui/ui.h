@@ -132,6 +132,7 @@ typedef enum {
     PAGE_CAM_BENCH,    /* 摄像头基准：后摄采集 + QR 解码性能实测（实验室子页） */
     PAGE_SCAN,         /* 扫码取景：按住 R 识别屏幕上的分享二维码（主页 L / 页头按钮进入） */
     PAGE_WEB,          /* 网页共享：浏览器经 http://IP:端口 下载/上传（官方 web share） */
+    PAGE_TEXT_VIEW,    /* 剪贴板文本消息只读预览（接收完成后自动进入） */
     PAGE_COUNT
 } PageId;
 
@@ -270,6 +271,10 @@ void page_scan_render(void);
 void page_scan_input(const Input *in);
 void page_web_render(void);
 void page_web_input(const Input *in);
+/* 剪贴板文本查看（PAGE_TEXT_VIEW）：打开时读入 path 的内容并排版 */
+void page_text_open(const char *path);
+void page_text_render(void);
+void page_text_input(const Input *in);
 
 /* ---------- 系统键盘（IME）改名事务（pages.c + app/ime.c） ---------- */
 bool page_ime_busy(void);   /* 改名事务进行中：主循环应跳过页面按键/触摸 */

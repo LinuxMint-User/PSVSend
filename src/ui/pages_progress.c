@@ -29,6 +29,9 @@ static ScrollGlide xf_glide;      /* 进度页文件列表触摸惯性 */
 static RecvStatusRow prog_win[MAX_INF];
 static int prog_win_base = 0, prog_win_n = 0;
 static bool prog_finalizing = false;   /* 最终化中：显示"正在整理…"且禁止取消 */
+/* 剪贴板文本消息：接收完成后自动打开预览页。用会话的 start_us 做"每个会话
+ * 只自动开一次"的标记——从预览页返回后会话仍是 DONE，不能反复弹。 */
+static uint64_t txt_auto_us = 0;
 
 /* ---- 速度读数：2s 滑动窗口 ----
  * 旧算法是"累计平均"：分子 = 已传字节，分母 = 从点击发送（或会话建立）起的
@@ -195,6 +198,14 @@ void page_progress_render(void)
             fail_state = rs.state == RECV_ST_FAIL ||
                          rs.state == RECV_ST_TIMEOUT;
             partial = rs.state == RECV_ST_PARTIAL; /* 部分成功：警示色 + N failed */
+            /* 单条剪贴板文本收完 → 自动打开预览页（每个会话只开一次） */
+            if (rs.state == RECV_ST_DONE && rs.start_us != txt_auto_us) {
+                char tp[512];
+                if (api_recv_text_path(tp, sizeof tp) == 1) {
+                    txt_auto_us = rs.start_us;
+                    page_text_open(tp);
+                }
+            }
             if (fail_state) {
                 msg = rs.err[0] ? rs.err : tr("Receive failed");
                 msg_col = theme->danger;

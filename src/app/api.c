@@ -466,6 +466,21 @@ int api_recv_status_summary(RecvStatusSummary *out)
     return recv_status_summary(out);
 }
 
+int api_recv_text_path(char *out, int cap)
+{
+    return recv_text_path(out, cap);
+}
+
+int api_recv_text_save(char *out, int cap)
+{
+    return recv_text_save(out, cap);
+}
+
+void api_recv_text_discard(void)
+{
+    recv_text_discard();
+}
+
 int api_recv_status_window(int base, int max, RecvStatusRow *out)
 {
     return recv_status_window(base, max, out);
