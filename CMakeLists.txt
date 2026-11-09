@@ -74,6 +74,7 @@ add_executable(${PROJECT_NAME}
     src/ui/pages_verify.c
     src/ui/pages_lab.c
     src/ui/pages_web.c
+    src/ui/pages_text.c
     src/ui/widgets.c
     src/ui/hintbar.c
     src/ui/input.c
@@ -119,6 +120,7 @@ add_custom_command(OUTPUT ${_vpk}
           -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKsc-Regular.otf=fonts/NotoSansCJKsc-Regular.otf
           -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKtc-Regular.otf=fonts/NotoSansCJKtc-Regular.otf
           -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKjp-Regular.otf=fonts/NotoSansCJKjp-Regular.otf
+          -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoEmoji-PSV.ttf=fonts/NotoEmoji-PSV.ttf
           -a ${CMAKE_CURRENT_SOURCE_DIR}/fonts/verify/icons-48.png=fonts/verify/icons-48.png
           ${_vpk}
   DEPENDS ${_elf}
@@ -130,6 +132,7 @@ add_custom_command(OUTPUT ${_vpk}
           ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKsc-Regular.otf
           ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKtc-Regular.otf
           ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoSansCJKjp-Regular.otf
+          ${CMAKE_CURRENT_SOURCE_DIR}/fonts/NotoEmoji-PSV.ttf
           ${CMAKE_CURRENT_SOURCE_DIR}/fonts/verify/icons-48.png
   COMMENT "Building vpk ${PROJECT_NAME}"
   VERBATIM

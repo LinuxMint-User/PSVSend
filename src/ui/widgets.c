@@ -60,20 +60,58 @@ static const char *utf8_next_cp(const char *p, uint32_t *cp)
     return p + 1;
 }
 
-/* 字体域判定：ASCII / Latin-1 与通用标点（U+2000-206F，含省略号 U+2026、
- * 弯引号 U+201C/201D、破折号 U+2014 等）走拉丁字体；其余（CJK 汉字、全角
- * 符号、假名…）走 CJK 字体。这类通用标点只放在拉丁字库里（早期按"码点
- * >0xFF 一律 CJK"路由，把省略号等发给了不带这些字形的 CJK 字库 → 中文文案
- * 渲染成方框，故单列此段）。 */
+/* emoji：libvita2d 的文字解码（utf8_to_ucs2）只认 1~3 字节，4 字节码位会被
+ * 拆成 4 个单字节、各画一个缺字方框。绕过办法是绘制前把 emoji 码位换到 BMP
+ * 私用区：U+1F000..U+1FAFF → U+E000..U+EAFF（PUA = 0xE000 + cp - 0x1F000）。
+ * 字体是 scripts/gen-emoji-font.py 由 Noto Emoji 重新映射生成的
+ * app0:/fonts/NotoEmoji-PSV.ttf，cmap 里只有这批 PUA。中文文本真用到 BMP
+ * 私用区的概率极低；真撞上也只是路由到 emoji 字体、最多显示成方框。 */
+#define EMOJI_CP_MIN   0x1F000
+#define EMOJI_CP_MAX   0x1FAFF
+#define EMOJI_PUA_BASE 0xE000
+#define EMOJI_PUA_MAX  (EMOJI_PUA_BASE + (EMOJI_CP_MAX - EMOJI_CP_MIN))
+
+/* 字体域：0=拉丁 1=CJK 2=emoji（与 ui_main.c 的字体槽一一对应）。 */
 static int cp_domain(uint32_t cp)
 {
+    if (cp >= EMOJI_PUA_BASE && cp <= EMOJI_PUA_MAX) return 2;
     if (cp <= 0xFF) return 0;
     if (cp >= 0x2000 && cp <= 0x206F) return 0;
     return 1;
 }
 
+/* 把待绘制字符串转成 libvita2d 能画的形式：4 字节 emoji 换成 3 字节 PUA。
+ * 其余字节原样拷贝（含非法/截断序列，保持 utf8_next_cp 的兜底行为）。输出
+ * 只会变短；cap 不够时就此截断。返回输出字节数。 */
+static int utf8_to_drawable(const char *in, char *out, int cap)
+{
+    const char *p = in;
+    int n = 0;
+
+    while (*p) {
+        uint32_t cp;
+        const char *nx = utf8_next_cp(p, &cp);
+        int len = (int)(nx - p);
+
+        if (cp >= EMOJI_CP_MIN && cp <= EMOJI_CP_MAX) {
+            cp = EMOJI_PUA_BASE + (cp - EMOJI_CP_MIN);
+            if (n + 3 >= cap) break;
+            out[n++] = (char)(0xE0 | (cp >> 12));
+            out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[n++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            if (n + len >= cap) break;
+            memcpy(out + n, p, (size_t)len);
+            n += len;
+        }
+        p = nx;
+    }
+    out[n] = 0;
+    return n;
+}
+
 /* 对 p 指向的字符串做逐字符字体路由：每段是连续同字体域子串，
- * cjk_out 返回该段字体域（1=CJK、0=拉丁；实际字体对象在绘制时按
+ * cjk_out 返回该段字体域（0=拉丁 1=CJK 2=emoji；实际字体对象在绘制时按
  * 当前字号经 font_get 取得）。返回段长度（字节）。 */
 static int next_run(const char *p, int *cjk_out)
 {
@@ -92,16 +130,18 @@ static int next_run(const char *p, int *cjk_out)
 
 void w_text(float x, float y, float scale, uint32_t color, const char *fmt, ...)
 {
-    char buf[512], seg[512];
+    char buf[512], enc[512], seg[512];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     if (!*buf) return;
+    utf8_to_drawable(buf, enc, sizeof enc);   /* emoji → PUA，见上方说明 */
+    if (!*enc) return;
     int size = w_font_px(scale);
     int base_y = (int)(y + FONT_ASC * size + 0.5f);
     int pen = (int)(x + 0.5f);
-    const char *p = buf;
+    const char *p = enc;
     while (*p) {
         int cjk;
         int n = next_run(p, &cjk);
@@ -117,6 +157,7 @@ void w_text(float x, float y, float scale, uint32_t color, const char *fmt, ...)
 
 void w_text_w(float scale, const char *text, int *w, int *h)
 {
+    char enc[1024];
     if (w) *w = 0;
     if (h) *h = 0;
     if (!text || !*text) return;
@@ -124,6 +165,12 @@ void w_text_w(float scale, const char *text, int *w, int *h)
     char seg[512];
     int pen = 0;
     const char *p = text;
+    /* emoji → PUA 后再量宽（否则 4 字节会被当成 4 个极宽的缺字）。超长文本
+     * （>enc，路径/名字的实际上限 512 字节，正常到不了）原样量，宁可贵一点。 */
+    if (strlen(text) < sizeof enc) {
+        utf8_to_drawable(text, enc, sizeof enc);
+        p = enc;
+    }
     while (*p) {
         int cjk;
         int n = next_run(p, &cjk);

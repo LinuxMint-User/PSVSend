@@ -38,7 +38,7 @@ extern const int config_recv_limit_tiers[RECV_FILES_LIMIT_TIERS];
  * 装完直接看"关于"就能核对刷入的是不是对新固件，不必翻日志。
  * 只用于显示/标识——不要拼进 PSVSEND_APP_VERSION：app/update.c 会解析远端
  * config.h 里的该宏做版本比较，混入构建号会让比较失准。 */
-#define PSVSEND_BUILD_TAG "d268"
+#define PSVSEND_BUILD_TAG "d275"
 
 typedef struct {
     char alias[64];          /* 设备名，广播给其他 LocalSend 设备 */

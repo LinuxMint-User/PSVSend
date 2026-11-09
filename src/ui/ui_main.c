@@ -31,12 +31,16 @@ extern void pages_init(void);
 #define FONT_SC_FILE    FONT_PATHS_BASE "NotoSansCJKsc-Regular.otf"
 #define FONT_TC_FILE    FONT_PATHS_BASE "NotoSansCJKtc-Regular.otf"
 #define FONT_JP_FILE    FONT_PATHS_BASE "NotoSansCJKjp-Regular.otf"
+/* emoji 字体（scripts/gen-emoji-font.py 由 Noto Emoji 重映射生成：cmap 里只有
+ * U+E000..U+EAFF 这批 PUA，对应原 U+1F000..U+1FAFF，见 ui/widgets.c 说明） */
+#define FONT_EMOJI_FILE FONT_PATHS_BASE "NotoEmoji-PSV.ttf"
 #define MAX_FONT_SIZES 24
 static struct {
     int size;
     int cjk_slot;      /* 本项 cjk 字体建自哪个地区槽（见 cjk_slot_current） */
     vita2d_font *lat;
     vita2d_font *cjk;
+    vita2d_font *emoji;  /* 只为部分字号预载（见 font_preload_all），其余为 NULL */
 } g_fs[MAX_FONT_SIZES];
 static int g_fs_n;
 static int g_font_lang = -1;   /* g_fs 的 cjk 字体是按哪个界面语言建的 */
@@ -56,15 +60,15 @@ static int g_font_lang = -1;   /* g_fs 的 cjk 字体是按哪个界面语言建
  * 日 jp）。各份都含全部 CJK 字形，差别只在"同一码位默认取哪个地区的字形"
  * （骨/道/直/繁…），故按当前界面语言只加载其中一份，换语言时才读另一份
  * （见 font_reload_cjk）。 */
-static void *g_font_ram[4];        /* 0=拉丁 1=CJK简 2=CJK繁 3=CJK日 */
-static int   g_font_ram_len[4];
+static void *g_font_ram[5];        /* 0=拉丁 1=CJK简 2=CJK繁 3=CJK日 4=emoji */
+static int   g_font_ram_len[5];
 
 /* 每槽读盘状态（g_font_ram[slot] 非 NULL ⇔ READY）。
  * 进设置页会起后台线程预读"另外两份" CJK，而主线程在页内切语言时可能同时要
  * 读同一份（切到槽序靠后的那份、线程还在读靠前的那份）。故用 CAS 抢读盘权：
  * 同一槽同时只有一个执行体在读——各读一遍会白占 16MB，且其中一份永远泄漏。 */
 enum { FRAM_EMPTY = 0, FRAM_LOADING, FRAM_READY };
-static volatile int g_fram[4];
+static volatile int g_fram[5];
 static SceUID g_font_thid = -1;    /* 设置页后台预读线程（-1 = 没在跑） */
 static volatile int g_font_stop;   /* 要求预读线程尽快退出（见 font_read 块间检查） */
 
@@ -74,7 +78,8 @@ static const char *font_path(int slot)
     case 0:  return FONT_LAT_FILE;
     case 1:  return FONT_SC_FILE;
     case 2:  return FONT_TC_FILE;
-    default: return FONT_JP_FILE;
+    case 3:  return FONT_JP_FILE;
+    default: return FONT_EMOJI_FILE;
     }
 }
 
@@ -184,26 +189,31 @@ static int g_in_frame;
 static int g_font_warned;      /* 缺档/表满告警已打印次数（防 dlog 刷屏） */
 
 /* 已建槽中与 size 最接近的字体（无槽则 NULL）。用于"帧内不许建槽/表满"时的
- * 降级：字号略有出入，但不会崩、也不丢字。 */
+ * 降级：字号略有出入，但不会崩、也不丢字。
+ * emoji（cjk=2）只考虑已预载 emoji 对象的档，其余字号用它就近缩放。 */
 static vita2d_font *font_nearest(int size, int cjk)
 {
     int i, best = -1, bd = 0;
     for (i = 0; i < g_fs_n; i++) {
         int d = g_fs[i].size > size ? g_fs[i].size - size : size - g_fs[i].size;
+        if (cjk == 2 && !g_fs[i].emoji) continue;
         if (best < 0 || d < bd) { best = i; bd = d; }
     }
     if (best < 0) return NULL;
+    if (cjk == 2) return g_fs[best].emoji;
     return cjk ? g_fs[best].cjk : g_fs[best].lat;
 }
 
-/* 返回 size 像素字号的字体：cjk=0 拉丁、1 CJK（地区随当前界面语言）；加载
- * 失败返回 NULL。
+/* 返回 size 像素字号的字体：cjk=0 拉丁、1 CJK（地区随当前界面语言）、
+ * 2 emoji（只取已预载的档，未预载字号就近降级）；加载失败返回 NULL。
  * 注意：新槽一次建齐 lat+cjk 两份，故建槽可能在"要拉丁"的那次调用里发生——
  * CJK 槽必须按当前界面语言算，不能沿用该次调用的 cjk 参数（否则两种字体
  * 会被建成同一份）。 */
 vita2d_font *font_get(int size, int cjk)
 {
     int i;
+    if (cjk == 2)              /* emoji 不建新槽：只在预载过的档里取/就近降级 */
+        return font_nearest(size, 2);
     for (i = 0; i < g_fs_n; i++)
         if (g_fs[i].size == size)
             return cjk ? g_fs[i].cjk : g_fs[i].lat;
@@ -224,6 +234,7 @@ vita2d_font *font_get(int size, int cjk)
         g_fs[g_fs_n].cjk_slot = slot;
         g_fs[g_fs_n].lat      = load_slot(0);
         g_fs[g_fs_n].cjk      = load_slot(slot);
+        g_fs[g_fs_n].emoji    = NULL;   /* 由 font_preload_all 只给部分档补上 */
         if (!g_fs[g_fs_n].lat || !g_fs[g_fs_n].cjk)
             dlog("font load failed size=%d lat=%p cjk=%p", size,
                  (void *)g_fs[g_fs_n].lat, (void *)g_fs[g_fs_n].cjk);
@@ -248,6 +259,12 @@ vita2d_font *font_get(int size, int cjk)
 static const float g_font_scales[] = { UI_FONT_SCALES(SCALE_ENTRY) };
 #define FONT_SCALES_N ((int)(sizeof g_font_scales / sizeof g_font_scales[0]))
 
+/* emoji 字体只为"用户自定文本"可能出现的字号预载：剪贴板预览 1.0、进度/列表
+ * 密集行 1.1、文件名/设备名 1.25（→ 20/22/25px）。每个档一个字体对象（512²
+ * 纹理），全档预载等于拿 ~8MB 显存换装饰性字形；其余字号由 font_nearest 就近
+ * 缩放（emoji 略有模糊可以接受）。 */
+static const float g_emoji_scales[] = { 1.0f, 1.1f, 1.25f };
+
 /* 启动时帧外预加载全部字号档（见 ui_run 的调用点）。
  * 动机：字体对象是懒加载的，若某字号第一次被页面用到才创建，创建动作
  * （vita2d_load_font_mem：freetype 初始化 + 512x512 灰度纹理分配 + 显存
@@ -260,15 +277,25 @@ static const float g_font_scales[] = { UI_FONT_SCALES(SCALE_ENTRY) };
  * 资源，无此风险），故无需也不应全量光栅化字形。 */
 static void font_preload_all(void)
 {
-    int i, ok = 0, sz;
+    int i, j, ok = 0, eok = 0, sz;
     g_font_lang = i18n_lang();
     for (i = 0; i < FONT_SCALES_N; i++) {
         sz = w_font_px(g_font_scales[i]);
         if (font_get(sz, 0)) ok++;   /* latin */
         if (font_get(sz, 1)) ok++;   /* CJK  */
     }
-    dlog("font preload done: %d/%d fonts, sizes %d..%d, lang=%d cjk_slot=%d "
-         "lat=%p cjk=%p", ok, 2 * FONT_SCALES_N,
+    for (i = 0; i < (int)(sizeof g_emoji_scales / sizeof g_emoji_scales[0]); i++) {
+        sz = w_font_px(g_emoji_scales[i]);
+        for (j = 0; j < g_fs_n; j++) {
+            if (g_fs[j].size != sz) continue;
+            if (!g_fs[j].emoji) g_fs[j].emoji = load_slot(4);
+            if (g_fs[j].emoji) eok++;
+            else dlog("font emoji load failed size=%d", sz);
+            break;
+        }
+    }
+    dlog("font preload done: %d/%d fonts + %d emoji, sizes %d..%d, lang=%d "
+         "cjk_slot=%d lat=%p cjk=%p", ok, 2 * FONT_SCALES_N, eok,
          w_font_px(g_font_scales[0]), w_font_px(g_font_scales[FONT_SCALES_N - 1]),
          g_font_lang, cjk_slot_current(), (void *)g_fs[0].lat, (void *)g_fs[0].cjk);
 }
@@ -539,6 +566,7 @@ static void render_page(void)
     case PAGE_CAM_BENCH:     page_cam_bench_render(); break;
     case PAGE_SCAN:          page_scan_render(); break;
     case PAGE_WEB:           page_web_render(); break;
+    case PAGE_TEXT_VIEW:     page_text_render(); break;
     default: break;
     }
 }
@@ -560,6 +588,7 @@ static void input_page(const Input *in)
     case PAGE_CAM_BENCH:     page_cam_bench_input(in); break;
     case PAGE_SCAN:          page_scan_input(in); break;
     case PAGE_WEB:           page_web_input(in); break;
+    case PAGE_TEXT_VIEW:     page_text_input(in); break;
     default: break;
     }
 }
