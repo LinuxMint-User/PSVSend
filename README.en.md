@@ -10,7 +10,7 @@ A [LocalSend](https://localsend.org)-compatible client for the **PS Vita**. It t
 
 > This project is not affiliated with or endorsed by Sony or PlayStation. It requires a jailbroken console (e.g. HENkaku / Ensō) and must be used in compliance with local laws and platform terms. Use at your own risk; intended for lawful personal use only.
 
-> Current version **v2.6.0** (LocalSend protocol v2, compatible with official clients v1.15+). The **About** row at the top of Settings shows the version (including build tag) and compatibility info. Official VPK builds are produced by GitHub Actions and published to [Releases](https://github.com/LinuxMint-User/PSVSend/releases).
+> Current version **v2.7.0** (LocalSend protocol v2, compatible with official clients v1.15+). The **About** row at the top of Settings shows the version (including build tag) and compatibility info. Official VPK builds are produced by GitHub Actions and published to [Releases](https://github.com/LinuxMint-User/PSVSend/releases).
 
 > **Project status**: Core features are complete. The project is in a stable maintenance phase: bug fixes and LocalSend compatibility updates take priority; no new features are actively planned.
 

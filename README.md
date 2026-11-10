@@ -10,7 +10,7 @@
 
 > 本项目与索尼（Sony）及 PlayStation 无任何关联或背书；需在自制系统（如 HENkaku / 变革）上运行，请自行了解并遵守所在地法律法规与平台条款，风险自负，仅建议用于个人合法用途。
 
-> 当前版本 **v2.6.0**（LocalSend 协议 v2，适配官方客户端 v1.15+）；设置页顶部「关于」行可查看版本（含构建号）与适配信息。正式版 VPK 由 GitHub Actions 自动构建并发布到 [Releases](https://github.com/LinuxMint-User/PSVSend/releases)。
+> 当前版本 **v2.7.0**（LocalSend 协议 v2，适配官方客户端 v1.15+）；设置页顶部「关于」行可查看版本（含构建号）与适配信息。正式版 VPK 由 GitHub Actions 自动构建并发布到 [Releases](https://github.com/LinuxMint-User/PSVSend/releases)。
 
 > **项目状态**：核心功能已完成，项目进入稳定维护阶段——后续以修复问题和跟进 LocalSend 兼容性为主，暂不规划新功能。
 
