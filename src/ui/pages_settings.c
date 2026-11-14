@@ -10,6 +10,7 @@
 #include "ui/theme.h"
 #include "core/config.h"
 #include "core/i18n.h"
+#include "app/api.h"
 #include "app/update.h"
 #include "app/ime.h"
 
@@ -944,6 +945,7 @@ static void dpick_save(void)
         config_set_save_dir(g_app.cur_dir);   /* 锁内写入并落盘：接收线程读该目录 */
     } else {
         snprintf(g_app.recv_dir, sizeof g_app.recv_dir, "%s", g_app.cur_dir);
+        api_recv_set_dir(g_app.recv_dir);   /* 立刻重算路径预算（深度/长度） */
     }
     if (dpick_origin == PAGE_SETTINGS) g_app.set_sel = SET_ITEM_SAVEDIR;
     else g_app.inc_sel = 0;         /* 回接收设置页并高亮目录行 */

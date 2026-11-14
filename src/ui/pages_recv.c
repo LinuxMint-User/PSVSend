@@ -200,6 +200,14 @@ void page_recv_confirm_render(void)
         w_text_clip(48, 212, 0.9f, theme->warn, line, lmax);
         warn++;
     }
+    if (rs.skipped > 0) {
+        /* 非法条目 + 当前保存目录下路径过深/超预算：接受时会被跳过，先说清楚 */
+        snprintf(line, sizeof line,
+                 tr("%d file(s) cannot be saved to this folder and will be skipped."),
+                 rs.skipped);
+        w_text_clip(48, 212 + warn * 20, 0.9f, theme->warn, line, lmax);
+        warn++;
+    }
     if (toolong > 0) {
         snprintf(line, sizeof line,
                  tr("%d file name(s) too long, will be shortened"), toolong);

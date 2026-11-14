@@ -436,16 +436,40 @@ static bool sess_zero_add_locked(int fidx, int ridx)
     return true;
 }
 
-/* 预算按 M2 暂存内的 part 实际路径算（比最终路径长），超了跳过并计数。 */
+/* PSV 文件系统（SceIofilemgr/FAT）的绝对路径段数上限：`ux0:` 计 1 段，最多
+ * 11 段，第 12 段起 sceIoMkdir/sceIoOpen 直接失败（d279 真机实测：默认保存
+ * 目录下 level-06 成功、level-07 失败；VitaShell FTP 的 MKD 也在同一边界回
+ * 550）。确认页据此把过深条目标为不可收，避免传到一半才按文件失败。 */
+#define FS_PATH_MAX_COMP 11
+
+/* 绝对路径段数（'/' 与设备名后的 ':' 都算分隔，末尾分隔符不算新段）。
+ * 注意 `ux0:data/...` 与 `ux0:/data/...` 必须得到同一结果。 */
+static int path_components(const char *p)
+{
+    int n = 0;
+    bool in_seg = false;
+    for (; *p; p++) {
+        if (*p == '/' || *p == ':') {
+            in_seg = false;
+        } else if (!in_seg) {
+            n++;
+            in_seg = true;
+        }
+    }
+    return n;
+}
+
 static bool path_budget_ok(const char *rel)
 {
     char top[RP_COMP_MAX + 1];
     char tmp[RP_PATH_MAX + 2];
     const char *inner;
+    bool ok;
 
     split_top_inner(rel, top, sizeof top, &inner);
-    if (!inner[0]) return rp_flat_part_path(g_dir, top, tmp, sizeof tmp);
-    return rp_stage_part_path(g_dir, top, inner, tmp, sizeof tmp);
+    if (!inner[0]) ok = rp_flat_part_path(g_dir, top, tmp, sizeof tmp);
+    else ok = rp_stage_part_path(g_dir, top, inner, tmp, sizeof tmp);
+    return ok && path_components(tmp) <= FS_PATH_MAX_COMP;
 }
 
 static bool rel_replace_last(const char *rel, const char *newname,
@@ -2626,6 +2650,9 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
     g_pend.n = n;
     if (n > g_pend.cfg_limit)                /* 超过设置值：按最小档临时提升 */
         g_pend.eff_limit = files_limit_raise(n);
+    /* 新请求：保存目录回到设置里的默认值再算预算（UI 收到新请求时同样重置
+     * recv_dir；否则会拿上一次会话 accept 时的临时目录判断路径深度） */
+    config_get_save_dir(g_dir, sizeof g_dir);
     pend_recheck_paths_locked();
     g_pend_result = 0;
     g_pend_hold = 0;                         /* 新请求从满窗开始（上一份的暂停状态不得串过来） */
