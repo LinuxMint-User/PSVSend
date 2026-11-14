@@ -18,7 +18,7 @@
 #include <stdint.h>
 #include <psp2/types.h>
 
-#define WEB_MAX_FILES 64        /* 下载分享清单上限（与 UI 的 MAX_PICKED 同口径）；上传走接收侧 2048 */
+#define WEB_MAX_FILES 64        /* 下载分享清单上限（网页页沿用 64，独立于发送侧 MAX_PICKED 512）；上传走接收侧 2048 */
 #define WEB_MAX_SESS  4         /* 并发下载会话上限（多台设备各一条） */
 #define WEB_MAX_CLIENTS 4       /* 运行页"连接来源"最多列出的浏览器数（同 IP 只留一条） */
 #define WEB_PIN_LEN   4
