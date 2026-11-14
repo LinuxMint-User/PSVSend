@@ -10,6 +10,8 @@
  * 列表采用"像素滚动"模型：内容像素偏移 scroll（0=从列表可视区顶开始），
  * 触摸拖动让内容直接跟手（正常滑动页面），方向键移动选中时自动滚到可见。 */
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <vita2d.h>
 #include <psp2/io/dirent.h>
@@ -21,6 +23,7 @@
 #include "core/i18n.h"
 #include "core/config.h"
 #include "core/json_util.h"
+#include "core/dlog.h"
 #include "app/api.h"
 
 static int dev_scroll = 0;         /* 主页设备栏内容像素偏移 */
@@ -43,9 +46,16 @@ static uint64_t dev_hint_us = 0;
 static uint64_t dev_warn_us = 0;    /* 接收请求被拒的红色提示截止时刻 */
 static int      dev_warn_reason = 0;/* HTTP_REJ_*（最近一次） */
 static int sw_focus = 0;           /* 发送等待页焦点：0=取消/完成，1=验证（仅 https 对端） */
+/* 文件夹相关短提示（主页细条 / 目录页右上）；设置函数在文件夹枚举一节 */
+static char     folder_note[96];
+static uint64_t folder_note_us;
+static char     dir_msg[96];
+static uint64_t dir_msg_us;
 
 static void start_send(int dev_idx);
 static void open_files(void);
+static void open_folders(void);
+static void folder_note_set(const char *fmt, ...);
 
 /* ---------- 主页两栏几何 ---------- */
 typedef struct { int x, w; } PaneRect;
@@ -221,6 +231,14 @@ static void dev_strip(void)
         dev_warn_us = 0;
     }
 
+    /* 文件夹枚举结果提示（如"N 个空文件夹已跳过"）：加完文件夹回主页时短时显示 */
+    if (folder_note_us && now < folder_note_us) {
+        tips_reset();
+        w_text_clip(28, STRIP_Y, 0.9f, theme->warn, folder_note, SCR_W - 56);
+        return;
+    }
+    folder_note_us = 0;
+
     if (dev_hint_us && now < dev_hint_us) {
         tips_reset();
         w_text(28, STRIP_Y, 0.9f, theme->warn, "%s", tr("Select files first"));
@@ -362,7 +380,8 @@ static void dev_pane_render(const PaneRect *p, bool focused)
     }
 }
 
-/* 已选文件栏：有文件画清单（行尾 ✕ = 触摸直接删除该项），空则给"选择文件"按钮。
+/* 已选文件栏：有文件画清单（行尾 ✕ = 触摸直接删除该项），空则给两个可聚焦动作
+ * "选择文件" / "发送文件夹"（焦点在 pick_empty_sel，确认键激活当前项）。
  * 焦点落在"行"上（强调行底），确认键=移除该项；选中行的完整路径由页头下的细条
  * 显示，行内被截断的文件名可在那里核对。 */
 static void pick_pane_render(const PaneRect *p, bool focused)
@@ -372,9 +391,15 @@ static void pick_pane_render(const PaneRect *p, bool focused)
     snprintf(title, sizeof title, tr("Selected files (%d)"), count);
     pane_title(p, title, focused);
     if (count <= 0) {
-        Rect b = { p->x + p->w / 2 - 110, PANE_TOP + 130, 220, 48 };
-        w_add(WID_FILES_PICK, b);
-        w_button(b, tr("Select files"), true);
+        int bw = 240, bx = p->x + (p->w - bw) / 2;
+        Rect b1 = { bx, PANE_TOP + 96, bw, 48 };
+        Rect b2 = { bx, PANE_TOP + 96 + 60, bw, 48 };
+        if (g_app.pick_empty_sel < 0 || g_app.pick_empty_sel > 1)
+            g_app.pick_empty_sel = 0;
+        w_add(WID_FILES_PICK, b1);
+        w_button(b1, tr("Select files"), focused && g_app.pick_empty_sel == 0);
+        w_add(WID_FILES_FOLDER, b2);
+        w_button(b2, tr("Send folder"), focused && g_app.pick_empty_sel == 1);
         return;
     }
     if (g_app.picked_sel >= count) g_app.picked_sel = count - 1;
@@ -603,6 +628,11 @@ void page_devices_render(void)
         int cnt = g_app.pane_focus == 0 ? g_app.dev_count : g_app.picked_count;
         int sel = g_app.pane_focus == 0 ? g_app.dev_sel : g_app.picked_sel;
         uint8_t off = HDIR_HORZ;
+        if (g_app.pane_focus == 1 && cnt == 0) {
+            /* 空文件栏是两个动作按钮：上下切换，不要画成"到头了" */
+            cnt = 2;
+            sel = g_app.pick_empty_sel;
+        }
         if (sel <= 0)       off |= HDIR_UP;
         if (sel >= cnt - 1) off |= HDIR_DOWN;
         segs[ns].key = HKEY_DPAD;     segs[ns].dir_off = off;
@@ -616,7 +646,9 @@ void page_devices_render(void)
         segs[ns].dim = g_app.dev_count <= 0;
         segs[ns++].text = tr("Send");
     } else {
-        segs[ns++].text = g_app.picked_count > 0 ? tr("Remove") : tr("Select files");
+        segs[ns++].text = g_app.picked_count > 0 ? tr("Remove")
+                          : (g_app.pick_empty_sel ? tr("Send folder")
+                                                  : tr("Select files"));
     }
     segs[ns].key = HKEY_TRIANGLE;     segs[ns].varies = true;
     /* 三角键语义随焦点栏变化：设备栏=短按扫描网段；文件栏=按住蓄满清空已选
@@ -674,6 +706,8 @@ void page_devices_input(const Input *in)
             g_app.picked_sel = id - WID_PICKS_BASE;
         } else if (id == WID_FILES_PICK) {
             open_files();
+        } else if (id == WID_FILES_FOLDER) {
+            open_folders();
         } else if (id == WID_HDR_SETTINGS) {
             settings_open();
             g_app.page = PAGE_SETTINGS;
@@ -707,6 +741,9 @@ void page_devices_input(const Input *in)
                 g_app.picked_sel++;
             area_keep_visible(&pick_scroll, g_app.picked_count, g_app.picked_sel,
                               PANE_VIEW_H);
+        } else if (g_app.pane_focus == 1) {
+            /* 空文件栏：上下在两个动作按钮间切换 */
+            g_app.pick_empty_sel = in->up ? 0 : 1;
         }
     }
     if (in->confirm) {
@@ -714,8 +751,10 @@ void page_devices_input(const Input *in)
             try_send(g_app.dev_sel);
         else if (g_app.picked_count > 0)
             unpick(g_app.picked_sel);
+        else if (g_app.pick_empty_sel)
+            open_folders();             /* 空文件栏：确认 = 当前焦点动作 */
         else
-            open_files();   /* 文件栏空态：确认 = 进文件选择页 */
+            open_files();
     }
     if (in->square) open_files();     /* 方块键：随时进文件选择页 */
     if (in->alt) {                    /* 三角键短按：设备栏=扫描网段 */
@@ -755,11 +794,15 @@ void files_load(void)
         n = 1;
     }
     while (n < MAX_FILES && sceIoDread(fd, &de) > 0) {
+        bool is_dir = (de.d_stat.st_mode & SCE_S_IFDIR) != 0;
         if (strcmp(de.d_name, ".") == 0 || strcmp(de.d_name, "..") == 0)
+            continue;
+        /* 目录模式（发送文件夹）：只列目录，不列文件 */
+        if (g_app.dir_mode && !is_dir)
             continue;
         strncpy(g_app.files[n].name, de.d_name, sizeof g_app.files[n].name - 1);
         g_app.files[n].name[sizeof g_app.files[n].name - 1] = 0;
-        g_app.files[n].is_dir = (de.d_stat.st_mode & SCE_S_IFDIR) != 0;
+        g_app.files[n].is_dir = is_dir;
         g_app.files[n].size = de.d_stat.st_size;
         n++;
     }
@@ -826,9 +869,12 @@ static void toggle_pick(int idx)
         unpick(k);
         return;
     }
-    if (g_app.picked_count >= MAX_PICKED) return;
-    /* 按 UTF-8 边界截断：256 字节的名字塞进 128 字节的已选栏，若切在半个汉字上，
-     * 这个非法序列会一路带到 prepare 的 JSON 里。 */
+    if (g_app.picked_count >= MAX_PICKED) {
+        folder_note_set(tr("Too many files (max %d)"), MAX_PICKED);
+        return;
+    }
+    /* 按 UTF-8 边界截断：文件系统名最长 255 字节，已选栏按 512 字节装，
+     * 若切在半个汉字上，这个非法序列会一路带到 prepare 的 JSON 里。 */
     str_copy_utf8(g_app.picked[g_app.picked_count].name,
                   (int)sizeof g_app.picked[0].name, g_app.files[idx].name);
     snprintf(g_app.picked[g_app.picked_count].path, sizeof g_app.picked[0].path,
@@ -876,6 +922,7 @@ static void remember_dir(void)
 static void done_files(void)
 {
     remember_dir();
+    g_app.dir_mode = false;
     pane_focus_default();
     g_app.page = PAGE_DEVICES;
 }
@@ -918,18 +965,290 @@ void parent_dir(void)
     g_app.file_sel = files_first_sel();
 }
 
+/* ================= 文件夹枚举（后台线程 + 扫描态） =================
+ * 目标：把当前目录整棵递归成逐文件条目。FAT 深目录的 opendir/readdir 会阻塞
+ * 几十~几百 ms，不能放 UI 线程；枚举在独立线程跑，结果写进静态区，UI 在
+ * pages_tick 里看到终态后归并（folder_scan_tick）。
+ *
+ * 路径口径与接收侧 recv_path.h 一致：相对路径 ≤511 字节、单级 ≤191 字节、
+ * 深度 ≤16（含顶层目录）。超出的条目跳过（对端也存不下这种路径）。 */
+#define FSCAN_COMP_MAX  191
+#define FSCAN_DEPTH_MAX 16
+enum {
+    FSCAN_IDLE = 0,     /* 空闲（无结果） */
+    FSCAN_RUNNING,      /* 线程枚举中 */
+    FSCAN_DONE,         /* 有结果，待归并 */
+    FSCAN_EMPTY,        /* 整个文件夹为空 */
+    FSCAN_TOO_MANY      /* 文件数超过 MAX_PICKED，整批拒绝 */
+};
+
+static struct {
+    volatile int state;
+    volatile int cancel;
+    int  n;                     /* 已收集文件数 */
+    int  empty_dirs;            /* 空目录数（跳过） */
+    int  skipped;               /* 因名字/路径/深度超限被跳过的文件数 */
+    char root[512];             /* 被扫描的绝对目录 */
+    char top[192];              /* 顶层目录名（相对路径第一级） */
+    PickedFile ent[MAX_PICKED];
+} s_fs;
+
+static void folder_note_set(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(folder_note, sizeof folder_note, fmt, ap);
+    va_end(ap);
+    folder_note_us = (uint64_t)sceKernelGetSystemTimeWide() + 6000000ull;
+}
+
+static void dir_msg_set(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(dir_msg, sizeof dir_msg, fmt, ap);
+    va_end(ap);
+    dir_msg_us = (uint64_t)sceKernelGetSystemTimeWide() + 5000000ull;
+}
+
+static void folder_scan_cancel(void)
+{
+    if (s_fs.state == FSCAN_RUNNING) s_fs.cancel = 1;
+}
+
+static bool folder_scan_running(void)
+{
+    return s_fs.state == FSCAN_RUNNING;
+}
+
+/* 丢弃未消费的旧结果（进入目录页时调用；线程运行中不动） */
+static void folder_scan_reset(void)
+{
+    if (s_fs.state != FSCAN_RUNNING) s_fs.state = FSCAN_IDLE;
+}
+
+static int fs_add(const char *abs, const char *rel, SceOff size)
+{
+    if (s_fs.n >= MAX_PICKED) return -1;      /* 超限：交给调用方整批拒绝 */
+    snprintf(s_fs.ent[s_fs.n].name, sizeof s_fs.ent[s_fs.n].name, "%s", rel);
+    snprintf(s_fs.ent[s_fs.n].path, sizeof s_fs.ent[s_fs.n].path, "%s", abs);
+    s_fs.ent[s_fs.n].size = size;
+    s_fs.n++;
+    return 0;
+}
+
+/* 深度优先枚举。depth = rel 的当前层数（顶层目录 = 1）。
+ * 返回 0=正常，1=超过文件上限（中止），2=已取消。 */
+static int fs_walk(const char *abs, const char *rel, int depth)
+{
+    SceUID fd = sceIoDopen(abs);
+    SceIoDirent de;
+    int children = 0, r = 0;
+
+    if (fd < 0) return 0;                 /* 打不开的目录跳过，不算失败 */
+    memset(&de, 0, sizeof de);
+    while (sceIoDread(fd, &de) > 0) {
+        char cabs[512], crel[512];
+        bool is_dir;
+        int n;
+
+        if (s_fs.cancel) { r = 2; break; }
+        if (strcmp(de.d_name, ".") == 0 || strcmp(de.d_name, "..") == 0)
+            continue;
+        children++;
+        is_dir = (de.d_stat.st_mode & SCE_S_IFDIR) != 0;
+        /* 单级超长：跳过（文件计数提示，目录只跳过本身，不猜里面有多少文件） */
+        if (strlen(de.d_name) > FSCAN_COMP_MAX) {
+            if (!is_dir) s_fs.skipped++;
+            continue;
+        }
+
+        n = snprintf(cabs, sizeof cabs, "%s%s%s", abs,
+                     (abs[0] && abs[strlen(abs) - 1] == '/') ? "" : "/",
+                     de.d_name);
+        if (n < 0 || n >= (int)sizeof cabs) {
+            if (!is_dir) s_fs.skipped++;
+            continue;
+        }
+
+        if (is_dir) {
+            if (depth + 1 > FSCAN_DEPTH_MAX) continue;
+            n = snprintf(crel, sizeof crel, "%s/%s", rel, de.d_name);
+            if (n < 0 || n >= (int)sizeof crel) continue;
+            r = fs_walk(cabs, crel, depth + 1);
+        } else {
+            if (depth + 1 > FSCAN_DEPTH_MAX) { s_fs.skipped++; continue; }
+            n = snprintf(crel, sizeof crel, "%s/%s", rel, de.d_name);
+            if (n < 0 || n >= (int)sizeof crel) { s_fs.skipped++; continue; }
+            if (fs_add(cabs, crel, de.d_stat.st_size) != 0) { r = 1; break; }
+        }
+        if (r) break;
+    }
+    sceIoDclose(fd);
+    if (r) return r;
+    if (children == 0 && depth > 1) s_fs.empty_dirs++;   /* 空目录：跳过并计数 */
+    return 0;
+}
+
+static int fs_thr(SceSize args, void *argp)
+{
+    int r;
+    (void)args; (void)argp;
+    __sync_synchronize();
+    r = fs_walk(s_fs.root, s_fs.top, 1);
+    __sync_synchronize();
+    if (s_fs.cancel)            s_fs.state = FSCAN_IDLE;   /* 用户取消：结果作废 */
+    else if (r == 1)            s_fs.state = FSCAN_TOO_MANY;
+    else if (s_fs.n == 0)       s_fs.state = FSCAN_EMPTY;
+    else                        s_fs.state = FSCAN_DONE;
+    sceKernelExitDeleteThread(0);
+    return 0;
+}
+
+/* 开始扫描 dir（绝对路径）。0=已启动，<0=拒绝（正在扫 / 参数非法 / 线程起不来）。 */
+static int folder_scan_start(const char *dir)
+{
+    size_t len, base;
+    SceUID th;
+
+    if (!dir || !dir[0] || s_fs.state == FSCAN_RUNNING) return -1;
+    s_fs.n = 0;
+    s_fs.empty_dirs = 0;
+    s_fs.skipped = 0;
+    s_fs.cancel = 0;
+    snprintf(s_fs.root, sizeof s_fs.root, "%s", dir);
+    /* 顶层目录名 = 路径最后一级 */
+    len = strlen(dir);
+    while (len > 1 && dir[len - 1] == '/') len--;
+    base = len;
+    while (base > 0 && dir[base - 1] != '/') base--;
+    if (base >= len) return -1;            /* 根目录没有名字：不扫 */
+    if (len - base > FSCAN_COMP_MAX) return -1;   /* 顶层名超长：对端存不下 */
+    snprintf(s_fs.top, sizeof s_fs.top, "%.*s", (int)(len - base), dir + base);
+
+    th = sceKernelCreateThread("psvsend_fscan", fs_thr, 0x40, 0x20000, 0,
+                               0, NULL);
+    if (th < 0) {
+        dlog("fs: thread create fail 0x%08X", (unsigned)th);
+        return -1;
+    }
+    s_fs.state = FSCAN_RUNNING;
+    if (sceKernelStartThread(th, 0, NULL) < 0) {
+        sceKernelDeleteThread(th);
+        s_fs.state = FSCAN_IDLE;
+        return -1;
+    }
+    return 0;
+}
+
+/* 扫描终态 → 归并到已选清单并回主页；空/超限留在目录页提示。
+ * 由 pages_tick 每帧调用（页面切换不放在 render 里，避免同帧输入打到新页）。 */
+void folder_scan_tick(void)
+{
+    int st = s_fs.state;
+    int i, dup = 0;
+
+    if (st != FSCAN_DONE && st != FSCAN_EMPTY && st != FSCAN_TOO_MANY) return;
+    if (g_app.page != PAGE_FILES || !g_app.dir_mode) return;  /* 结果先留着 */
+
+    if (st == FSCAN_EMPTY) {
+        s_fs.state = FSCAN_IDLE;
+        dir_msg_set("%s", tr("Folder is empty"));
+        return;
+    }
+    if (st == FSCAN_TOO_MANY) {
+        s_fs.state = FSCAN_IDLE;
+        dir_msg_set(tr("Too many files (max %d)"), MAX_PICKED);
+        return;
+    }
+    /* FSCAN_DONE：按绝对路径去重后整批归并；净新增超限则整批拒绝，不截断 */
+    for (i = 0; i < s_fs.n; i++)
+        if (find_picked(s_fs.ent[i].path) >= 0) dup++;
+    if (g_app.picked_count + (s_fs.n - dup) > MAX_PICKED) {
+        s_fs.state = FSCAN_IDLE;
+        dir_msg_set(tr("Too many files (max %d)"), MAX_PICKED);
+        return;
+    }
+    for (i = 0; i < s_fs.n; i++) {
+        if (find_picked(s_fs.ent[i].path) >= 0) continue;
+        g_app.picked[g_app.picked_count] = s_fs.ent[i];
+        g_app.picked_total += s_fs.ent[i].size;
+        g_app.picked_count++;
+    }
+    /* 有文件因名字/路径/深度超限被跳过时优先提示（用户最可能没察觉少文件） */
+    if (s_fs.skipped > 0)
+        folder_note_set(tr("%d file(s) skipped (name too long)"), s_fs.skipped);
+    else if (s_fs.empty_dirs > 0)
+        folder_note_set(tr("%d empty folder(s) skipped"), s_fs.empty_dirs);
+    s_fs.state = FSCAN_IDLE;
+    g_app.dir_mode = false;
+    done_files();                    /* 回主页，焦点按有无文件落到设备栏 */
+}
+
+/* 目录模式下确认发送当前目录（根目录不可发：没有可用的顶层名） */
+static void send_current_folder(void)
+{
+    if (strlen(g_app.cur_dir) <= 5) return;
+    if (folder_scan_start(g_app.cur_dir) != 0)
+        dir_msg_set("%s", tr("Cannot read folder"));
+}
+
+/* 光标停在哪一级就发哪一级：停在子目录行 → 发那个子目录；停在 ".."（或列表
+ * 为空）→ 发当前目录。这样在 ux0:/ 根下不用先进入子目录，选中按 □ 就能发。 */
+static bool cursor_is_subdir(void)
+{
+    int s = g_app.file_sel;
+    return s >= 0 && s < g_app.file_count && g_app.files[s].is_dir &&
+           strcmp(g_app.files[s].name, "..") != 0;
+}
+
+static void send_folder_at_cursor(void)
+{
+    char path[512];
+    if (cursor_is_subdir()) {
+        join_path(g_app.files[g_app.file_sel].name, path, sizeof path);
+        if (folder_scan_start(path) != 0)
+            dir_msg_set("%s", tr("Cannot read folder"));
+    } else {
+        send_current_folder();
+    }
+}
+
 void page_files_render(void)
 {
     int count = g_app.file_count;
-    w_page_header(tr("Select files"));
-    w_text_lead(28, 56, 1.0f, theme->text_dim, g_app.cur_dir, SCR_W - 260);
-    {   /* 右端显示已选总数：跨目录挑文件时也能看到累计 */
+    bool dm = g_app.dir_mode;
+    uint64_t now = (uint64_t)sceKernelGetSystemTimeWide();
+
+    /* 目录模式 + 后台枚举中：整页只留扫描态与取消（FAT 深目录不能卡 UI） */
+    if (dm && folder_scan_running()) {
+        HintSeg segs[2] = { 0 };
+        Rect b = { SCR_W - 216, SCR_H - 42, 192, 36 };
+        w_page_header(tr("Select folder"));
+        w_text_lead(28, 56, 1.0f, theme->text_dim, s_fs.root, SCR_W - 56);
+        w_text(40, 150, 1.2f, theme->text, "%s", tr("Scanning folder..."));
+        segs[0].key = HKEY_BACK;
+        segs[0].text = tr("Cancel");
+        w_page_footer_segs(segs, 1);
+        w_add(WID_FILES_CANCEL_DIR, b);
+        w_button(b, tr("Cancel"), true);
+        return;
+    }
+
+    w_page_header(tr(dm ? "Select folder" : "Select files"));
+    w_text_lead(28, 56, 1.0f, theme->text_dim, g_app.cur_dir,
+                SCR_W - (dm ? 360 : 260));
+    if (!dm) {   /* 右端显示已选总数：跨目录挑文件时也能看到累计 */
         char cnt[48];
         int cw = 0, ch = 0;
         snprintf(cnt, sizeof cnt, tr("%d selected"), g_app.picked_count);
         w_text_w(1.0f, cnt, &cw, &ch);
         w_text(SCR_W - 28 - cw, 56, 1.0f,
                g_app.picked_count > 0 ? theme->text : theme->text_dim, "%s", cnt);
+    } else if (dir_msg_us && now < dir_msg_us) {
+        w_text_right(SCR_W - 28, 56, 1.0f, theme->warn, "%s", dir_msg);
+    } else {
+        dir_msg_us = 0;
     }
     file_scroll = glide_step(&file_glide, file_scroll, list_max_scroll(count));
     if (count > 0) {
@@ -963,39 +1282,80 @@ void page_files_render(void)
     if (count == 0)
         w_text(28, LIST_TOP + 8, 1.1f, theme->text_dim, "%s",
                tr("(empty folder)"));
-    HintSeg segs[6] = { 0 };
-    int ns = 0;
-    /* 只声明本页用到的键，顺序由 hintbar 排。空目录里没有可选项：
-     * 选择/打开/全选都灰掉。首行的 ".." 是我们插的上级入口、不是内容，
-     * 不能拿它把空目录撑成"非空"（否则只剩 ".." 时全选提示不灰）。 */
-    int entries = count;
-    if (entries > 0 && strcmp(g_app.files[0].name, "..") == 0) entries--;
-    bool has = entries > 0;
-    /* 上下选文件：选到首/末行时把方向键对应臂画灰 */
-    uint8_t off = HDIR_HORZ;
-    if (g_app.file_sel <= 0)         off |= HDIR_UP;
-    if (g_app.file_sel >= count - 1) off |= HDIR_DOWN;
-    segs[ns].key = HKEY_DPAD;         segs[ns].dim = !has;
-    segs[ns].dir_off = off;           segs[ns++].text = tr("Choose");
-    segs[ns].key = HKEY_CONFIRM;      segs[ns].dim = !has;
-    segs[ns++].text = tr("Open/Pick");
-    /* ✗ = 回上层目录；到根目录时退回设备页，只是文案换词 */
-    segs[ns].key = HKEY_BACK;
-    segs[ns++].text = strlen(g_app.cur_dir) <= 5 ? tr("Back") : tr("Up");
-    segs[ns].key = HKEY_SQUARE;       segs[ns++].text = tr("Done");
-    segs[ns].key = HKEY_TRIANGLE;     segs[ns].dim = !has;
-    segs[ns].varies = true;           /* 全选↔取消全选：随状态变 → 靠右 */
-    segs[ns++].text = all_files_picked() ? tr("Deselect all") : tr("Select all");
-    w_page_footer_segs(segs, ns);
-    /* 右下角"完成"触摸按钮（与方块键同义）：保留已选回主页 */
-    Rect done = { SCR_W - 216, SCR_H - 42, 192, 36 };
-    w_add(WID_FILES_DONE, done);
-    w_button(done, tr("Done"), true);
+    {
+        HintSeg segs[6] = { 0 };
+        int ns = 0;
+        /* 只声明本页用到的键，顺序由 hintbar 排。空目录里没有可选项：
+         * 选择/打开/全选都灰掉。首行的 ".." 是我们插的上级入口、不是内容，
+         * 不能拿它把空目录撑成"非空"（否则只剩 ".." 时全选提示不灰）。 */
+        int entries = count;
+        bool has;
+        uint8_t off;
+        if (entries > 0 && strcmp(g_app.files[0].name, "..") == 0) entries--;
+        has = entries > 0;
+        /* 上下选文件：选到首/末行时把方向键对应臂画灰 */
+        off = HDIR_HORZ;
+        if (g_app.file_sel <= 0)         off |= HDIR_UP;
+        if (g_app.file_sel >= count - 1) off |= HDIR_DOWN;
+
+        if (dm) {
+            /* 目录模式：面板只列目录；□ = 发送光标所在目录（子目录行=该子目录，
+             * ".."=当前目录）。根目录自身没有顶层名，不可发。 */
+            bool root = strlen(g_app.cur_dir) <= 5;
+            bool can_send = cursor_is_subdir() || !root;
+            Rect send = { SCR_W - 216, SCR_H - 42, 192, 36 };
+            Rect cancel = { send.x - 12 - 120, SCR_H - 42, 120, 36 };
+            segs[ns].key = HKEY_DPAD;     segs[ns].dim = count <= 0;
+            segs[ns].dir_off = off;       segs[ns++].text = tr("Choose");
+            segs[ns].key = HKEY_CONFIRM;  segs[ns].dim = !has;
+            segs[ns++].text = tr("Open/Pick");
+            segs[ns].key = HKEY_BACK;     segs[ns++].text = root ? tr("Back") : tr("Up");
+            segs[ns].key = HKEY_SQUARE;   segs[ns].dim = !can_send;
+            segs[ns++].text = tr("Send folder");
+            w_page_footer_segs(segs, ns);
+            w_add(WID_FILES_SEND_DIR, send);
+            w_add(WID_FILES_CANCEL_DIR, cancel);
+            w_button(send, tr("Send this folder"), !root);
+            w_button(cancel, tr("Cancel"), true);
+            return;
+        }
+
+        segs[ns].key = HKEY_DPAD;         segs[ns].dim = !has;
+        segs[ns].dir_off = off;           segs[ns++].text = tr("Choose");
+        segs[ns].key = HKEY_CONFIRM;      segs[ns].dim = !has;
+        segs[ns++].text = tr("Open/Pick");
+        /* ✗ = 回上层目录；到根目录时退回设备页，只是文案换词 */
+        segs[ns].key = HKEY_BACK;
+        segs[ns++].text = strlen(g_app.cur_dir) <= 5 ? tr("Back") : tr("Up");
+        segs[ns].key = HKEY_SQUARE;       segs[ns++].text = tr("Done");
+        segs[ns].key = HKEY_TRIANGLE;     segs[ns].dim = !has;
+        segs[ns].varies = true;           /* 全选↔取消全选：随状态变 → 靠右 */
+        segs[ns++].text = all_files_picked() ? tr("Deselect all") : tr("Select all");
+        w_page_footer_segs(segs, ns);
+        /* 右下角"完成"触摸按钮（与方块键同义）：保留已选回主页 */
+        {
+            Rect done = { SCR_W - 216, SCR_H - 42, 192, 36 };
+            w_add(WID_FILES_DONE, done);
+            w_button(done, tr("Done"), true);
+        }
+    }
 }
 
 void page_files_input(const Input *in)
 {
     int count = g_app.file_count;
+    bool dm = g_app.dir_mode;
+
+    /* 目录模式 + 枚举中：只响应取消（✗ / 右下按钮）；线程下个目录项就会看到标志 */
+    if (dm && folder_scan_running()) {
+        if (in->tap) {
+            if (w_hit(in->tap_x, in->tap_y) == WID_FILES_CANCEL_DIR)
+                folder_scan_cancel();
+        } else if (in->back) {
+            folder_scan_cancel();
+        }
+        return;
+    }
     if (count > 0 && (in->drag_start || in->dragging)) {
         glide_stop(&file_glide);
         list_drag(in, count, &file_scroll, &file_press_scroll, &g_app.file_sel);
@@ -1008,11 +1368,15 @@ void page_files_input(const Input *in)
     glide_stop(&file_glide);
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
-        if (id == WID_FILES_DONE) {
+        if (id == WID_FILES_CANCEL_DIR) {
+            done_files();                 /* 目录模式：取消（不发送） */
+        } else if (id == WID_FILES_SEND_DIR) {
+            send_current_folder();
+        } else if (id == WID_FILES_DONE) {
             done_files();
         } else if (id >= 0 && id < count) {
             if (g_app.files[id].is_dir) enter_dir(g_app.files[id].name);
-            else {
+            else if (!dm) {
                 g_app.file_sel = id;
                 toggle_pick(id);
             }
@@ -1031,8 +1395,13 @@ void page_files_input(const Input *in)
         int s = g_app.file_sel;
         if (s >= 0 && s < count) {
             if (g_app.files[s].is_dir) enter_dir(g_app.files[s].name);
-            else toggle_pick(s);
+            else if (!dm) toggle_pick(s);
         }
+    }
+    if (dm) {
+        if (in->square) send_folder_at_cursor();
+        if (in->back) parent_dir();
+        return;
     }
     if (in->square) done_files();            /* 方块键：完成，回主页 */
     if (in->alt) toggle_select_all();        /* 三角键：本目录全选/取消全选 */
@@ -1043,6 +1412,23 @@ void page_files_input(const Input *in)
 /* 进文件选择页：从上次目录开始（首次 ux0:/），已选清单保留（可跨目录追加） */
 static void open_files(void)
 {
+    g_app.dir_mode = false;
+    strncpy(g_app.cur_dir, pick_dir, sizeof g_app.cur_dir - 1);
+    g_app.cur_dir[sizeof g_app.cur_dir - 1] = 0;
+    file_scroll = 0;
+    glide_reset(&file_glide);
+    files_load();
+    g_app.file_sel = files_first_sel();
+    g_app.page = PAGE_FILES;
+}
+
+/* 进"发送文件夹"页：同一张浏览页的目录模式（只列目录），从上次目录开始 */
+static void open_folders(void)
+{
+    if (folder_scan_running()) return;
+    folder_scan_reset();              /* 丢弃上一轮未消费的结果 */
+    dir_msg_us = 0;
+    g_app.dir_mode = true;
     strncpy(g_app.cur_dir, pick_dir, sizeof g_app.cur_dir - 1);
     g_app.cur_dir[sizeof g_app.cur_dir - 1] = 0;
     file_scroll = 0;
@@ -1057,19 +1443,24 @@ static void open_files(void)
  * 留窗口（这正是把发送挪到主页设备栏的意义）。 */
 static void start_send(int dev_idx)
 {
-    XferFile ff[XFER_MAX_FILES];
-    int i, n = 0;
+    XferFile *ff;
+    int i, n = 0, rc;
     if (g_app.picked_count <= 0) return;
     if (dev_idx < 0 || dev_idx >= g_app.dev_count || !g_app.dev_ip[dev_idx][0])
         return;                   /* 设备刚好离线：不发，留在主页 */
+    /* 512 条 × ~1KB 不能放 UI 线程栈（默认栈只有 256KB），堆上一次分配 */
+    ff = (XferFile *)malloc(sizeof(XferFile) * (size_t)g_app.picked_count);
+    if (!ff) return;
     for (i = 0; i < g_app.picked_count && n < XFER_MAX_FILES; i++) {
         snprintf(ff[n].name, sizeof ff[n].name, "%s", g_app.picked[i].name);
         snprintf(ff[n].path, sizeof ff[n].path, "%s", g_app.picked[i].path);
         ff[n].size = g_app.picked[i].size;
         n++;
     }
-    if (api_send_start(g_app.dev_ip[dev_idx], g_app.dev_port[dev_idx],
-                       g_app.dev_proto[dev_idx], g_app.dev_fp[dev_idx], ff, n) != 0) {
+    rc = api_send_start(g_app.dev_ip[dev_idx], g_app.dev_port[dev_idx],
+                        g_app.dev_proto[dev_idx], g_app.dev_fp[dev_idx], ff, n);
+    free(ff);
+    if (rc != 0) {
         /* 启动被拒（上一次传输还在收尾）：留在本页，不要切等待页——等待页读的是
          * xfer 的共享快照，那还是上一批的状态，看着会像"这次发失败了"。 */
         return;
@@ -1085,7 +1476,6 @@ static void start_send(int dev_idx)
     g_app.prog_ms = 0;
     g_app.prog_running = true;
     g_app.prog_start = sceKernelGetSystemTimeWide();
-    xf_count = n;
     sw_focus = 0;                  /* 焦点默认落在"取消/完成"上，验证是次要动作 */
     g_app.page = PAGE_SEND_WAIT;   /* 先进等待页；对端接受后由 pages_tick 切进度页 */
 }
@@ -1154,7 +1544,7 @@ void page_send_wait_render(void)
         double frac = 1.0;
         Rect bar;
         if (cur < xv.count) {
-            SceOff cs = xv.f[cur].size;
+            SceOff cs = xv.hash_cur_size;
             frac = cs > 0 ? (double)xv.hash_cur_done / (double)cs : 1.0;
             if (frac > 1.0) frac = 1.0;
         }

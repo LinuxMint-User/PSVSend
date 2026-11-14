@@ -67,6 +67,8 @@ void api_send_set_pin(const char *pin);
 void api_send_pin_cancel(void);
 /* 锁内拷贝当前发送快照（每帧可调；线程结束后保留最后一次状态） */
 void api_send_info(XferInfo *out);
+/* 锁内拷贝发送文件行 [base, base+max)，返回实际行数（窗口之外返回 0） */
+int  api_send_window(int base, int max, XferRow *out);
 
 /* ---- UI 门面：接收（proto/receive.c） ----
  * 接收数据类型（RecvPendingSummary/RecvStatusSummary/窗口行/RECV_ST_ 枚举）随本契约

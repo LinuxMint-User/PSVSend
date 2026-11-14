@@ -25,9 +25,11 @@
 
 static int xf_press_scroll = 0;
 static ScrollGlide xf_glide;      /* 进度页文件列表触摸惯性 */
-/* 接收路径的 64 行窗口（每帧重拉：got/状态都在变）。发送路径仍用 xf_* 数组。 */
+/* 接收路径的 64 行窗口（每帧重拉：got/状态都在变）；发送路径同理。 */
 static RecvStatusRow prog_win[MAX_INF];
 static int prog_win_base = 0, prog_win_n = 0;
+static XferRow prog_send_win[MAX_INF];       /* 发送路径：64 行窗口（512 文件也不整份拷） */
+static int prog_send_base = 0, prog_send_n = 0;
 static bool prog_finalizing = false;   /* 最终化中：显示"正在整理…"且禁止取消 */
 /* 剪贴板文本消息：接收完成后自动打开预览页。用会话的 start_us 做"每个会话
  * 只自动开一次"的标记——从预览页返回后会话仍是 DONE，不能反复弹。 */
@@ -112,8 +114,6 @@ void goto_devices(void)
 void page_progress_render(void)
 {
     int i;
-    SceOff done[MAX_PICKED];
-    bool rfail[MAX_PICKED] = { false };  /* 每行是否失败（发送路径：逐文件独立成败） */
     SceOff sent_bytes = 0;               /* 真实已传字节（速度用，不从百分比反推） */
     int fin = 0, nfail = 0, nskip = 0, active = -1;
     bool fail_state = false, partial = false;
@@ -123,23 +123,25 @@ void page_progress_render(void)
     uint32_t msg_col = theme->text_dim;
 
     if (g_app.prog_dir == 0) {
-        /* 发送路径（真实）：从 xfer 模块拷快照映射到行显示数组 */
+        /* 发送路径（真实）：summary 每帧取一次，文件行按 64 行窗口每帧重拉
+         * （512 文件时整份快照约 276KB/帧，不能每帧拷贝）。 */
+        int total, maxb, want;
         api_send_info(&xv);
-        xf_count = xv.count > MAX_PICKED ? MAX_PICKED : xv.count;
-        g_app.prog_total = xf_count;
+        total = xv.count;
+        if (total > MAX_PICKED) total = MAX_PICKED;
+        g_app.prog_total = total;
         prog_win_n = 0;
         prog_finalizing = false;
+        maxb = total > MAX_INF ? total - MAX_INF : 0;
+        want = xf_scroll / ROW_STRIDE;
+        if (want > maxb) want = maxb;
+        if (want < 0) want = 0;
+        prog_send_base = want;
+        prog_send_n = api_send_window(want, MAX_INF, prog_send_win);
+        fin = xv.done;                       /* 汇总里已带终态计数 */
+        nfail = xv.failed;
+        active = xv.cur;
         sent_bytes = xv.total_sent;
-        for (i = 0; i < xf_count; i++) {
-            snprintf(xf_name[i], sizeof xf_name[0], "%s",
-                     xv.f[i].name[0] ? xv.f[i].name : "?");
-            xf_size[i] = xv.f[i].size;
-            done[i] = xv.f[i].sent < xv.f[i].size ? xv.f[i].sent : xv.f[i].size;
-            rfail[i] = xv.f[i].state == 3;   /* 这个文件独立失败（被拒收 / HTTP 错） */
-            if (rfail[i]) nfail++;
-            else if (xv.f[i].state == 2) fin++;
-            if (xv.f[i].state == 1 && active < 0) active = i;
-        }
         if (xv.active)
             g_app.prog_ms = (int)((sceKernelGetSystemTimeWide() - xv.start_us) / 1000);
         /* sha256 预扫阶段不在这里展示：pages_tick 只在真正开始上传（cur>=0）后
@@ -283,10 +285,13 @@ void page_progress_render(void)
         bool is_fail;
         if (top >= XF_BOTTOM) break;
         if (g_app.prog_dir == 0) {
-            name = xf_name[i];
-            rsize = xf_size[i];
-            rgot = done[i];
-            is_fail = rfail[i];               /* 该文件独立失败 → 标红 */
+            int k = i - prog_send_base;
+            if (k < 0 || k >= prog_send_n) continue;  /* 窗口未覆盖（滚动瞬时） */
+            name = prog_send_win[k].name[0] ? prog_send_win[k].name : "?";
+            rsize = prog_send_win[k].size;
+            rgot = prog_send_win[k].sent;
+            if (rgot > rsize) rgot = rsize;
+            is_fail = prog_send_win[k].state == 3;    /* 该文件独立失败 → 标红 */
         } else {
             int k = i - prog_win_base;
             if (k < 0 || k >= prog_win_n) continue;   /* 窗口未覆盖（滚动瞬时） */

@@ -94,7 +94,9 @@ int  w_hit(int x, int y);            /* 命中返回 widget id，未命中 -1 */
 /* ---------- 数据 ---------- */
 #define MAX_DEVICES  32
 #define MAX_FILES    512
-#define MAX_PICKED   64
+/* 已选清单上限（含文件夹展开后的逐文件条目）。与 proto/transfer.h 的
+ * XFER_MAX_FILES 同口径：超过整批拒绝，不截断。 */
+#define MAX_PICKED   512
 
 typedef struct {
     char  name[256];    /* 文件名 */
@@ -103,8 +105,8 @@ typedef struct {
 } FsEntry;
 
 typedef struct {
-    char  name[128];    /* 文件名 */
-    char  path[512];    /* 完整路径 */
+    char  name[512];    /* 显示名：散文件=文件名；文件夹内文件=相对路径（顶层名/子路径/文件名） */
+    char  path[512];    /* 完整路径（发送读盘用） */
     SceOff size;
 } PickedFile;
 
@@ -166,6 +168,8 @@ typedef struct {
     int     picked_count;
     int     picked_sel;                 /* 已选文件栏的选中行（picked 下标） */
     SceOff  picked_total;
+    int     pick_empty_sel;             /* 空文件栏焦点：0="选择文件" 1="发送文件夹" */
+    bool    dir_mode;                   /* 文件浏览页处于"选文件夹"模式（只列目录） */
 
     /* 传输（mock 进度） */
     int     prog_dir;      /* 0=发送 1=接收 */

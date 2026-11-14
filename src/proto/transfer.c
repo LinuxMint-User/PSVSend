@@ -46,7 +46,7 @@
 #define TX_SOCK_BUF   8192           /* 响应收包缓冲 */
 #define TX_CHUNK      32768          /* 上传分块 */
 #define TX_BLOCKS     2              /* 发送流水线块数（读线程 / 发送线程各用一块） */
-#define RSP_BUF       65536          /* prepare 应答缓冲上限（头+body） */
+#define RSP_BUF_BASE  65536          /* prepare 应答缓冲基数（头+body），按文件数再加 */
 #define PREPARE_PATH  "/api/localsend/v2/prepare-upload"
 #define PIN_MAX_TRY   3              /* 401 时最多尝试的 PIN 次数（含首次无 PIN） */
 #define PIN_WAIT_US   (120LL * 1000000LL)  /* 等 UI 输入 PIN 的上限 */
@@ -79,6 +79,7 @@ typedef struct {
     char       pin_in[32];           /* UI 输入的 PIN（锁内读写） */
     char       pin_code[32];         /* 本次重试实际带上的 PIN（线程私有） */
     XferFile   files[XFER_MAX_FILES];
+    XferRow    rows[XFER_MAX_FILES];  /* 进度行（窗口快照源） */
     int        count;
     char       session[64];          /* prepare 应答的会话 ID */
     char       tokens[XFER_MAX_FILES][64];
@@ -111,9 +112,12 @@ static void set_file_state(int i, int state, SceOff sent)
 {
     if (i < 0 || i >= g_j.count) return;
     lock();
-    g_j.v.total_sent += sent - g_j.v.f[i].sent;
-    g_j.v.f[i].state = state;
-    g_j.v.f[i].sent = sent;
+    g_j.v.total_sent += sent - g_j.rows[i].sent;
+    /* 终态计数只在首次进入 2/3 时累加（state=1 会被进度更新反复写） */
+    if (g_j.rows[i].state != 2 && state == 2) g_j.v.done++;
+    if (g_j.rows[i].state != 3 && state == 3) g_j.v.failed++;
+    g_j.rows[i].state = state;
+    g_j.rows[i].sent = sent;
     unlock();
 }
 
@@ -140,7 +144,7 @@ static void mark_file_failed(int i, const char *fmt, ...)
     char tmp[160];
     va_list ap;
     if (i >= 0 && i < g_j.count)
-        set_file_state(i, 3, g_j.v.f[i].sent);
+        set_file_state(i, 3, g_j.rows[i].sent);
     va_start(ap, fmt);
     vsnprintf(tmp, sizeof tmp, fmt, ap);
     va_end(ap);
@@ -762,13 +766,69 @@ static int jcat(char *b, int cap, int o, const char *fmt, ...)
     return o + w;
 }
 
+/* 按扩展名推断 fileType（大小写不敏感）。协议里它只是给对端的提示，
+ * 不参与落盘与校验；认不出来一律 application/octet-stream（协议默认）。 */
+static const char *file_mime(const char *name)
+{
+    static const struct { const char *ext, *mime; } map[] = {
+        { "jpg",  "image/jpeg" },   { "jpeg", "image/jpeg" },
+        { "png",  "image/png" },    { "gif",  "image/gif" },
+        { "webp", "image/webp" },   { "bmp",  "image/bmp" },
+        { "svg",  "image/svg+xml" },{ "heic", "image/heic" },
+        { "mp4",  "video/mp4" },    { "mkv",  "video/x-matroska" },
+        { "webm", "video/webm" },   { "avi",  "video/x-msvideo" },
+        { "mov",  "video/quicktime" },
+        { "mp3",  "audio/mpeg" },   { "wav",  "audio/wav" },
+        { "flac", "audio/flac" },   { "m4a",  "audio/mp4" },
+        { "ogg",  "audio/ogg" },    { "opus", "audio/opus" },
+        { "pdf",  "application/pdf" },
+        { "zip",  "application/zip" },
+        { "7z",   "application/x-7z-compressed" },
+        { "rar",  "application/vnd.rar" },
+        { "gz",   "application/gzip" }, { "tar", "application/x-tar" },
+        { "txt",  "text/plain" },   { "md",   "text/markdown" },
+        { "csv",  "text/csv" },     { "log",  "text/plain" },
+        { "json", "application/json" }, { "xml", "application/xml" },
+        { "html", "text/html" },    { "htm",  "text/html" },
+        { "css",  "text/css" },     { "js",   "text/javascript" },
+        { "apk",  "application/vnd.android.package-archive" },
+        { "epub", "application/epub+zip" },
+        { "doc",  "application/msword" },
+        { "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
+        { "xls",  "application/vnd.ms-excel" },
+        { "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+        { "ppt",  "application/vnd.ms-powerpoint" },
+        { "pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation" },
+    };
+    const char *slash, *dot;
+    char ext[16];
+    int i, n;
+
+    slash = strrchr(name, '/');       /* 相对路径：只看最后一级的扩展名 */
+    if (slash) name = slash + 1;
+    dot = strrchr(name, '.');
+    if (!dot || !dot[1]) return "application/octet-stream";
+    dot++;
+    n = (int)strlen(dot);
+    if (n >= (int)sizeof ext) return "application/octet-stream";
+    for (i = 0; i < n; i++) {
+        char c = dot[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        ext[i] = c;
+    }
+    ext[n] = 0;
+    for (i = 0; i < (int)(sizeof map / sizeof map[0]); i++)
+        if (strcmp(ext, map[i].ext) == 0) return map[i].mime;
+    return "application/octet-stream";
+}
+
 /* 组装 prepare-upload 请求体（成员信息 + 待发文件元数据）。
  * 任何一段装不下就返回 NULL：宁可不发，也不发一个截断的 JSON 出去。 */
 static char *build_prepare_json(void)
 {
-    /* 单文件上限按最坏情况给足：128 字节文件名（转义后 2×）+ sha256(64) + 固定字段。
-     * 早期 420 在带 sha256 后会把长名文件挤出上限，导致整份 JSON 拒发。 */
-    int cap = TX_SOCK_BUF + XFER_MAX_FILES * 560;
+    /* 按文件数动态分配：单文件最坏情况是 512 字节相对路径（转义后 2×）
+     * + sha256(64) + 固定字段。留 256 字节余量给 id/size/fileType/分隔符。 */
+    int cap = TX_SOCK_BUF + g_j.count * (2 * 512 + 256);
     char al[sizeof g_cfg.alias], fp[65];
     char ae[2 * sizeof g_cfg.alias], fe[2 * 65];
     char *b = (char *)malloc((size_t)cap);
@@ -787,7 +847,7 @@ static char *build_prepare_json(void)
              "\"download\":false},\"files\":{",
              ae, fe, http_port(), g_j.tls ? "https" : "http");
     for (i = 0; o >= 0 && i < g_j.count; i++) {
-        char esc[2 * 128 + 8];
+        char esc[2 * sizeof g_j.files[0].name + 8];
         char sh[80];
         json_escape(g_j.files[i].name, esc, sizeof esc);
         /* sha256 是协议里的可空字段：算了才带（设置页开关，默认开）。
@@ -797,8 +857,9 @@ static char *build_prepare_json(void)
             snprintf(sh, sizeof sh, ",\"sha256\":\"%s\"", g_j.sha[i]);
         o = jcat(b, cap, o,
                  "%s\"f%d\":{\"id\":\"f%d\",\"fileName\":\"%s\","
-                 "\"size\":%lld,\"fileType\":\"application/octet-stream\"%s}",
-                 i ? "," : "", i, i, esc, (long long)g_j.files[i].size, sh);
+                 "\"size\":%lld,\"fileType\":\"%s\"%s}",
+                 i ? "," : "", i, i, esc, (long long)g_j.files[i].size,
+                 file_mime(g_j.files[i].name), sh);
     }
     o = jcat(b, cap, o, "}}");
     if (o < 0) {                             /* 装不下：别发截断的 JSON */
@@ -1074,6 +1135,7 @@ static int hash_phase(void)
         lock();
         g_j.v.hash_cur = i;
         g_j.v.hash_cur_done = 0;
+        g_j.v.hash_cur_size = g_j.files[i].size;
         unlock();
         set_msg("Calculating checksum (%d/%d)", i + 1, n);
         if (hash_one(i, g_j.sha[i]) != 0) {
@@ -1122,7 +1184,7 @@ static int upload_one(int i)
     }
     lock();
     g_j.v.cur = i;                  /* 并发下 = 最近开工的那个（页面只拿它判状态行） */
-    g_j.v.f[i].state = 1;
+    g_j.rows[i].state = 1;
     unlock();
     if (g_j.parallel <= 1)          /* 串行才报"在发哪个文件"；并发时报了只会乱跳 */
         set_msg("Sending %s (%d/%d)", g_j.files[i].name, i + 1, g_j.count);
@@ -1335,6 +1397,7 @@ static int xfer_thr(SceSize args, void *argp)
     char *body = NULL;
     char *prep = NULL;              /* prepare 应答缓冲（堆上，容大文件列表） */
     int code = 0, rc, i, attempt;
+    int rsp_cap = RSP_BUF_BASE + g_j.count * 128;   /* 512 文件约 131KB */
     (void)args; (void)argp;
     dlog("xfer: thread entered, target %s:%d (%s)%s, %d file(s)",
          g_j.ip, g_j.port, g_j.tls ? "https" : "http",
@@ -1352,7 +1415,7 @@ static int xfer_thr(SceSize args, void *argp)
     set_msg("Waiting for %s to accept...", g_j.ip);
     body = build_prepare_json();
     if (!body) { fail("cannot build prepare request"); goto out; }
-    prep = (char *)malloc(RSP_BUF);
+    prep = (char *)malloc(rsp_cap);
     if (!prep) { fail("out of memory"); goto out; }
     for (attempt = 0; ; attempt++) {
         char path[256];      /* 路径 + "?pin=" + 百分号编码后最长 ~3×32 字节 */
@@ -1365,7 +1428,7 @@ static int xfer_thr(SceSize args, void *argp)
         if (rc == 0)
             rc = conn_send_all(&c, body, (int)strlen(body), NULL, NULL);
         if (rc == 0)
-            rc = read_resp(&c, &code, prep, RSP_BUF, PREPARE_WAIT_US);
+            rc = read_resp(&c, &code, prep, rsp_cap, PREPARE_WAIT_US);
         if (rc == -2) { conn_close(&c); finish_cancelled(); goto out; }
         if (rc < 0) {
             /* rc==-3: TCP 已通但 TLS 握手/证书校验失败；其余归"无应答" */
@@ -1487,9 +1550,9 @@ static int xfer_thr(SceSize args, void *argp)
     if (g_j.abort) {
         int nfail = 0;
         for (i = 0; i < g_j.count; i++) {
-            if (g_j.v.f[i].state == 0 || g_j.v.f[i].state == 1)
-                set_file_state(i, 3, g_j.v.f[i].sent);
-            if (g_j.v.f[i].state == 3) nfail++;
+            if (g_j.rows[i].state == 0 || g_j.rows[i].state == 1)
+                set_file_state(i, 3, g_j.rows[i].sent);
+            if (g_j.rows[i].state == 3) nfail++;
         }
         fail("%s", g_j.abort_msg[0] ? g_j.abort_msg : "peer unreachable");
         dlog("xfer: aborted, %d/%d file(s) failed", nfail, g_j.count);
@@ -1502,7 +1565,7 @@ static int xfer_thr(SceSize args, void *argp)
         int nfail = 0;
         lock();
         for (i = 0; i < g_j.count; i++)
-            if (g_j.v.f[i].state == 3) nfail++;
+            if (g_j.rows[i].state == 3) nfail++;
         g_j.v.finished = true;
         g_j.v.active = false;
         g_j.v.cur = -1;
@@ -1568,17 +1631,17 @@ int xfer_start(const char *ip, int port, const char *proto, const char *fp,
     g_j.port = port;
     g_j.count = n;
     for (i = 0; i < n; i++) {
-        /* 名字按 UTF-8 边界截断：128 字节装不下的长名很常见，若切在半个汉字上，
+        /* 名字按 UTF-8 边界截断：512 字节装不下的长名很常见，若切在半个汉字上，
          * prepare 的 JSON 里就是非法序列，对端解析会出错。 */
         str_copy_utf8(g_j.files[i].name, (int)sizeof g_j.files[i].name, files[i].name);
         strncpy(g_j.files[i].path, files[i].path, sizeof g_j.files[i].path - 1);
         g_j.files[i].size = files[i].size;
-        str_copy_utf8(g_j.v.f[i].name, (int)sizeof g_j.v.f[i].name, files[i].name);
-        g_j.v.f[i].size = files[i].size;
+        str_copy_utf8(g_j.rows[i].name, (int)sizeof g_j.rows[i].name, files[i].name);
+        g_j.rows[i].size = files[i].size;
     }
     g_j.v.count = n;
     g_j.v.start_us = (uint64_t)sceKernelGetSystemTimeWide();
-    for (i = 0; i < n; i++) g_j.v.total += g_j.v.f[i].size;
+    for (i = 0; i < n; i++) g_j.v.total += g_j.rows[i].size;
     g_j.v.active = true;
     unlock();
 
@@ -1642,6 +1705,19 @@ void xfer_info(XferInfo *out)
     lock();
     if (out) *out = g_j.v;
     unlock();
+}
+
+int xfer_window(int base, int max, XferRow *out)
+{
+    int n = 0;
+    if (!out || max <= 0 || base < 0) return 0;
+    lock();
+    while (n < max && base + n < g_j.count) {
+        out[n] = g_j.rows[base + n];
+        n++;
+    }
+    unlock();
+    return n;
 }
 
 bool xfer_active(void)

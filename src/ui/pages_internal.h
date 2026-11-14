@@ -39,6 +39,9 @@
 #define WID_PICKS_BASE  0x2000                /* + 已选文件行下标 */
 #define WID_PICKX_BASE  0x3000                /* + 已选文件行尾"✕"下标 */
 #define WID_FILES_PICK  0x8002                /* 空文件栏的"选择文件"按钮 */
+#define WID_FILES_FOLDER 0x8003               /* 空文件栏的"发送文件夹"按钮 */
+#define WID_FILES_SEND_DIR 0x8004             /* 目录模式右下"发送此文件夹" */
+#define WID_FILES_CANCEL_DIR 0x8005           /* 目录模式右下"取消"（扫描中=取消扫描） */
 /* 主页页头的触摸按钮（触摸补齐）：此前进设置只有 SELECT、扫描只有 △，
  * 触摸用户无路可走（无设备时设备栏更是没有任何可点之物）。扫码入口可关，
  * 关掉时页头只画其余按钮。 */
@@ -252,6 +255,7 @@ int  files_first_sel(void);     /* pages_send.c：files_load 后光标默认落�
 void enter_dir(const char *name);   /* pages_send.c：进入子目录并重载（".." = 回上级） */
 void parent_dir(void);              /* pages_send.c：回上级目录（根则退回设备页） */
 void pane_focus_default(void);      /* pages_send.c：按已选文件数定主页焦点栏（有文件→设备栏） */
+void folder_scan_tick(void);        /* pages_send.c：文件夹后台枚举完成后归并/转场（pages_tick 调） */
 void goto_devices(void);            /* pages_progress.c：回设备页并复位传输态（接收收尾/离开进度页用） */
 void return_from_recv(void);        /* pages_recv.c：接收流程收尾，回到弹确认页之前的页 */
 void spd_reset(void);               /* pages_progress.c：新传输起点作废上一笔的速度采样 */
@@ -269,11 +273,7 @@ void ui_font_preload_begin(void);   /* ui_main.c：进设置页 → 后台预读
 void ui_font_preload_end(void);     /* ui_main.c：出设置页 → 停预读并释放非常驻副本 */
 
 /* ---------- 跨页共享状态 ---------- */
-/* 进度页当前文件清单：发送时每帧由 xfer 快照覆盖；接收由 start_recv 先以本地
- * 清单兜底首帧、再由 receive 会话快照覆盖（定义在 pages.c）。 */
-extern int    xf_count;
-extern char   xf_name[MAX_PICKED][192];
-extern SceOff xf_size[MAX_PICKED];
+/* 进度页文件列表滚动位置（定义在 pages.c）。 */
 extern int    xf_scroll;
 
 #endif

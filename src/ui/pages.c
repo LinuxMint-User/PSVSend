@@ -6,7 +6,7 @@
  *   pages_settings.c  设置 / 目录选择
  * 布局常量与各页共用的小工具见 ui/pages_internal.h。
  *
- * 本文件只保留跨页共享的进度行清单（xf_*）与开机初始化/预热。 */
+ * 本文件只保留开机初始化/预热。 */
 #include <psp2/kernel/threadmgr/thread.h>
 #include "ui/ui.h"
 #include "ui/pages_internal.h"
@@ -16,12 +16,7 @@
 #include "app/api.h"
 #include "core/dlog.h"
 
-/* 进度页当前文件清单：发送由 start_send（pages_send.c）先写入、每帧再由
- * xfer 快照覆盖；接收由 start_recv（pages_recv.c）先以本地清单兜底首帧、
- * 再由 receive 会话快照覆盖（渲染在 pages_progress.c）。 */
-int    xf_count = 0;
-char   xf_name[MAX_PICKED][192];
-SceOff xf_size[MAX_PICKED];
+/* 进度页文件列表的滚动位置（跨页保留：发送等待 → 进度页初始化归零） */
 int    xf_scroll = 0;
 
 void pages_init(void)

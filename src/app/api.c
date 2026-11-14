@@ -415,6 +415,11 @@ void api_send_info(XferInfo *out)
     xfer_info(out);
 }
 
+int api_send_window(int base, int max, XferRow *out)
+{
+    return xfer_window(base, max, out);
+}
+
 /* ---- UI 门面：接收（均为薄转发，见 api.h） ---- */
 int api_recv_pending_summary(RecvPendingSummary *out)
 {

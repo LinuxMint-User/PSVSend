@@ -11,25 +11,32 @@
 #include <stdint.h>
 #include <psp2/types.h>
 
-#define XFER_MAX_FILES 64   /* 与 UI 的 MAX_PICKED 一致 */
+#define XFER_MAX_FILES 512   /* 与 UI 的 MAX_PICKED 一致；超过整批拒绝，不截断 */
 
-/* 待发文件（xfer_start 入参，一次拷贝，线程内部使用） */
+/* 待发文件（xfer_start 入参，一次拷贝，线程内部使用）。
+ * name 是发送给对端的 fileName：散文件=文件名，文件夹内文件=相对路径
+ * （顶层目录名/子路径/文件名，正斜杠），与官方客户端"发送文件夹"同口径。 */
 typedef struct {
-    char   name[128];
+    char   name[512];
     char   path[512];
     SceOff size;
 } XferFile;
 
-/* 传输过程快照（UI 只读展示；读取用 xfer_info 锁内拷贝） */
+/* 单文件进度行（窗口快照；512 文件时不再每帧整份拷贝） */
 typedef struct {
-    struct {
-        char   name[128];
-        SceOff size;
-        SceOff sent;
-        int    state;       /* 0=等待 1=上传中 2=完成 3=失败 */
-    } f[XFER_MAX_FILES];
+    char   name[512];       /* 相对路径（界面显示口径） */
+    SceOff size;
+    SceOff sent;
+    int    state;           /* 0=等待 1=上传中 2=完成 3=失败 */
+} XferRow;
+
+/* 传输过程汇总（UI 只读展示；读取用 xfer_info 锁内拷贝）。
+ * 文件行不进这里——按 [base, base+n) 走 xfer_window 窗口拉取。 */
+typedef struct {
     int     count;
     int     cur;            /* 当前处理下标（-1=无） */
+    int     done;           /* state==2 的文件数 */
+    int     failed;         /* state==3 的文件数 */
     bool    active;         /* 传输线程运行中 */
     bool    finished;       /* 线程已退出 */
     bool    ok;             /* 全部成功 */
@@ -42,6 +49,7 @@ typedef struct {
     int     hash_cur;       /* 正在算校验的文件下标（-1=无） */
     SceOff  hash_done;      /* 预扫已读字节（整批） */
     SceOff  hash_cur_done;  /* 当前文件已扫字节（分段进度条用） */
+    SceOff  hash_cur_size;  /* 当前文件总字节（等待页分段进度用） */
     SceOff  hash_total;     /* 预扫总字节（= total） */
     uint64_t start_us;      /* 启动时刻（sceKernelGetSystemTimeWide） */
     char    msg[96];        /* 状态行：等待接受/上传中/已完成/失败原因 */
@@ -67,6 +75,10 @@ void xfer_pin_cancel(void);
 
 /* 锁内拷贝当前快照（每帧调用无妨；线程结束时快照保留最后一次状态） */
 void xfer_info(XferInfo *out);
+
+/* 锁内拷贝文件行 [base, base+max)，返回实际行数（窗口之外返回 0）。
+ * 进度页每帧按滚动位置拉取，512 文件时也不再整份拷贝。 */
+int  xfer_window(int base, int max, XferRow *out);
 
 /* 轻量查询：是否正在发送（锁内读 active；receive 侧"发送中拒绝接收"用） */
 bool xfer_active(void);

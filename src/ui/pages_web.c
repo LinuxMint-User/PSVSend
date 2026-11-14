@@ -25,20 +25,24 @@
 
 static int  web_sel;                /* 选择态焦点：0=分享 1=接收 */
 static bool web_stop_hold;          /* 手指正按住停止按钮（画蓄力弧用） */
-static WebEntry s_entries[MAX_PICKED];
+static WebEntry s_entries[WEB_MAX_FILES];
 
 static void start_download_share(void)
 {
-    int i;
-    if (g_app.picked_count <= 0) return;
-    for (i = 0; i < g_app.picked_count; i++) {
-        snprintf(s_entries[i].name, sizeof s_entries[i].name, "%s",
-                 g_app.picked[i].name);
+    int i, n = g_app.picked_count;
+    if (n <= 0) return;
+    if (n > WEB_MAX_FILES) n = WEB_MAX_FILES;   /* 网页分享沿用 64 条上限 */
+    for (i = 0; i < n; i++) {
+        /* 已选清单里文件夹内文件是相对路径；网页下载只展示最后一级文件名
+         * （路径仍用绝对路径读盘，浏览器不会拿到目录结构） */
+        const char *base = strrchr(g_app.picked[i].name, '/');
+        base = base ? base + 1 : g_app.picked[i].name;
+        snprintf(s_entries[i].name, sizeof s_entries[i].name, "%s", base);
         snprintf(s_entries[i].path, sizeof s_entries[i].path, "%s",
                  g_app.picked[i].path);
         s_entries[i].size = g_app.picked[i].size;
     }
-    api_web_start_download(s_entries, g_app.picked_count);
+    api_web_start_download(s_entries, n);
 }
 
 static void web_enter(bool start_download)
@@ -85,6 +89,7 @@ static void render_choose(void)
     char sub[96];
     SceOff total = g_app.picked_total;
     int n = g_app.picked_count;
+    if (n > WEB_MAX_FILES) n = WEB_MAX_FILES;   /* 与实际分享条数一致 */
 
     if (n > 0) {
         char sz[24];
