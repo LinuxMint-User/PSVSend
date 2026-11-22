@@ -3232,6 +3232,10 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
         unlock();
         return 500;
     }
+    /* resolve_disk_conflict_locked 会放锁做 stat（ux0 大目录下单次可达数百 ms），
+     * 必须先把 busy 置上：否则这个窗口里 recv_clear / drop_stale_session_locked
+     * 会按"空闲"释放 g_sess.f，resolve 回来再写 f->rel 等就是写已释放内存。 */
+    f->busy = true;
     /* 接受时没做磁盘 stat（2048 文件不能锁内逐个探测）：真正写盘前在这里解析
      * 同名冲突，必要时把最后一级改成 " (k)"。
      * 大批量小文件例外：直写最终名并在 open_direct_bulk 里判冲突，省掉每个
@@ -3239,11 +3243,17 @@ static int recv_http_upload(const char *query, const char *ip, int64_t total,
     direct = g_sess.bulk && f->size >= 0 && f->size <= RECV_INLINE_MAX &&
              !f->overwrite && !f->is_text && !strchr(f->rel, '/');
     if (!direct && !resolve_disk_conflict_locked(f)) {
-        file_fail_locked(f, "无法分配文件名");
+        file_fail_locked(f, "无法分配文件名");   /* 内部已把 busy 清回 false */
         unlock();
         return 500;
     }
-    f->busy = true;
+    /* stat 放锁窗口内用户可能已取消（recv_abort/recv_clear 置 g_abort）：别继续收 */
+    if (g_abort) {
+        file_fail_locked(f, "已取消");
+        clear_pending_finish_locked();
+        unlock();
+        return 500;
+    }
     g_sess.cur = idx;
     g_sess.state = RECV_ST_RECEIVING;
     g_sess.last_us = now_us();
