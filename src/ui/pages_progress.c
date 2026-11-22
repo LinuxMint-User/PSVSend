@@ -14,6 +14,7 @@
 #include "core/i18n.h"
 #include "core/dlog.h"
 #include "app/api.h"
+#include "proto/recv_path.h"      /* RP_PATH_MAX：文本预览路径缓冲上限 */
 
 /* 传输页：文件列表区域与总进度布局（发送/接收共用）。
  * 列表顶 / 行高 / 行步进走 ui.h 的公共常量（与其它整幅列表一致）；
@@ -215,7 +216,7 @@ void page_progress_render(void)
             partial = rs.state == RECV_ST_PARTIAL; /* 部分成功：警示色 + N failed */
             /* 单条剪贴板文本收完 → 自动打开预览页（每个会话只开一次） */
             if (rs.state == RECV_ST_DONE && rs.start_us != txt_auto_us) {
-                char tp[512];
+                char tp[RP_PATH_MAX + 1];
                 if (api_recv_text_path(tp, sizeof tp) == 1) {
                     txt_auto_us = rs.start_us;
                     page_text_open(tp);

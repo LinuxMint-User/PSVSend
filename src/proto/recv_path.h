@@ -29,6 +29,7 @@
 
 #define RP_STAGE_SUFFIX ".psvsend-part"   /* 顶层目录的暂存后缀 */
 #define RP_PART_SUFFIX  ".psvsend.tmp"    /* 单文件写入中的临时后缀 */
+#define RP_BAK_SUFFIX   ".psvsend.bak"    /* 覆盖落盘前的旧文件备份后缀 */
 
 typedef enum {
     RP_OK = 0,
@@ -74,7 +75,8 @@ static inline bool rp_name_eq(const char *a, const char *b)
     return rp_name_cmp(a, b) == 0;
 }
 
-/* 顶层名是否以保留后缀结尾（.psvsend-part / .psvsend.tmp，大小写不敏感）。 */
+/* 顶层名是否以保留后缀结尾（.psvsend-part / .psvsend.tmp / .psvsend.bak，
+ * 大小写不敏感）。 */
 bool rp_reserved_name(const char *name);
 
 /* 生成第 k 个不重名候选：base (k).ext，结果仍 <= RP_COMP_MAX 且 < outsz。

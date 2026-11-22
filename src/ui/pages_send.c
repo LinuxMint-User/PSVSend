@@ -56,6 +56,7 @@ static void start_send(int dev_idx);
 static void open_files(void);
 static void open_folders(void);
 static void folder_note_set(const char *fmt, ...);
+static void dir_msg_set(const char *fmt, ...);
 
 /* ---------- 主页两栏几何 ---------- */
 typedef struct { int x, w; } PaneRect;
@@ -806,6 +807,10 @@ void files_load(void)
         g_app.files[n].size = de.d_stat.st_size;
         n++;
     }
+    /* 是否被 MAX_FILES 截断：停在 n == MAX_FILES 可能刚好读完，再读一次确认
+     * 还有剩余条目（读完再关 fd），避免误报。 */
+    bool truncated = false;
+    if (n >= MAX_FILES && sceIoDread(fd, &de) > 0) truncated = true;
     sceIoDclose(fd);
     g_app.file_count = n;
     /* 目录在前，名称升序（".." 是第 0 项，从它后面开始排） */
@@ -823,6 +828,8 @@ void files_load(void)
         }
     }
     if (g_app.file_sel >= g_app.file_count) g_app.file_sel = 0;
+    if (truncated)
+        dir_msg_set(tr("Too many items (first %d shown)"), MAX_FILES);
 }
 
 /* files_load 之后光标的默认落点：跳过第 0 行的 ".."，省得每次进目录都先往下按一下
@@ -832,14 +839,17 @@ int files_first_sel(void)
     return (g_app.file_count > 1 && strcmp(g_app.files[0].name, "..") == 0) ? 1 : 0;
 }
 
-/* 当前浏览目录 + 文件名拼成完整路径（去重/发送都按它比，不用裸文件名） */
-static void join_path(const char *name, char *out, int n)
+/* 当前浏览目录 + 文件名拼成完整路径（去重/发送都按它比，不用裸文件名）。
+ * 返回 false = 缓冲区装不下（路径被截断），调用方必须放弃本次操作并提示。 */
+static bool join_path(const char *name, char *out, int n)
 {
     size_t len = strlen(g_app.cur_dir);
+    int r;
     if (len > 0 && g_app.cur_dir[len - 1] == '/')
-        snprintf(out, n, "%s%s", g_app.cur_dir, name);
+        r = snprintf(out, n, "%s%s", g_app.cur_dir, name);
     else
-        snprintf(out, n, "%s/%s", g_app.cur_dir, name);
+        r = snprintf(out, n, "%s/%s", g_app.cur_dir, name);
+    return r > 0 && r < n;
 }
 
 /* 在已选清单里找同一路径；-1 = 未选 */
@@ -854,7 +864,7 @@ static int find_picked(const char *path)
 static bool is_picked(int idx)
 {
     char path[512];
-    join_path(g_app.files[idx].name, path, sizeof path);
+    if (!join_path(g_app.files[idx].name, path, sizeof path)) return false;
     return find_picked(path) >= 0;
 }
 
@@ -863,7 +873,10 @@ static void toggle_pick(int idx)
 {
     char path[512];
     int k;
-    join_path(g_app.files[idx].name, path, sizeof path);
+    if (!join_path(g_app.files[idx].name, path, sizeof path)) {
+        dir_msg_set("%s", tr("Path too long"));   /* 截断路径不写入已选 */
+        return;
+    }
     k = find_picked(path);
     if (k >= 0) {                   /* 已选 → 取消 */
         unpick(k);
@@ -929,14 +942,21 @@ static void done_files(void)
 
 void enter_dir(const char *name)
 {
+    char path[512];
     size_t len;
+    int r;
     /* 列表首行的 ".." 不是真目录名：直接回上级，别拼出 "ux0:/dir/.." 这种路径 */
     if (strcmp(name, "..") == 0) { parent_dir(); return; }
     len = strlen(g_app.cur_dir);
     if (len > 0 && g_app.cur_dir[len - 1] == '/')
-        snprintf(g_app.cur_dir, sizeof g_app.cur_dir, "%s%s", g_app.cur_dir, name);
+        r = snprintf(path, sizeof path, "%s%s", g_app.cur_dir, name);
     else
-        snprintf(g_app.cur_dir, sizeof g_app.cur_dir, "%s/%s", g_app.cur_dir, name);
+        r = snprintf(path, sizeof path, "%s/%s", g_app.cur_dir, name);
+    if (r < 0 || r >= (int)sizeof path) {   /* 截断路径不进入 */
+        dir_msg_set("%s", tr("Path too long"));
+        return;
+    }
+    strcpy(g_app.cur_dir, path);
     file_scroll = 0;
     glide_reset(&file_glide);
     remember_dir();
@@ -1219,7 +1239,10 @@ static void send_folder_at_cursor(void)
 {
     char path[512];
     if (cursor_is_subdir()) {
-        join_path(g_app.files[g_app.file_sel].name, path, sizeof path);
+        if (!join_path(g_app.files[g_app.file_sel].name, path, sizeof path)) {
+            dir_msg_set("%s", tr("Path too long"));   /* 截断路径不发起发送 */
+            return;
+        }
         if (folder_scan_start(path) != 0)
             dir_msg_set("%s", tr("Cannot read folder"));
     } else {
@@ -1251,15 +1274,17 @@ void page_files_render(void)
     w_page_header(tr(dm ? "Select folder" : "Select files"));
     w_text_lead(28, 56, 1.0f, theme->text_dim, g_app.cur_dir,
                 SCR_W - (dm ? 360 : 260));
-    if (!dm) {   /* 右端显示已选总数：跨目录挑文件时也能看到累计 */
+    /* 本页短提示（列表截断 / 路径过长）：文件选择页与目录模式页都显示，
+     * 短暂占用右上角——文件选择页这里平时显示已选计数。 */
+    if (dir_msg_us && now < dir_msg_us) {
+        w_text_right(SCR_W - 28, 56, 1.0f, theme->warn, "%s", dir_msg);
+    } else if (!dm) {   /* 右端显示已选总数：跨目录挑文件时也能看到累计 */
         char cnt[48];
         int cw = 0, ch = 0;
         snprintf(cnt, sizeof cnt, tr("%d selected"), g_app.picked_count);
         w_text_w(1.0f, cnt, &cw, &ch);
         w_text(SCR_W - 28 - cw, 56, 1.0f,
                g_app.picked_count > 0 ? theme->text : theme->text_dim, "%s", cnt);
-    } else if (dir_msg_us && now < dir_msg_us) {
-        w_text_right(SCR_W - 28, 56, 1.0f, theme->warn, "%s", dir_msg);
     } else {
         dir_msg_us = 0;
     }

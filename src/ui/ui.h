@@ -212,8 +212,6 @@ typedef struct {
     int     light_mode;    /* 明暗：0=深色 1=浅色（OLED 固定深色） */
     int     confirm_layout;/* 0=美式(X确认/O返回) 1=日式(O确认/X返回) */
     int     set_sel;
-
-    bool    done;
 } App;
 
 extern App g_app;

@@ -21,12 +21,14 @@ static uint64_t rep_last[4];    /* 上次触发时刻 */
 #define REP_INTERVAL_US 80000   /* 之后每 80ms 一次 */
 
 /* 三角键"按住蓄力"（主页文件栏清空列表用；长按口径的唯一真源）：
- *   按住 → 进度按帧上涨，蓄满产生一次 Input.alt_long 事件并上锁（仍按着不再触发）；
- *   松开 → 解锁，进度按帧回落到 0（不立刻归零：符合"蓄力泄掉"的直觉）。
+ *   按住 → 进度按真实时间上涨，蓄满产生一次 Input.alt_long 事件并上锁（仍按着不再触发）；
+ *   松开 → 解锁，进度按真实时间回落到 0（不立刻归零：符合"蓄力泄掉"的直觉）。
  * 页面只消费 alt_long 事件 + 读 ui_input_alt_charge() 画环，不判断物理键。 */
 #define ALT_HOLD_US    700000   /* 蓄满所需按住时长（0.7s） */
 #define ALT_REL_US     1000000  /* 松手后回落时长（1s） */
-#define ALT_FRAME_US   16667    /* 每帧步长：poll 每帧一次、vsync 恒 60Hz */
+#define ALT_MAX_DT_US  100000   /* 单帧步长上限：卡顿后最多补 100ms，避免一帧跳满 */
+
+static uint64_t last_poll_us;   /* 上次 poll 时刻（蓄力按真实时间步进用；0 = 首帧） */
 
 static float alt_charge;        /* 当前蓄力进度 0..1（页面画环用） */
 static bool  alt_locked;        /* 本次按住不再蓄力（已触发 / 换栏作废），松开才解 */
@@ -103,14 +105,14 @@ static bool touch_to_screen(int px, int py, int *sx, int *sy)
     return false;
 }
 
-static void touch_poll(Input *in, SceTouchData *touch, uint64_t now)
+static void touch_poll(Input *in, SceTouchData *touch, uint64_t now, uint64_t dt_us)
 {
     bool down = touch->reportNum > 0;
     int cx = 0, cy = 0;
 
     /* 抬手后蓄力回落（与三角同口径）：页面看到环逐渐泄掉 */
     if (!down && touch_charge > 0.0f) {
-        touch_charge -= (float)ALT_FRAME_US / (float)ALT_REL_US;
+        touch_charge -= (float)dt_us / (float)ALT_REL_US;
         if (touch_charge < 0.0f) touch_charge = 0.0f;
     }
 
@@ -179,7 +181,7 @@ static void touch_poll(Input *in, SceTouchData *touch, uint64_t now)
                 in->touch_hold = true;
                 in->touch_x = t_x0; in->touch_y = t_y0;
                 if (!touch_locked) {
-                    touch_charge += (float)ALT_FRAME_US / (float)ALT_HOLD_US;
+                    touch_charge += (float)dt_us / (float)ALT_HOLD_US;
                     if (touch_charge >= 1.0f) {
                         touch_charge = 0.0f;
                         touch_locked = true;
@@ -227,11 +229,18 @@ void ui_input_poll(Input *in)
 {
     SceCtrlData pad;
     SceTouchData touch;
-    uint64_t now;
+    uint64_t now, dt_us = 0;
 
     memset(in, 0, sizeof *in);
     update_keys();
     now = sceKernelGetSystemTimeWide();
+    /* 本帧真实耗时：蓄力进度按它步进，帧率波动时快慢一致。
+     * 首帧（last_poll_us == 0）或时钟异常（dt <= 0）按 0 处理；卡顿后夹到上限。 */
+    if (last_poll_us && now > last_poll_us) {
+        dt_us = now - last_poll_us;
+        if (dt_us > ALT_MAX_DT_US) dt_us = ALT_MAX_DT_US;
+    }
+    last_poll_us = now;
 
     if (sceCtrlPeekBufferPositive(0, &pad, 1) >= 0) {
         uint32_t b = pad.buttons;
@@ -253,7 +262,7 @@ void ui_input_poll(Input *in)
         /* 三角蓄力：按住上涨，满格产生一次 alt_long 事件并上锁；松开回落 */
         if (b & SCE_CTRL_TRIANGLE) {
             if (!alt_locked) {
-                alt_charge += (float)ALT_FRAME_US / (float)ALT_HOLD_US;
+                alt_charge += (float)dt_us / (float)ALT_HOLD_US;
                 if (alt_charge >= 1.0f) {
                     alt_charge = 0.0f;   /* 满格即清零：环立刻消失（动作已发生） */
                     alt_locked = true;
@@ -263,14 +272,14 @@ void ui_input_poll(Input *in)
         } else {
             alt_locked = false;
             if (alt_charge > 0.0f) {
-                alt_charge -= (float)ALT_FRAME_US / (float)ALT_REL_US;
+                alt_charge -= (float)dt_us / (float)ALT_REL_US;
                 if (alt_charge < 0.0f) alt_charge = 0.0f;
             }
         }
         /* 返回键蓄力：与三角同口径（满格一次 back_long，松开回落） */
         if (b & g_back_key) {
             if (!back_locked) {
-                back_charge += (float)ALT_FRAME_US / (float)ALT_HOLD_US;
+                back_charge += (float)dt_us / (float)ALT_HOLD_US;
                 if (back_charge >= 1.0f) {
                     back_charge = 0.0f;
                     back_locked = true;
@@ -280,7 +289,7 @@ void ui_input_poll(Input *in)
         } else {
             back_locked = false;
             if (back_charge > 0.0f) {
-                back_charge -= (float)ALT_FRAME_US / (float)ALT_REL_US;
+                back_charge -= (float)dt_us / (float)ALT_REL_US;
                 if (back_charge < 0.0f) back_charge = 0.0f;
             }
         }
@@ -288,7 +297,7 @@ void ui_input_poll(Input *in)
     }
 
     if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) >= 0)
-        touch_poll(in, &touch, now);
+        touch_poll(in, &touch, now, dt_us);
     else
         t_down = false;   /* 读取失败视为抬手，避免状态卡住 */
 }
@@ -312,6 +321,7 @@ void ui_input_resync(void)
         prev_buttons = pad.buttons;
     for (i = 0; i < 4; i++)
         rep_press[i] = rep_last[i] = now;
+    last_poll_us = 0;    /* 冻结期没推进过：解冻首帧 dt 按 0，蓄力不凭空跳一截 */
     alt_charge = 0.0f;   /* 冻结期没推进过蓄力：解冻不继承，避免凭空蓄满 */
     alt_locked = false;
     back_charge = 0.0f;

@@ -807,6 +807,12 @@ static void settings_leave(void)
 
 void page_settings_input(const Input *in)
 {
+    /* 收起动画期间（item 已清、面板还在渐隐）：吞掉本帧全部输入。
+     * 否则点在渐隐面板上会因 item < 0 被静默丢弃，点左侧列表区会被当成普通行
+     * 处理（开键盘 / 开另一个抽屉），与"面板还在"的视觉不符。
+     * 动画由 render 里的 set_drawer_step 继续推进，这里不碰。 */
+    if (set_drawer_item < 0 && set_drawer_vis >= 0)
+        return;
     /* 面板态：拖动滚动冻结、列表焦点不动，其余按键一律吞掉，只认面板内的动作 */
     if (set_drawer_item >= 0) {
         glide_stop(&set_glide);   /* 面板态列表冻结：别让惯性在面板底下继续滚 */

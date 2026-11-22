@@ -826,6 +826,17 @@ static int dirnames_has(const DirNames *d, const char *name)
     return 0;
 }
 
+/* 名字里是否含非 ASCII 字节（UTF-8 多字节）：strcasecmp 在 C locale 只折
+ * ASCII，É/é 这类差异快照里查不出来，需要补 stat 兜底。 */
+static int name_has_nonascii(const char *s)
+{
+    const unsigned char *p = (const unsigned char *)s;
+
+    for (; *p; p++)
+        if (*p >= 0x80) return 1;
+    return 0;
+}
+
 /* 只 stat 唯一目录路径：
  *   1) 每个顶层一次（目标是否存在 / 是目录还是文件）；
  *   2) 仅对“目标已存在同名目录”的顶层，逐个子目录一次——被同名文件挡住的
@@ -874,8 +885,14 @@ static void pend_roots_precheck_locked(void)
         {
             /* 先查名字快照：不在目录里就不用 stat（省掉一次整目录线性扫描）。 */
             const char *base = strrchr(target, '/');
-            int exists = dn_ok ? dirnames_has(&dn, base ? base + 1 : target) : 1;
+            const char *leaf = base ? base + 1 : target;
+            int exists = dn_ok ? dirnames_has(&dn, leaf) : 1;
 
+            /* 快照按 strcasecmp 比对，非 ASCII 大小写（É/é）会漏判；小目录补
+             * 一次 stat 兜底。大目录（>256 项）逐文件 stat 会重现整目录线性
+             * 扫描的卡顿，仍只靠落盘 resolve 避让。 */
+            if (!exists && dn.n <= 256 && name_has_nonascii(leaf))
+                exists = 1;
             if (!exists || sceIoGetstat(target, &st) < 0) {
                 rt->conflict = RECV_ROOT_CF_NONE;
             } else if (rt->is_dir && (st.st_mode & SCE_S_IFDIR)) {
@@ -1536,6 +1553,9 @@ static int finish_root(const SessRoot *r)
     return merge_dir(stage, target, 0) ? FIN_ROOT_OK : FIN_ROOT_FAIL;
 }
 
+/* 见文件后部：把 part 提交到 final（overwrite 时带备份/回滚）。 */
+static int commit_replace(const char *part, const char *final, bool overwrite);
+
 static bool create_zero_file(const char *path)
 {
     SceUID fd;
@@ -1573,8 +1593,17 @@ static bool create_zero_staged(const char *rel, const char *stage_name,
 
     split_top_inner(rel, top, sizeof top, &inner);
     if (!inner[0]) {
-        if (overwrite && rp_final_path(g_dir, top, NULL, path, sizeof path))
-            return create_zero_file(path);
+        if (overwrite) {
+            /* 覆盖：先建临时名再替换，别 O_TRUNC 截断旧文件（断电会剩空文件） */
+            char tmp[RP_PATH_MAX + 1 + sizeof(RP_PART_SUFFIX)];
+            int n;
+            if (!rp_final_path(g_dir, top, NULL, path, sizeof path))
+                return false;
+            n = snprintf(tmp, sizeof tmp, "%s%s", path, RP_PART_SUFFIX);
+            if (n < 0 || n >= (int)sizeof tmp) return false;
+            if (!create_zero_file(tmp)) return false;
+            return commit_replace(tmp, path, true) == 0;
+        }
         return create_zero_flat(top);
     }
     if (!rp_stage_file_path(g_dir, stage_name, inner, path, sizeof path))
@@ -1584,10 +1613,14 @@ static bool create_zero_staged(const char *rel, const char *stage_name,
 
 static SceUID g_fin_thr = -1;
 
-static void fin_reap(void)
+/* 回收已退出的 finalize 线程（需持 g_mtx：写者 finalize_start_locked 也在锁内，
+ * 无锁回收可能误删刚启动的线程，会话将永久卡在 FINALIZING）。 */
+static void fin_reap_locked(void)
 {
-    if (g_fin_thr >= 0 && thread_exited(g_fin_thr)) {
-        sceKernelDeleteThread(g_fin_thr);
+    SceUID t = g_fin_thr;
+
+    if (t >= 0 && thread_exited(t)) {
+        sceKernelDeleteThread(t);
         g_fin_thr = -1;
     }
 }
@@ -1673,7 +1706,7 @@ static void finalize_start_locked(void)
     g_sess.state = RECV_ST_FINALIZING;
     g_sess.cur = -1;
     g_sess.last_us = now_us();
-    fin_reap();
+    fin_reap_locked();
     /* 合并是递归目录遍历，栈留足（深度 ≤18，每层约 4KB） */
     t = sceKernelCreateThread("psvsend_fin", fin_thread, 0x40, 0x40000, 0,
                               SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
@@ -1819,7 +1852,8 @@ void recv_init(void)
     unlock();
     /* 清扫上次异常退出残留（只扫当前默认/设置目录顶层）：
      *   - *.psvsend-part 目录（M2 暂存根，可能带 " (k)"）→ 递归删除；
-     *   - *.psvsend.tmp 文件 / .psvsend-tmp-* → 删除。
+     *   - *.psvsend.tmp 文件 / .psvsend-tmp-* → 删除；
+     *   - *.psvsend.bak → final 在就删备份，final 缺失就把备份改回去。
      * 正式文件不带这些后缀，所以不会误删已收完的内容。用户自己正好有同名
      * 文件/目录的取舍见 TODO「后缀即保留名」：视为残留，这是既定设计。
      * 注：不清理旧版遗留的 *.part —— 那正是"对端发来叫 x.part 的合法文件被当
@@ -1841,8 +1875,27 @@ void recv_init(void)
             } else if (!isdir &&
                        (str_ends_ci(de.d_name, RP_PART_SUFFIX) ||
                         strncmp(de.d_name, ".psvsend-tmp-", 13) == 0)) {
+                /* part 是未写完的新数据，按既有规则删掉；旧文件在 bak 里 */
                 sceIoRemove(p);
                 dlog("recv: init removed stale %s", de.d_name);
+            } else if (!isdir && str_ends_ci(de.d_name, RP_BAK_SUFFIX)) {
+                char fin[RP_PATH_MAX + 1];
+                size_t bl = strlen(de.d_name) - strlen(RP_BAK_SUFFIX);
+                SceIoStat st;
+
+                if (snprintf(fin, sizeof fin, "%s/%.*s", g_dir, (int)bl,
+                             de.d_name) >= (int)sizeof fin)
+                    continue;
+                if (sceIoGetstat(fin, &st) >= 0) {
+                    /* final 已存在：上次替换已完成，备份只是没删掉 */
+                    sceIoRemove(p);
+                    dlog("recv: init removed stale bak %s", de.d_name);
+                } else if (sceIoRename(p, fin) == 0) {
+                    /* final 缺失：替换没做完，恢复旧文件 */
+                    dlog("recv: init restored bak -> %s", de.d_name);
+                } else {
+                    dlog("recv: init restore bak fail %s", de.d_name);
+                }
             }
         }
         sceIoDclose(d);
@@ -2514,7 +2567,9 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
 
     if (respsz > 0) resp[0] = 0;
     reap_zombies();                          /* 先回收旧僵尸槽位，避免复用其临时路径 */
-    fin_reap();                              /* 回收上一次会话的最终化线程 */
+    lock();                                  /* 回收 finalize 线程需持 g_mtx */
+    fin_reap_locked();                       /* 回收上一次会话的最终化线程 */
+    unlock();
 
     infov = json_get_val(body, "info");
     filesv = json_get_val(body, "files");
@@ -3056,12 +3111,35 @@ static SceUID open_direct_bulk(RFile *f)
     }
 }
 
-/* 落盘提交：overwrite 的顶层平铺文件先删掉同名旧文件，再把临时文件改名过去。
- * 旧文件在收完且校验通过之后才删，失败时原文件保持不动。 */
+/* 落盘提交：overwrite 时走"备份 → 替换 → 删备份"。
+ * 不能先删旧文件再改名：remove 之后 rename 失败或断电会新旧俱失。备份残留
+ * 由 recv_init 扫尾（final 在就删 bak，final 缺失就 bak 改回去）。 */
+static int commit_replace(const char *part, const char *final, bool overwrite)
+{
+    char bak[RP_PATH_MAX + 1 + sizeof(RP_BAK_SUFFIX)];
+    SceIoStat st;
+    int n;
+
+    if (!overwrite) return sceIoRename(part, final);
+    n = snprintf(bak, sizeof bak, "%s%s", final, RP_BAK_SUFFIX);
+    if (n < 0 || n >= (int)sizeof bak) return -1;  /* 超预算：不冒险动旧文件 */
+    if (sceIoGetstat(final, &st) < 0)             /* 没有旧文件，不用备份 */
+        return sceIoRename(part, final);
+    if (st.st_mode & SCE_S_IFDIR) return -1;      /* 旧的是目录：不替换（同旧语义） */
+    if (sceIoRename(final, bak) < 0) return -1;   /* 备份失败：旧文件原地不动 */
+    if (sceIoRename(part, final) < 0) {
+        if (sceIoRename(bak, final) < 0)          /* 回滚失败：留着 bak 给开机清扫 */
+            dlog("recv: rollback fail, keep bak %s", bak);
+        return -1;
+    }
+    if (sceIoRemove(bak) < 0)                     /* 删不掉也不影响数据，开机兜底 */
+        dlog("recv: remove bak fail %s", bak);
+    return 0;
+}
+
 static int commit_file_rename(RFile *f)
 {
-    if (f->overwrite) sceIoRemove(f->final);
-    return sceIoRename(f->part, f->final);
+    return commit_replace(f->part, f->final, f->overwrite);
 }
 
 /* 小文件直写：不开槽位/线程，在当前 http worker 里收完、校验、改名。
@@ -4118,7 +4196,13 @@ int recv_text_path(char *out, int cap)
     if (g_phase == PH_ACTIVE && g_sess.f && g_sess.n == 1 &&
         g_sess.f[0].is_text && g_sess.f[0].st == 1) {
         /* 文本消息还没"保存"：内容在临时文件里（见 cleanup_parts 的说明） */
-        if (out && cap > 0) snprintf(out, cap, "%s", g_sess.f[0].part);
+        if (out && cap > 0) {
+            int n = snprintf(out, cap, "%s", g_sess.f[0].part);
+            if (n >= cap) {                  /* 路径被截断：不能报成功 */
+                unlock();
+                return 0;
+            }
+        }
         r = 1;
     }
     unlock();
@@ -4231,8 +4315,8 @@ int recv_status_window(int base, int max, RecvStatusRow *out)
 void recv_clear(void)
 {
     reap_zombies();                      /* 会话收尾顺手回收已退出的僵尸槽位 */
-    fin_reap();
-    lock();
+    lock();                              /* 回收 finalize 线程需持 g_mtx */
+    fin_reap_locked();
     if (g_phase == PH_ACTIVE) {
         if (g_sess.state == RECV_ST_FINALIZING) {
             /* 最终化在跑：线程还在用 g_sess/暂存根，不能拆。推迟到它收尾时

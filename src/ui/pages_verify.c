@@ -12,7 +12,7 @@
  * 显示两种等价形式（官方是二选一，我们并排放，省掉切换交互）：
  *   - 左半：16 个图标，图标 = SHA-256(128 hex) 前 16 字节做 base-260 的 16 位数字，
  *     下标直接取图集格子（官方 fingerprintToIcons 的完整口径）；
- *   - 右半：原 128 hex，改成 8 行 × 16 字符（字号不变，只是换行）。
+ *   - 右半：原 128 hex，按每行 16 字符分行（128 hex 时即 8 行，短指纹行数随之减少）。
  * 本页只展示、不改任何传输状态：返回后回到进入前的页面。 */
 #include <stdio.h>
 #include <string.h>
@@ -139,13 +139,19 @@ void page_verify_render(void)
         /* 中缝：只是视觉分隔，不占交互 */
         w_rect((Rect){ div_x - 1, 158, 2, 228 }, theme->border);
 
-        /* 右半：128 hex 分 8 行 × 16 字符（字号与原来的文本模式一致，仅换行），
-         * 逐行在本半区内居中，保留逐字符比对的用途 */
-        for (i = 0; i < 8; i++) {
+        /* 右半：每行 16 字符（字号与原来的文本模式一致，仅换行），行数按实际
+         * 长度算（128 hex 即 8 行，短指纹不留空行），逐行在本半区内居中 */
+        int len = (int)strlen(g_app.verify_code);
+        int lines = (len + 15) / 16;
+        int cap = (int)(sizeof g_app.verify_code - 1) / 16;   /* 缓冲上限 8 行 */
+        if (lines > cap) lines = cap;
+        for (i = 0; i < lines; i++) {
             char chunk[17];
+            int n = len - i * 16;
             int tw = 0;
-            memcpy(chunk, g_app.verify_code + i * 16, 16);
-            chunk[16] = 0;
+            if (n > 16) n = 16;
+            memset(chunk, 0, sizeof chunk);   /* 末行不足 16 字符时不留旧值 */
+            memcpy(chunk, g_app.verify_code + i * 16, (size_t)n);
             w_text_w(SC_MAIN, chunk, &tw, NULL);
             w_text(div_x + (right_w - tw) / 2, 158 + i * 29, SC_MAIN,
                    theme->text, "%s", chunk);

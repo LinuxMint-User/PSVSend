@@ -245,7 +245,8 @@ static bool ends_with_ci(const char *s, const char *suffix)
 bool rp_reserved_name(const char *name)
 {
     return ends_with_ci(name, RP_STAGE_SUFFIX) ||
-           ends_with_ci(name, RP_PART_SUFFIX);
+           ends_with_ci(name, RP_PART_SUFFIX) ||
+           ends_with_ci(name, RP_BAK_SUFFIX);
 }
 
 bool rp_unique_name(const char *name, int k, char *out, size_t outsz)

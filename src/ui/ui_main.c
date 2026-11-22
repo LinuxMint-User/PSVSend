@@ -188,14 +188,16 @@ static vita2d_font *load_slot(int slot)
 static int g_in_frame;
 static int g_font_warned;      /* 缺档/表满告警已打印次数（防 dlog 刷屏） */
 
-/* 已建槽中与 size 最接近的字体（无槽则 NULL）。用于"帧内不许建槽/表满"时的
+/* 已建槽中与 size 最接近的字体（无可用槽则 NULL）。用于"帧内不许建槽/表满"时的
  * 降级：字号略有出入，但不会崩、也不丢字。
+ * 跳过建失败的坏槽（lat/cjk 任一为 NULL，绘制时会出现整段缺字）。
  * emoji（cjk=2）只考虑已预载 emoji 对象的档，其余字号用它就近缩放。 */
 static vita2d_font *font_nearest(int size, int cjk)
 {
     int i, best = -1, bd = 0;
     for (i = 0; i < g_fs_n; i++) {
         int d = g_fs[i].size > size ? g_fs[i].size - size : size - g_fs[i].size;
+        if (!g_fs[i].lat || !g_fs[i].cjk) continue;   /* CPU/GPU 建失败的坏槽 */
         if (cjk == 2 && !g_fs[i].emoji) continue;
         if (best < 0 || d < bd) { best = i; bd = d; }
     }
@@ -215,8 +217,12 @@ vita2d_font *font_get(int size, int cjk)
     if (cjk == 2)              /* emoji 不建新槽：只在预载过的档里取/就近降级 */
         return font_nearest(size, 2);
     for (i = 0; i < g_fs_n; i++)
-        if (g_fs[i].size == size)
+        if (g_fs[i].size == size) {
+            /* 该槽建过但 lat/cjk 有 NULL：既不能返回坏字体，也不要它参与降级 */
+            if (!g_fs[i].lat || !g_fs[i].cjk)
+                return font_nearest(size, cjk);
             return cjk ? g_fs[i].cjk : g_fs[i].lat;
+        }
     /* 帧内禁建槽：UI 字号档本应在启动时按 UI_FONT_SCALES 建齐（font_preload_all），
      * 走到这里说明该字号漏在表外（页面新加了字号档没补表）。此时宁可降级到最接近
      * 的已建档，也不能在建槽时触发 GPU crash。 */
@@ -235,10 +241,14 @@ vita2d_font *font_get(int size, int cjk)
         g_fs[g_fs_n].lat      = load_slot(0);
         g_fs[g_fs_n].cjk      = load_slot(slot);
         g_fs[g_fs_n].emoji    = NULL;   /* 由 font_preload_all 只给部分档补上 */
-        if (!g_fs[g_fs_n].lat || !g_fs[g_fs_n].cjk)
-            dlog("font load failed size=%d lat=%p cjk=%p", size,
-                 (void *)g_fs[g_fs_n].lat, (void *)g_fs[g_fs_n].cjk);
         g_fs_n++;
+        if (!g_fs[g_fs_n - 1].lat || !g_fs[g_fs_n - 1].cjk) {
+            /* 建失败的坏槽只记账（避免每帧重试），不当可用字体返回：
+             * 降级到其它可用档，无可用档则 NULL（widgets 绘制处已判空） */
+            dlog("font load failed size=%d lat=%p cjk=%p", size,
+                 (void *)g_fs[g_fs_n - 1].lat, (void *)g_fs[g_fs_n - 1].cjk);
+            return font_nearest(size, cjk);
+        }
         return cjk ? g_fs[g_fs_n - 1].cjk : g_fs[g_fs_n - 1].lat;
     }
     if (g_font_warned < 8) {
@@ -608,7 +618,8 @@ void ui_run(void)
     font_preload_all();        /* 建齐字号字体对象（帧外；首次触发 ttf 读进 RAM） */
     verify_icons_init();       /* 验证页图标图集（帧外建纹理，之后常驻只读） */
 
-    while (!g_app.done) {
+    /* 应用不提供内部退出：循环永不退出，只能由系统 HOME 关闭进程。 */
+    for (;;) {
         /* 主线程心跳（诊断用）：开机头 12s 或"网络未就绪"期间每秒打一行，
          * 记录主循环存活及它读到的后端状态（disc 启动与否、链路缓存、IP）。
          * 定位"后端已 up 但 UI 卡 not ready"类问题：心跳持续 = 主线程活着、
