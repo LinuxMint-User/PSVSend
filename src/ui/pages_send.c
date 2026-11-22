@@ -988,6 +988,7 @@ static struct {
     int  n;                     /* 已收集文件数 */
     int  empty_dirs;            /* 空目录数（跳过） */
     int  skipped;               /* 因名字/路径/深度超限被跳过的文件数 */
+    int  skipped_dirs;          /* 因打不开/路径/深度超限被跳过的目录数 */
     char root[512];             /* 被扫描的绝对目录 */
     char top[192];              /* 顶层目录名（相对路径第一级） */
     PickedFile ent[MAX_PICKED];
@@ -1045,7 +1046,8 @@ static int fs_walk(const char *abs, const char *rel, int depth)
     SceIoDirent de;
     int children = 0, r = 0;
 
-    if (fd < 0) return 0;                 /* 打不开的目录跳过，不算失败 */
+    /* 打不开的目录（含根目录）跳过，但按目录计数——否则整棵子树静默消失 */
+    if (fd < 0) { s_fs.skipped_dirs++; return 0; }
     memset(&de, 0, sizeof de);
     while (sceIoDread(fd, &de) > 0) {
         char cabs[512], crel[512];
@@ -1057,9 +1059,10 @@ static int fs_walk(const char *abs, const char *rel, int depth)
             continue;
         children++;
         is_dir = (de.d_stat.st_mode & SCE_S_IFDIR) != 0;
-        /* 单级超长：跳过（文件计数提示，目录只跳过本身，不猜里面有多少文件） */
+        /* 单级超长：跳过并计数（目录不猜里面有多少文件，只记一个目录） */
         if (strlen(de.d_name) > FSCAN_COMP_MAX) {
             if (!is_dir) s_fs.skipped++;
+            else         s_fs.skipped_dirs++;
             continue;
         }
 
@@ -1068,13 +1071,14 @@ static int fs_walk(const char *abs, const char *rel, int depth)
                      de.d_name);
         if (n < 0 || n >= (int)sizeof cabs) {
             if (!is_dir) s_fs.skipped++;
+            else         s_fs.skipped_dirs++;
             continue;
         }
 
         if (is_dir) {
-            if (depth + 1 > FSCAN_DEPTH_MAX) continue;
+            if (depth + 1 > FSCAN_DEPTH_MAX) { s_fs.skipped_dirs++; continue; }
             n = snprintf(crel, sizeof crel, "%s/%s", rel, de.d_name);
-            if (n < 0 || n >= (int)sizeof crel) continue;
+            if (n < 0 || n >= (int)sizeof crel) { s_fs.skipped_dirs++; continue; }
             r = fs_walk(cabs, crel, depth + 1);
         } else {
             if (depth + 1 > FSCAN_DEPTH_MAX) { s_fs.skipped++; continue; }
@@ -1115,6 +1119,7 @@ static int folder_scan_start(const char *dir)
     s_fs.n = 0;
     s_fs.empty_dirs = 0;
     s_fs.skipped = 0;
+    s_fs.skipped_dirs = 0;
     s_fs.cancel = 0;
     snprintf(s_fs.root, sizeof s_fs.root, "%s", dir);
     /* 顶层目录名 = 路径最后一级 */
@@ -1153,7 +1158,12 @@ void folder_scan_tick(void)
 
     if (st == FSCAN_EMPTY) {
         s_fs.state = FSCAN_IDLE;
-        dir_msg_set("%s", tr("Folder is empty"));
+        /* 一个文件都没收进来，但有被跳过的：不能报"文件夹是空的" */
+        if (s_fs.skipped > 0 || s_fs.skipped_dirs > 0)
+            dir_msg_set("%s",
+                        tr("No sendable files (path too deep or name too long)"));
+        else
+            dir_msg_set("%s", tr("Folder is empty"));
         return;
     }
     if (st == FSCAN_TOO_MANY) {
@@ -1175,9 +1185,12 @@ void folder_scan_tick(void)
         g_app.picked_total += s_fs.ent[i].size;
         g_app.picked_count++;
     }
-    /* 有文件因名字/路径/深度超限被跳过时优先提示（用户最可能没察觉少文件） */
+    /* 跳过提示只出一条，按严重度取：文件 > 目录 > 空目录 */
     if (s_fs.skipped > 0)
         folder_note_set(tr("%d file(s) skipped (name too long)"), s_fs.skipped);
+    else if (s_fs.skipped_dirs > 0)
+        folder_note_set(tr("%d folder(s) skipped (path too deep or too long)"),
+                        s_fs.skipped_dirs);
     else if (s_fs.empty_dirs > 0)
         folder_note_set(tr("%d empty folder(s) skipped"), s_fs.empty_dirs);
     s_fs.state = FSCAN_IDLE;

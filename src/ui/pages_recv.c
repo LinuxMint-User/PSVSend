@@ -96,6 +96,9 @@ void return_from_recv(void)
     case PAGE_FILES:
         g_app.page = PAGE_FILES;
         break;
+    case PAGE_SCAN:
+        scan_resume_pick();          /* 回扫码候选页（没有定格候选则回取景） */
+        break;
     default:
         break;                       /* 设备页：goto_devices 已经落在这里 */
     }
@@ -111,6 +114,7 @@ static void recv_focus_sane(void)
 void page_recv_confirm_render(void)
 {
     w_page_header(tr("Incoming files"));
+    w_hdr_button(HDR_SLOT_R, WID_HDR_BACK_RECV, HDRBTN_BACK, false);
     char line[256];
     Rect card = { 24, 80, SCR_W - 48, 320 };
     /* 卡片内文本的可用宽（左边距 24、右边距 48）：别名与提示句的长度都不受本端
@@ -346,6 +350,11 @@ void page_recv_confirm_input(const Input *in)
         api_recv_decide_touch();   /* 人在操作：60s 窗口重开（含方向键） */
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
+        if (id == WID_HDR_BACK_RECV) {   /* 与 Reject 同义，但收尾按来处返回 */
+            if (g_recv_expired) recv_close();
+            else recv_reject_close();
+            return;
+        }
         if (id == 2) {
             /* Accept 在"一个文件都没勾选"时是禁用态：点它不搬焦点——否则焦点停在
              * 禁用项上，页脚还写着 Accept，确认键就成了死键（DPAD 路径本就跳过它）。 */
@@ -760,12 +769,14 @@ static void do_accept(void)
 static void start_recv(void)
 {
     RecvPendingSummary s;
+    /* 先设本次保存目录（Setup 里可临时改）：recv_set_dir 会对 PH_PENDING 重算
+     * 路径预算，summary 的可收数必须按新目录算，否则可能整批误判不可收。 */
+    api_recv_set_dir(g_app.recv_dir);
     if (api_recv_pending_summary(&s) != 1) {  /* 已过期（竞态防护，正常不会到） */
         recv_close();
         return;
     }
     if (s.selected == 0) { recv_reject_close(); return; }   /* 全被勾掉：当拒绝 */
-    api_recv_set_dir(g_app.recv_dir);   /* 本次保存目录（Setup 里可临时改） */
 
     /* P_PRECHECK：后端只 stat 唯一顶层 / 嵌套目录路径；有冲突就进弹窗流程，
      * 期间暂停 60s 决定窗口。 */

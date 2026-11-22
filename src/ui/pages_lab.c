@@ -295,8 +295,15 @@ void page_cam_bench_input(const Input *in)
 #define SCAN_PREV_W   (CAM_SCAN_PREV_W * SCAN_PREV_H / CAM_SCAN_PREV_H)
 #define SCAN_PREV_X   (SCAN_CARD_X + (SCAN_CARD_W - SCAN_PREV_W) / 2)
 #define SCAN_PREV_Y   SCAN_CARD_Y
+/* 取景页左右"按住扫描"触摸区：宽 150，高度 = 预览高 - 192，垂直居中于预览区，
+ * 落在预览两侧的卡片底色里（不盖住画面）。绘制与命中判断共用这几个常量。 */
+#define SCAN_HOLD_W   150
+#define SCAN_HOLD_H   (SCAN_PREV_H - 192)
+#define SCAN_HOLD_Y   (SCAN_PREV_Y + (SCAN_PREV_H - SCAN_HOLD_H) / 2)
+#define SCAN_HOLD_LX  (SCAN_CARD_X + 12)
+#define SCAN_HOLD_RX  (SCAN_CARD_X + SCAN_CARD_W - 12 - SCAN_HOLD_W)
 
-enum { SCAN_VIEW = 0, SCAN_PICK, SCAN_DETAIL, SCAN_CONNECT };
+enum { SCAN_VIEW = 0, SCAN_PICK, SCAN_CONNECT };
 
 typedef struct {
     bool ok;
@@ -311,6 +318,8 @@ static CamScanSnap scan_snap;               /* 本帧快照（input 读上一帧
 static ScanLink    scan_link;
 static char        scan_text[CAM_SCAN_TEXT];/* 选中候选的原文 */
 static int         scan_err;                /* 打开分享失败的提示（api_recv_link_error_take） */
+static bool        scan_touch_hold;         /* 取景页手指正按在左右按住区里 */
+static bool        scan_static_snap;        /* 候选来自暂存快照（相机已被确认页停掉） */
 
 /* http://host[:port]/?pin=NNNN —— 与我们网页共享页二维码的内容格式一致 */
 static bool link_parse(const char *s, ScanLink *out)
@@ -441,7 +450,10 @@ static void scan_move(int ox, int oy)
 
     if (scan_phase != SCAN_PICK || scan_snap.n <= 1) return;
     best = scan_best(ox, oy);
-    if (best >= 0) scan_sel = best;      /* 该方向没有候选就不动，不绕回 */
+    if (best >= 0) {                     /* 该方向没有候选就不动，不绕回 */
+        scan_sel = best;
+        scan_err = 0;                    /* 换选后旧候选的错误不再适用 */
+    }
 }
 
 /* 当前候选在四个方向上分别走不走得动（页脚灰臂用，口径同 hintbar 的 dir_off） */
@@ -465,6 +477,22 @@ static void scan_box(int x0, int y0, int x1, int y1, uint32_t c)
     w_rect((Rect){ x1 - 2, y0, 2, y1 - y0 }, c);
 }
 
+/* 左右按住区：半透明底 + 2px 描边；按住时描边/文字用 accent，空闲用弱色。
+ * 标签居中、限宽裁剪，短标签不会溢出。 */
+static void scan_hold_zone(Rect r, bool on)
+{
+    const char *lbl = on ? tr("Scanning...") : tr("Scan");
+    uint32_t bd = on ? theme->accent : theme->border;
+    int tw = 0;
+
+    w_rect(r, 0x50000000u);
+    scan_box(r.x, r.y, r.x + r.w, r.y + r.h, bd);
+    w_text_w(0.9f, lbl, &tw, NULL);
+    if (tw > r.w - 12) tw = r.w - 12;
+    w_text_clip(r.x + (r.w - tw) / 2, r.y + (r.h - 18) / 2, 0.9f,
+                on ? theme->accent : theme->text_dim, lbl, r.w - 12);
+}
+
 /* 取景框四角（只是对准提示；解码用的是整幅画面） */
 static void scan_frame_mark(int cx, int cy)
 {
@@ -485,6 +513,7 @@ void open_scan(void)
     scan_phase = SCAN_VIEW;
     scan_sel = 0;
     scan_err = 0;
+    scan_static_snap = false;
     scan_text[0] = 0;
     memset(&scan_link, 0, sizeof scan_link);
     cam_scan_clear_hit();
@@ -503,52 +532,96 @@ static void scan_leave(void)
     cam_scan_stop();
     scan_phase = SCAN_VIEW;
     scan_err = 0;
+    scan_touch_hold = false;
+    scan_static_snap = false;
     g_app.page = PAGE_DEVICES;           /* 扫码从主页进入，退出回主页 */
 }
 
-/* 被接收确认页顶掉（pages_recv.c 调）：相机/冻结态清干净，但页面切换交给它。
- * 之后确认页收尾会按 recv_back 回主页（goto_devices）。 */
+/* 被接收确认页顶掉（pages_recv.c 调）：相机停掉省资源，但把定格候选留在
+ * scan_snap 里（纹理也保留最后一帧）——确认页拒绝/关闭后能原样回到候选页。
+ * 若当时还在取景（没有定格结果），标记为"无暂存"，返回时重开相机。 */
 void scan_leave_for_recv(void)
 {
     cam_scan_stop();
-    scan_phase = SCAN_VIEW;
-    scan_sel = 0;
+    scan_touch_hold = false;
     scan_err = 0;
-    scan_text[0] = 0;
-    memset(&scan_link, 0, sizeof scan_link);
+    if (scan_phase == SCAN_PICK || scan_phase == SCAN_CONNECT) {
+        scan_static_snap = true;
+        scan_phase = SCAN_PICK;
+    } else {
+        scan_static_snap = false;
+    }
 }
 
-/* 选定当前候选 → 详情 */
-static void scan_confirm(void)
+/* 从接收确认页返回到扫码流程：有定格候选就回候选页，否则回取景并重开相机 */
+void scan_resume_pick(void)
 {
-    if (scan_sel < 0 || scan_sel >= scan_snap.n) return;
-    if (!scan_snap.items[scan_sel].text[0]) return;
-    snprintf(scan_text, sizeof scan_text, "%s", scan_snap.items[scan_sel].text);
-    link_parse(scan_text, &scan_link);
-    scan_phase = SCAN_DETAIL;
+    scan_err = 0;
+    if (scan_static_snap) {
+        scan_phase = SCAN_PICK;
+    } else {
+        scan_phase = SCAN_VIEW;
+        scan_static_snap = false;
+        cam_scan_clear_hit();
+        cam_scan_start();
+    }
+    g_app.page = PAGE_SCAN;
 }
 
-/* 清掉冻结结果、回到取景 */
+/* 聚焦第 i 个候选：换选时清掉上一次的打开错误，并把判定结果算好 */
+static void scan_focus(int i)
+{
+    if (i < 0 || i >= scan_snap.n) return;
+    if (i != scan_sel) scan_err = 0;
+    scan_sel = i;
+    snprintf(scan_text, sizeof scan_text, "%s", scan_snap.items[i].text);
+    link_parse(scan_text, &scan_link);
+}
+
+/* 清掉冻结结果、回到取景（相机若已被确认页停掉则重新启动） */
 static void scan_rescan(void)
 {
     cam_scan_clear_hit();
+    cam_scan_start();
     scan_phase = SCAN_VIEW;
     scan_sel = 0;
     scan_err = 0;
+    scan_touch_hold = false;
+    scan_static_snap = false;
     memset(&scan_link, 0, sizeof scan_link);
     scan_text[0] = 0;
 }
 
-/* 详情页 Open：后台去对方分享页取清单（成功后 pages_tick 会自动弹接收确认页） */
-static void scan_open_link(void)
+/* 打开当前候选：非链接码只重算不改状态（信息带已经说明原因） */
+static void scan_open_selected(void)
 {
-    if (!scan_link.ok) { scan_rescan(); return; }
+    scan_focus(scan_sel);
+    if (!scan_link.ok) return;
     scan_err = 0;
     if (api_recv_link_open(scan_link.host, scan_link.port, scan_link.pin) != 0) {
         scan_err = 5;                    /* 本机已有接收会话 / 上一次连接还没收 */
-        return;
+        return;                          /* 留在候选页，信息带报错 */
     }
     scan_phase = SCAN_CONNECT;
+}
+
+/* 统一返回：永远回上一个界面/状态（取景 ← 候选 ← 连接中） */
+static void scan_back(void)
+{
+    if (scan_phase == SCAN_PICK) {
+        scan_rescan();
+        return;
+    }
+    if (scan_phase == SCAN_CONNECT) {
+        if (api_recv_link_connecting()) {
+            api_recv_link_cancel();
+            api_recv_link_error_take();  /* 丢掉自己造成的 CANCELLED */
+        }
+        scan_phase = SCAN_PICK;          /* 候选留着，回到选码 */
+        scan_err = 0;
+        return;
+    }
+    scan_leave();
 }
 
 static const char *scan_err_text(int e)
@@ -568,30 +641,37 @@ void page_scan_render(void)
     Rect card = { SCAN_CARD_X, SCAN_CARD_Y, SCAN_CARD_W, SCAN_CARD_H };
     Rect prev = { SCAN_PREV_X, SCAN_PREV_Y, SCAN_PREV_W, SCAN_PREV_H };
     struct vita2d_texture *tex;
-    bool hold;
+    bool hold = false;
     int i;
 
     w_page_header(tr("Scan a QR code"));
     w_hdr_button(HDR_SLOT_R, WID_HDR_BACK_SCAN, HDRBTN_BACK, false);
     w_rect(card, theme->card);
 
-    hold = (scan_phase == SCAN_VIEW) && ui_input_r_down();
-    cam_scan_set_hold(hold);
-    cam_scan_snapshot(&scan_snap);
+    /* 暂存快照（确认页返回的候选）没有相机可读：保留旧候选，不刷新快照 */
+    if (!scan_static_snap) {
+        hold = (scan_phase == SCAN_VIEW) && (ui_input_r_down() || scan_touch_hold);
+        cam_scan_set_hold(hold);
+        cam_scan_snapshot(&scan_snap);
+    }
 
     /* 命中 → 按一次"快门"：帧与解码都已在引擎里停住，这里只切界面。
      * 在 render 里转，是因为冻结不一定伴随按键事件（可能正好在松开 R 之后）。 */
-    if (scan_phase == SCAN_VIEW && scan_snap.frozen && scan_snap.n > 0) {
+    if (!scan_static_snap && scan_phase == SCAN_VIEW &&
+        scan_snap.frozen && scan_snap.n > 0) {
         scan_phase = SCAN_PICK;
         scan_sel = 0;
+        scan_focus(0);
+        scan_touch_hold = false;
+        scan_err = 0;
     }
 
-    /* 连接分享失败 → 回详情页就地报错；成功的话 pages_tick 已经把接收确认页
+    /* 连接分享失败 → 回候选页就地报错；成功的话 pages_tick 已经把接收确认页
      * 顶上来（本页在可打断列表里），这里不用再做什么。 */
     if (scan_phase == SCAN_CONNECT) {
         int e = api_recv_link_error_take();
         if (e) {
-            scan_phase = SCAN_DETAIL;
+            scan_phase = SCAN_PICK;
             scan_err = e;
         }
     }
@@ -627,10 +707,22 @@ void page_scan_render(void)
         if (scan_snap.state != CAM_SCAN_ERROR)
             scan_frame_mark(SCAN_PREV_X + SCAN_PREV_W / 2,
                             SCAN_PREV_Y + SCAN_PREV_H / 2);
-    } else if (scan_phase == SCAN_PICK) {
+
+        /* 左右按住区：整块可按住取景；只在取景态注册热区 */
+        {
+            Rect hl = { SCAN_HOLD_LX, SCAN_HOLD_Y, SCAN_HOLD_W, SCAN_HOLD_H };
+            Rect hr = { SCAN_HOLD_RX, SCAN_HOLD_Y, SCAN_HOLD_W, SCAN_HOLD_H };
+            scan_hold_zone(hl, scan_touch_hold);
+            scan_hold_zone(hr, scan_touch_hold);
+            w_add(WID_SCAN_HOLD_L, hl);
+            w_add(WID_SCAN_HOLD_R, hr);
+        }
+    } else {
         int n = scan_snap.n;
         char sum[160];
 
+        /* PICK / CONNECT 共用：定格画面 + 候选框 + 底部信息带。
+         * CONNECT 下候选只画不注册（连接中点击无意义）。 */
         w_rect(prev, 0x70000000u);
         for (i = 0; i < n && i < CAM_SCAN_MAX; i++) {
             int x0, y0, x1, y1;
@@ -641,10 +733,12 @@ void page_scan_render(void)
             snprintf(idx, sizeof idx, "%d", i + 1);
             w_text(x0 - 2, y0 - 24, 0.8f,
                    i == scan_sel ? theme->accent : theme->text_dim, "%s", idx);
-            w_add(WID_SCAN_BOX + i, (Rect){ x0 - 8, y0 - 8, x1 - x0 + 16, y1 - y0 + 16 });
+            if (scan_phase == SCAN_PICK)
+                w_add(WID_SCAN_BOX + i,
+                      (Rect){ x0 - 8, y0 - 8, x1 - x0 + 16, y1 - y0 + 16 });
         }
 
-        /* 底部信息带：当前候选的判定摘要 + 原文 */
+        /* 底部信息带：第一行 n/N + 判定摘要；第二行按优先级显示连接态/错误/原文 */
         w_rect((Rect){ SCAN_CARD_X, LIST_BOTTOM - 70, SCAN_CARD_W, 70 }, 0xE0000000u);
         if (scan_sel >= 0 && scan_sel < n) {
             char num[16];
@@ -654,43 +748,16 @@ void page_scan_render(void)
                         num, 60);
             w_text_clip(SCAN_CARD_X + 80, LIST_BOTTOM - 62, 1.0f, theme->text,
                         sum, SCAN_CARD_W - 96);
+        }
+        if (scan_phase == SCAN_CONNECT)
+            w_text_clip(SCAN_CARD_X + 16, LIST_BOTTOM - 34, 0.8f, theme->accent,
+                        tr("Opening share..."), SCAN_CARD_W - 32);
+        else if (scan_err)
+            w_text_clip(SCAN_CARD_X + 16, LIST_BOTTOM - 34, 0.8f, theme->warn,
+                        scan_err_text(scan_err), SCAN_CARD_W - 32);
+        else if (scan_sel >= 0 && scan_sel < n)
             w_text_clip(SCAN_CARD_X + 16, LIST_BOTTOM - 34, 0.8f, theme->text_dim,
                         scan_snap.items[scan_sel].text, SCAN_CARD_W - 32);
-        }
-    } else {
-        Rect pane = { 168, 150, 624, 220 };
-
-        w_rect(prev, 0xB0000000u);
-        w_rect(pane, theme->bg);
-        w_rect_outline(pane, theme->border);
-        if (scan_link.ok) {
-            w_text(pane.x + 24, pane.y + 22, 1.2f, theme->accent, "%s",
-                   tr("Share link"));
-            w_text(pane.x + 24, pane.y + 62, 0.9f, theme->text_dim, "%s",
-                   tr("Address"));
-            w_text(pane.x + 24, pane.y + 84, 1.1f, theme->text, "http://%s:%d",
-                   scan_link.host, scan_link.port);
-            w_text(pane.x + 24, pane.y + 114, 0.9f, theme->text_dim, "%s",
-                   tr("PIN"));
-            w_text(pane.x + 24, pane.y + 136, 1.4f, theme->accent, "%s",
-                   scan_link.pin);
-            if (scan_phase == SCAN_CONNECT)
-                w_text(pane.x + 24, pane.y + 178, 0.9f, theme->accent, "%s",
-                       tr("Opening share..."));
-            else if (scan_err)
-                w_text(pane.x + 24, pane.y + 178, 0.85f, theme->warn, "%s",
-                       scan_err_text(scan_err));
-            else
-                w_text(pane.x + 24, pane.y + 178, 0.8f, theme->text_dim, "%s",
-                       tr("Open to choose files"));
-        } else {
-            w_text(pane.x + 24, pane.y + 22, 1.2f, theme->warn, "%s",
-                   tr("Not a file transfer link"));
-            /* 原文可能很长/含非 ASCII：只画一行尾部截断（不做按字节折行，
-             * 免得把 UTF-8 字符劈成两半） */
-            w_text_clip(pane.x + 24, pane.y + 64, 0.85f, theme->text_dim,
-                        scan_text, pane.w - 48);
-        }
     }
 
     {
@@ -713,12 +780,6 @@ void page_scan_render(void)
             segs[ns].key = HKEY_BACK; segs[ns++].text = tr("Scan again");
         } else if (scan_phase == SCAN_CONNECT) {
             segs[ns].key = HKEY_BACK; segs[ns++].text = tr("Cancel");
-        } else if (scan_link.ok) {
-            segs[ns].key = HKEY_CONFIRM; segs[ns++].text = tr("Open");
-            segs[ns].key = HKEY_BACK; segs[ns++].text = tr("Back");
-        } else {
-            segs[ns].key = HKEY_CONFIRM; segs[ns++].text = tr("Scan again");
-            segs[ns].key = HKEY_BACK; segs[ns++].text = tr("Back");
         }
         w_page_footer_segs(segs, ns);
     }
@@ -726,15 +787,28 @@ void page_scan_render(void)
 
 void page_scan_input(const Input *in)
 {
+    /* 取景态左右按住区：按住即扫描；松手/滑走/切状态立刻停 */
+    if (scan_phase == SCAN_VIEW && in->touch_hold) {
+        scan_touch_hold =
+            (in->touch_x >= SCAN_HOLD_LX && in->touch_x < SCAN_HOLD_LX + SCAN_HOLD_W &&
+             in->touch_y >= SCAN_HOLD_Y && in->touch_y < SCAN_HOLD_Y + SCAN_HOLD_H) ||
+            (in->touch_x >= SCAN_HOLD_RX && in->touch_x < SCAN_HOLD_RX + SCAN_HOLD_W &&
+             in->touch_y >= SCAN_HOLD_Y && in->touch_y < SCAN_HOLD_Y + SCAN_HOLD_H);
+    } else {
+        scan_touch_hold = false;
+    }
+
     if (in->tap) {
         int id = w_hit(in->tap_x, in->tap_y);
-        if (id == WID_HDR_BACK_SCAN) { scan_leave(); return; }
+        if (id == WID_HDR_BACK_SCAN) { scan_back(); return; }
+        /* 按住区松手产生的 tap 不做事（动作已在按住期间完成） */
+        if (id == WID_SCAN_HOLD_L || id == WID_SCAN_HOLD_R) return;
         if (scan_phase == SCAN_PICK && id >= WID_SCAN_BOX &&
             id < WID_SCAN_BOX + CAM_SCAN_MAX) {
             int i = id - WID_SCAN_BOX;
             if (i < scan_snap.n) {
-                scan_sel = i;
-                scan_confirm();
+                if (i != scan_sel) scan_focus(i);   /* 第一次点：只聚焦 */
+                else scan_open_selected();          /* 再点一次：打开 */
             }
         }
         return;
@@ -746,20 +820,8 @@ void page_scan_input(const Input *in)
     if (in->left)  { scan_move(-1, 0); return; }
     if (in->right) { scan_move(1, 0);  return; }
     if (in->confirm) {
-        if (scan_phase == SCAN_PICK)         scan_confirm();
-        else if (scan_phase == SCAN_DETAIL)  scan_open_link();
+        if (scan_phase == SCAN_PICK) scan_open_selected();
         return;                              /* 连接中忽略确认键 */
     }
-    if (in->back) {
-        if (scan_phase == SCAN_PICK) { scan_rescan(); return; }
-        if (scan_phase == SCAN_CONNECT) {    /* 取消连接，回详情页 */
-            if (api_recv_link_connecting()) {
-                api_recv_link_cancel();
-                api_recv_link_error_take();  /* 丢掉自己造成的 CANCELLED */
-            }
-            scan_phase = SCAN_DETAIL;
-            return;
-        }
-        scan_leave();
-    }
+    if (in->back) { scan_back(); return; }
 }

@@ -60,6 +60,12 @@
 #define WID_HDR_WEB      0x820A               /* 主页页头最左：进网页共享页（不自动启动） */
 #define WID_HDR_BACK_WEB 0x820B               /* 网页共享页：停止并回主页/设置页 */
 #define WID_HDR_BACK_SCAN 0x820C              /* 扫码取景页：停相机并回主页 */
+#define WID_HDR_BACK_RECV 0x820D              /* 接收确认页：拒绝并回到来处 */
+
+/* 扫码取景页左右"按住扫描"触摸区（候选框 id 0xA201 起，占 CAM_SCAN_MAX=8 个，
+ * 定义在 pages_lab.c）：这两个 id 避开该区段。 */
+#define WID_SCAN_HOLD_L  0xA211               /* 取景页左侧按住扫描区 */
+#define WID_SCAN_HOLD_R  0xA212               /* 取景页右侧按住扫描区 */
 
 /* ---------- 各页共用的小工具 ---------- */
 
@@ -264,7 +270,10 @@ void open_color_pick(void);         /* pages_settings.c：进自定义色盘页�
 void open_verify(const char *peer_fp, const char *alias); /* pages_verify.c：进身份验证页 */
 void open_lab(void);                /* pages_lab.c：进实验室页（会先停字体预读） */
 void open_scan(void);               /* pages_lab.c：进扫码取景页（启动相机） */
-void scan_leave_for_recv(void);     /* pages_lab.c：扫码页被接收确认页顶掉时停相机/清冻结态 */
+void scan_leave_for_recv(void);     /* pages_lab.c：扫码页被接收确认页顶掉时停相机，
+                                     * 但保留定格候选供返回；VIEW 下则下次重开相机 */
+void scan_resume_pick(void);        /* pages_lab.c：从接收确认页返回扫码流程（回候选页，
+                                     * 没有定格候选时回取景并重开相机） */
 void open_web(bool start_download); /* pages_web.c：进网页共享页；true=直接用已选文件开分享 */
 void ask_ime_host(void);            /* pages_recv.c：打开系统键盘改本机设备名（设置页主机名行用） */
 void ask_ime_pin(void);             /* pages_recv.c：发送等待页对方要求 PIN → 弹键盘输入 */

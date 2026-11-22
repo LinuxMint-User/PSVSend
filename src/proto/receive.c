@@ -1935,7 +1935,10 @@ void recv_pending_rename(int idx, const char *name)
     if (g_phase == PH_PENDING && idx < g_pend.n) {
         if (!name[0]) {
             g_pend.f[idx].rname[0] = 0;
-        } else if (rp_sanitize_component(name, comp, sizeof comp, &cut)) {
+        } else if (rp_sanitize_component(name, comp, sizeof comp, &cut) &&
+                   !rp_reserved_name(comp)) {
+            /* 保留后缀（.psvsend-part/.psvsend.tmp）会被开机清扫当成残留删除，
+             * 改名成它等于丢数据；直接忽略这次改名，保持原 rname 不变。 */
             snprintf(g_pend.f[idx].rname, sizeof g_pend.f[idx].rname, "%s", comp);
         }
         pend_recheck_paths_locked();      /* 改名可能超出路径预算 */
@@ -2224,6 +2227,7 @@ static int build_session_locked(const char *session_id, int via_web)
         char eff_rel[RP_REL_MAX + 1];
         char cand[RP_REL_MAX + 1];
         char base_rel[RP_REL_MAX + 1];
+        char rn[RP_REL_MAX + 1];
         char ctop[RP_COMP_MAX + 1];
         const char *cinner;
         char final[RP_PATH_MAX + 1];
@@ -2234,23 +2238,15 @@ static int build_session_locked(const char *session_id, int via_web)
         if (!pend_inc_get(i)) continue;
         if (!g_pend.f[i].path_ok) { skipped++; continue; }
 
-        if (g_pend.f[i].rname[0]) {
-            if (!rel_replace_last(g_pend.f[i].name, g_pend.f[i].rname,
-                                  rel, sizeof rel)) {
-                skipped++;
-                continue;
-            }
-        } else {
-            snprintf(rel, sizeof rel, "%s", g_pend.f[i].name);
-        }
-
-        /* M5：按顶层冲突解析结果换成最终根名；整根被跳过 / 仍有未决冲突的
-         * 条目一律跳过并计数，绝不把没解决的数据硬塞进目标目录。 */
+        /* M5：顶层冲突必须按“原始顶层名”解析——逐文件改名会改掉顶层平铺名，
+         * 拿改后的 rel 去查会查不到，之前选定的 Skip/Overwrite/Rename 全部失效。
+         * 顺序：原始名 → 顶层动作替换 → 最后再应用逐文件改名（只动最后一级）。 */
+        snprintf(rel, sizeof rel, "%s", g_pend.f[i].name);
         if (g_pend.roots_ready) {
             char top0[RP_COMP_MAX + 1];
             const char *inner0;
             int rix;
-            split_top_inner(rel, top0, sizeof top0, &inner0);
+            split_top_inner(g_pend.f[i].name, top0, sizeof top0, &inner0);
             rix = pend_root_find_locked(top0);
             if (rix >= 0) {
                 const PendRoot *rt = &g_pend.roots[rix];
@@ -2263,13 +2259,20 @@ static int build_session_locked(const char *session_id, int via_web)
                     continue;
                 }
                 overwrite = (rt->action == RECV_ROOT_ACT_OVERWRITE);
-                if (!rel_replace_top(rel, root_eff_name(rt),
+                if (!rel_replace_top(g_pend.f[i].name, root_eff_name(rt),
                                      eff_rel, sizeof eff_rel)) {
                     skipped++;
                     continue;
                 }
                 snprintf(rel, sizeof rel, "%s", eff_rel);
             }
+        }
+        if (g_pend.f[i].rname[0]) {
+            if (!rel_replace_last(rel, g_pend.f[i].rname, rn, sizeof rn)) {
+                skipped++;
+                continue;
+            }
+            snprintf(rel, sizeof rel, "%s", rn);
         }
         if (!path_budget_ok(rel)) { skipped++; continue; }
 
@@ -2648,6 +2651,15 @@ static int recv_http_prepare(const char *body, const char *ip, const char *peer_
         return 204;
     }
     g_pend.n = n;
+    /* 文本语义只对“整批只有一个文件”成立：recv_text_path/save 都要求 n==1，
+     * 多条带 preview 的文本若仍逐条标 is_text，会显示成功却在会话结束时被
+     * cleanup_parts 当临时文件删掉。n 已最终确定，这里统一归一化。
+     * 只清 is_text，不回滚解析期已改过的 rel（上面 UUID 名已换成 clipboard-…，
+     * 作为普通文件接收落盘仍然正确）。 */
+    if (n != 1) {
+        int i;
+        for (i = 0; i < n; i++) g_pend.f[i].is_text = false;
+    }
     if (n > g_pend.cfg_limit)                /* 超过设置值：按最小档临时提升 */
         g_pend.eff_limit = files_limit_raise(n);
     /* 新请求：保存目录回到设置里的默认值再算预算（UI 收到新请求时同样重置
@@ -4025,6 +4037,9 @@ static int link_thr(SceSize args, void *argp)
         g_pend.f[i].trunc = tmp[i].trunc;
         pend_inc_set(i, true);
     }
+    /* 与 prepare 一致：新会话先回到设置里的默认目录，再算路径预算；否则上一次
+     * 会话临时选过的深目录会残留，确认页按旧目录算跳过数。 */
+    config_get_save_dir(g_dir, sizeof g_dir);
     pend_recheck_paths_locked();
     g_pend_result = 0;
     g_pend_hold = 0;
