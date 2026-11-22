@@ -2,6 +2,8 @@
 /vitasdk/
 # 构建产物
 /build/
+# 主机单测构建目录（cmake -S tests -B build-tests）
+/build-tests/
 # bootstrap 临时目录
 /.vitasdk-tmp/
 # 第三方工具与参考示例（vdpm 包管理器、官方 samples）
