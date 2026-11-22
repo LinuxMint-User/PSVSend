@@ -64,3 +64,18 @@ ctest --test-dir build-tests --output-on-failure
 ```
 
 仅供本地回归，不接入 CI（推送前手动跑一遍即可）。
+
+## 6. 发送链路测试（可选）
+
+发送侧「逐文件独立成败」没法用官方客户端复现（它的接收弹窗只能整体接受或拒绝）。仓库自带 `scripts/fake-recv.py`：在 **53317** 起一个明文 HTTP 假接收端，默认全部接受并直接把文件体读掉丢弃，**不产生任何测试文件**。PSV 扫描后会把 `FAKE-RECV` 当成一台设备，选几个文件发过去，即可在进度页看到逐文件结果。
+
+前提：PC 与 PSV 同网段；先关掉 PC 上的官方 LocalSend（同占 53317 端口）；PC 防火墙放行 53317。
+
+```bash
+python3 scripts/fake-recv.py                 # 全部接受（对照组，PSV 应显示绿色「已完成」）
+python3 scripts/fake-recv.py --skip 2        # 第 2 个文件不回 token（对端只收子集）
+python3 scripts/fake-recv.py --fail 2        # 第 2 个文件的上传回 HTTP 500
+python3 scripts/fake-recv.py --cut 2         # 第 2 个文件传到一半直接断连
+```
+
+编号从 1 数、可逗号分隔（如 `--skip 1,3`）。另有 `--chunked`（prepare 回执用 chunked 编码回）与 `--cut-resp`（收到清单后直接断连），分别验证回执解析与连接级中止。
