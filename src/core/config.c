@@ -83,7 +83,7 @@ static void cfg_defaults(void)
 
 void config_init(void)
 {
-    char buf[2048];
+    char buf[4096];         /* 与 config_write_locked 的 out 同尺寸，避免长配置被读半截 */
     int n;
     long long v;
 
@@ -108,6 +108,8 @@ void config_init(void)
     if (fd >= 0) {
         n = sceIoRead(fd, buf, sizeof buf - 1);
         sceIoClose(fd);
+        if (n == (int)sizeof buf - 1)
+            dlog("cfg: read %d bytes (buffer full, may be truncated)", n);
         if (n > 0) {
             buf[n] = 0;
             json_get_str(buf, "alias", g_cfg.alias, sizeof g_cfg.alias);

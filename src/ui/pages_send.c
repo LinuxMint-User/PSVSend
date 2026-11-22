@@ -1326,9 +1326,9 @@ void page_files_render(void)
             segs[ns].key = HKEY_SQUARE;   segs[ns].dim = !can_send;
             segs[ns++].text = tr("Send folder");
             w_page_footer_segs(segs, ns);
-            w_add(WID_FILES_SEND_DIR, send);
+            if (can_send) w_add(WID_FILES_SEND_DIR, send);
             w_add(WID_FILES_CANCEL_DIR, cancel);
-            w_button(send, tr("Send this folder"), !root);
+            w_button(send, tr("Send folder"), can_send);
             w_button(cancel, tr("Cancel"), true);
             return;
         }
@@ -1384,7 +1384,7 @@ void page_files_input(const Input *in)
         if (id == WID_FILES_CANCEL_DIR) {
             done_files();                 /* 目录模式：取消（不发送） */
         } else if (id == WID_FILES_SEND_DIR) {
-            send_current_folder();
+            send_folder_at_cursor();
         } else if (id == WID_FILES_DONE) {
             done_files();
         } else if (id >= 0 && id < count) {

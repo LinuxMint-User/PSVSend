@@ -980,7 +980,7 @@ static void tx_reap_zombies(void)
 
 /* 起"读线程 + 本线程消费"的双缓冲流水（占一个静态槽位）。
  * 返回槽位指针；*zero=1 表示零字节文件（无需流水线，仍要 tx_pipe_stop 归还）；
- * NULL=并发已满或资源不足（fd 已由槽位接管并关闭，调用者不要再关）。 */
+ * NULL=并发已满或资源不足（fd 已由本函数关闭，调用者不要再关）。 */
 static TxPipe *tx_pipe_begin(SceUID fd, SceOff size, int *zero)
 {
     int i, started = 0;
@@ -997,7 +997,10 @@ static TxPipe *tx_pipe_begin(SceUID fd, SceOff size, int *zero)
         p->state = TXSLOT_ACTIVE;
     }
     tx_unlock();
-    if (!p) return NULL;
+    if (!p) {                        /* 槽位耗尽：fd 由本函数关闭，与下面失败路径一致 */
+        sceIoClose(fd);
+        return NULL;
+    }
     if (size <= 0) { *zero = 1; return p; }
     p->buf = (char *)malloc((size_t)TX_CHUNK * TX_BLOCKS);
     if (p->buf)

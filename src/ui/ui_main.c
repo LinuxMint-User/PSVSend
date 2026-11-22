@@ -251,10 +251,13 @@ vita2d_font *font_get(int size, int cjk)
 /* UI 字号档 = 各页面 w_text / w_text_w / w_text_mid / w_text_clip 的 scale 取值
  * 集合，这里是**唯一真源**（scale→px 的换算只走 w_font_px，字号档由它生成，
  * 不再手工维护一张 px 表）。页面新增字号档时补进本列表即可；漏补不会崩——
- * font_get 的帧内守卫会拦下建槽并降级，同时 dlog 报出漏掉的字号。 */
+ * font_get 的帧内守卫会拦下建槽并降级，同时 dlog 报出漏掉的字号。
+ * 下面已补齐全仓页面实际用到的全部档位（含 hintbar 的 0.7、网页页的
+ * 0.75/1.6/2.2 等），按升序排列。 */
 #define UI_FONT_SCALES(X)                                                    \
-    X(0.8f) X(0.9f) X(1.0f) X(1.05f) X(1.1f) X(1.15f) X(1.2f) X(1.25f)      \
-    X(1.3f) X(1.5f) X(1.7f)
+    X(0.7f) X(0.75f) X(0.8f) X(0.85f) X(0.9f) X(1.0f) X(1.05f) X(1.1f)      \
+    X(1.15f) X(1.2f) X(1.25f) X(1.3f) X(1.4f) X(1.5f) X(1.6f) X(1.7f)       \
+    X(2.2f)
 #define SCALE_ENTRY(s) s,
 static const float g_font_scales[] = { UI_FONT_SCALES(SCALE_ENTRY) };
 #define FONT_SCALES_N ((int)(sizeof g_font_scales / sizeof g_font_scales[0]))

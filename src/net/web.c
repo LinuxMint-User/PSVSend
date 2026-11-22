@@ -517,7 +517,7 @@ build:
     if (fsz > 1) { files_json[0] = '['; files_json[1] = 0; o = 1; }
     for (i = 0; i < W.n && fsz > 0 && o < fsz - 8; i++) {
         char en[512];
-        int el = 0;
+        int el = 0, w;
         const char *p = W.files[i].name;
         /* 名字里的 " 与 \ 转义（文件名可以包含任意字符） */
         while (*p && el < (int)sizeof en - 3) {
@@ -525,9 +525,19 @@ build:
             en[el++] = *p++;
         }
         en[el] = 0;
-        o += snprintf(files_json + o, (size_t)(fsz - o),
-                      "%s{\"id\":\"f%d\",\"fileName\":\"%s\",\"size\":%lld}",
-                      i ? "," : "", i, en, (long long)W.files[i].size);
+        w = snprintf(files_json + o, (size_t)(fsz - o),
+                     "%s{\"id\":\"f%d\",\"fileName\":\"%s\",\"size\":%lld}",
+                     i ? "," : "", i, en, (long long)W.files[i].size);
+        if (w < 0 || w >= fsz - o) break;   /* 本条装不下：i 停在当前项，下面按 413 处理 */
+        o += w;
+    }
+    /* 没把 W.n 条全写完 = 缓冲装不下：不能截断后仍回 200（浏览器会拿到坏 JSON） */
+    if (i < W.n) {
+        dlog("web: download list too large for %d bytes (%d/%d files)",
+             fsz, i, W.n);
+        if (fsz > 0) files_json[0] = 0;
+        unlock();
+        return 413;
     }
     if (fsz > 0)
         snprintf(files_json + (o < fsz ? o : fsz - 1),

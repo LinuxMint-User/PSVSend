@@ -106,11 +106,12 @@ static int prep_gate_try(void)
     sceKernelUnlockMutex(g_prep_mtx, 1);
     return ok;
 }
-static void prep_gate_leave(void)
+static void prep_gate_leave(int gen)
 {
     if (g_prep_mtx < 0) return;
     sceKernelLockMutex(g_prep_mtx, 1, NULL);
-    g_prep_busy = 0;
+    /* 只清本代次的闸门：stop 后旧 worker 迟到退出时，新代次可能已重新持锁 */
+    if (gen == g_gen) g_prep_busy = 0;
     sceKernelUnlockMutex(g_prep_mtx, 1);
 }
 
@@ -1241,15 +1242,17 @@ static int parse_range(const char *h, SceOff size, SceOff *start, SceOff *total)
     p += 6;
     if (strchr(p, ',')) return 0;             /* 多段：整段回 */
     while (*p >= '0' && *p <= '9') {
+        if (++na > 12) return 0;             /* 超长数字：防 SceOff 溢出，退回整段 200 */
         a = a * 10 + (*p - '0');
         p++;
-        na++;
     }
     if (*p != '-') return 0;
     p++;
     if (!na) {                                /* bytes=-N：最后 N 字节 */
         SceOff k = 0;
+        int nk = 0;
         while (*p >= '0' && *p <= '9') {
+            if (++nk > 12) return 0;         /* 同上：位数上限 */
             k = k * 10 + (*p - '0');
             p++;
         }
@@ -1259,9 +1262,9 @@ static int parse_range(const char *h, SceOff size, SceOff *start, SceOff *total)
         b = size - 1;
     } else {
         while (*p >= '0' && *p <= '9') {
+            if (++nb > 12) return 0;         /* 同上：位数上限 */
             b = (b < 0 ? 0 : b) * 10 + (*p - '0');
             p++;
-            nb++;
         }
         if (!nb) b = size - 1;                /* bytes=a-：到文件末尾 */
     }
@@ -1500,7 +1503,7 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
      *   无 CL 的旧客户端仍用这个 32KB 兼容窗口。 */
     if (strcmp(route, "/api/localsend/v2/upload") != 0) {
         if (is_prepare && prep_gate && cl64 > 0) {
-            int want = (int)cl64;
+            int want = (int)cl64;        /* 上面的 413 检查已保证 <= 4MB，窄化安全 */
             int already = n - (he + 4);
             SceLong64 dl = sceKernelGetSystemTimeWide() + HTTP_PREPARE_US;
             if (already < 0) already = 0;
@@ -1536,15 +1539,21 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
             SceLong64 dl = sceKernelGetSystemTimeWide()
                          + (cl64 > 0 ? (SceLong64)HTTP_RECV_TIMEOUT_S * 1000000LL
                                      : 400000LL);
-            int want = cl64 > 0 ? (int)(he + 4 + cl64) : HTTP_MAX_REQ - 1;
+            /* 先在 SceLong64 域里算出目标长度并比上限，确认不超后再窄化到 int，
+             * 避免超大 CL 在钳制前就 (int) 转换（实现定义/UB）。 */
+            SceLong64 want64 = cl64 > 0 ? (SceLong64)he + 4 + cl64
+                                        : HTTP_MAX_REQ - 1;
+            int want;
             int had = llen > 0;
-            if (want > HTTP_MAX_REQ - 1) {
+            if (want64 > HTTP_MAX_REQ - 1) {
                 /* 声明的 body 超出缓冲上限：正常客户端在非 upload 路由上不会发这么大
                  * 的请求，出现即说明对端异常（或 Content-Length 被读错）。截断后
                  * handler 多半报 400，这里点明真因，省得对着"400 bad request"倒查。 */
                 dlog("http: %s req body %lld > cap %d, truncated",
                      route, (long long)cl64, HTTP_MAX_REQ - 1);
                 want = HTTP_MAX_REQ - 1;
+            } else {
+                want = (int)want64;
             }
             while (n < want) {
                 SceLong64 lim;
@@ -1619,7 +1628,7 @@ static void handle_conn(Conn *cn, const char *rip, int my_gen)
 out:
     /* handler 返回后才释放：4MB 清单在"等 UI 决定"的 60s 里一直驻留，
      * 闸门也持有到这一刻，保证同一时间只有一份大 body。 */
-    if (prep_gate) prep_gate_leave();
+    if (prep_gate) prep_gate_leave(my_gen);
     free(pbody);
 }
 
@@ -2031,6 +2040,14 @@ void http_stop(void)
         g_thr = -1;
     }
     http_join_conns();               /* 有预算地等仍在跑的连接 worker */
+    if (g_prep_mtx >= 0) {
+        /* 旧 worker 可能还挂在 prepare（等 UI 决定最长 60s）：换代后直接复位，
+         * 否则重启服务器后的新 prepare 会一直撞 409。旧 worker 迟到的
+         * prep_gate_leave 会因 my_gen 不符而不清它。 */
+        sceKernelLockMutex(g_prep_mtx, 1, NULL);
+        g_prep_busy = 0;
+        sceKernelUnlockMutex(g_prep_mtx, 1);
+    }
     g_port = 0;
 }
 

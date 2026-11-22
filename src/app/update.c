@@ -349,8 +349,8 @@ static long long date_to_unix(const char *s)
 }
 
 /* 解析已收齐的 HTTP 头部 win[0..hn)：状态码 + Content-Length + chunked 标记 */
-static void http_parse_hdr(const char *h, int hn, int *st, int *clen, int *chunked,
-                           char *date, int dsz)
+static void http_parse_hdr(const char *h, int hn, int *st, long long *clen,
+                           int *chunked, char *date, int dsz)
 {
     const char *p = h, *end = h + hn;
     *st = 0;
@@ -381,12 +381,14 @@ static void http_parse_hdr(const char *h, int hn, int *st, int *clen, int *chunk
             int nlen = (int)(colon - p);
             while (vlen > 0 && *v == ' ') { v++; vlen--; }
             if (ci_eq(p, nlen, "content-length") && vlen > 0) {
-                int x = 0;
+                long long x = 0;
+                int nd = 0, bad = 0;
                 while (vlen > 0 && *v >= '0' && *v <= '9') {
+                    if (++nd > 18) { bad = 1; break; }  /* 位数超限：防溢出，按无效 */
                     x = x * 10 + (*v - '0');
                     v++; vlen--;
                 }
-                *clen = x;
+                *clen = bad ? -1 : x;
             } else if (ci_eq(p, nlen, "transfer-encoding")) {
                 if (ci_has(v, vlen, "chunked")) *chunked = 1;
             } else if (ci_eq(p, nlen, "date") && date && dsz > 0) {
@@ -420,9 +422,11 @@ static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn,
     mbedtls_ctr_drbg_context drbg;
     unsigned int saddr = 0;
     int fd = -1, r, i, bn = 0;
-    int hs = 0, st = 0, clen = -1, chunked = 0, done = 0;
+    int hs = 0, st = 0, chunked = 0, done = 0;
+    long long clen = -1;
     uint64_t dl;
-    int ch_state = 0, ch_left = 0, ch_size = 0, ch_hex = 0, ch_ext = 0;
+    int ch_state = 0, ch_hex = 0, ch_ext = 0, ch_ndig = 0;
+    unsigned long long ch_left = 0, ch_size = 0;
 
     tag[0] = 0;
     if (date_out) *date_out = 0;     /* 无 Date/解析失败 = 0 */
@@ -568,6 +572,7 @@ static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn,
                             ch_size = 0;
                             ch_hex = 0;
                             ch_ext = 0;
+                            ch_ndig = 0;
                             if (ch_left == 0) { done = 1; break; }  /* 尾块 */
                             continue;
                         }
@@ -577,7 +582,8 @@ static int fetch_one(int idx, const UpdSrc *s, char *tag, int tagn,
                                 int v = c <= '9' ? c - '0'
                                       : (c <= 'F' ? c - 'A' + 10 : c - 'a' + 10);
                                 ch_hex = 1;
-                                ch_size = ch_size * 16 + v;
+                                if (++ch_ndig > 16) { done = 1; break; }  /* 超长按格式异常 */
+                                ch_size = ch_size * 16 + (unsigned)v;
                             }
                         } else {
                             ch_ext = 1;           /* 扩展/空格后数字一律忽略 */

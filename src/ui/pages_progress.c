@@ -130,6 +130,13 @@ void page_progress_render(void)
         total = xv.count;
         if (total > MAX_PICKED) total = MAX_PICKED;
         g_app.prog_total = total;
+        /* 惯性先推进并夹紧，再按"推进后"的 xf_scroll 取行窗口，
+         * 否则甩动时窗口比画面慢一帧，顶部/底部会闪空白。 */
+        { int max_s = total * ROW_STRIDE - XF_VIEW_H;
+          if (max_s < 0) max_s = 0;
+          xf_scroll = glide_step(&xf_glide, xf_scroll, max_s);
+          if (xf_scroll < 0) xf_scroll = 0;
+          if (xf_scroll > max_s) xf_scroll = max_s; }
         prog_win_n = 0;
         prog_finalizing = false;
         maxb = total > MAX_INF ? total - MAX_INF : 0;
@@ -171,13 +178,19 @@ void page_progress_render(void)
         bool has = api_recv_status_summary(&rs) == 1;
         if (has) {
             int total = rs.count;
+            g_app.prog_total = total;
+            /* 同发送路径：先推进/夹紧惯性，再按推进后的 xf_scroll 算窗口 */
+            { int max_s = total * ROW_STRIDE - XF_VIEW_H;
+              if (max_s < 0) max_s = 0;
+              xf_scroll = glide_step(&xf_glide, xf_scroll, max_s);
+              if (xf_scroll < 0) xf_scroll = 0;
+              if (xf_scroll > max_s) xf_scroll = max_s; }
             int maxb = total > MAX_INF ? total - MAX_INF : 0;
             int want = xf_scroll / ROW_STRIDE;
             if (want > maxb) want = maxb;
             if (want < 0) want = 0;
             prog_win_base = want;
             prog_win_n = api_recv_status_window(want, MAX_INF, prog_win);
-            g_app.prog_total = total;
             fin = rs.done;
             nfail = rs.failed;
             nskip = rs.skipped;                    /* 接受时/竞态跳过的计数 */
@@ -235,6 +248,13 @@ void page_progress_render(void)
              * Accept 后 http 线程应在几十 ms 内建好会话；若过了 2s 还没会话、
              * 且请求也不再 PENDING（说明后端已把决定处理掉但没建成会话，
              * 如请求恰好在决定前过期）→ 不能卡在进度页，给个失败态可退出。 */
+            {   /* 会话未建好：仍用上一帧/start_recv 记下的总数推进惯性并夹紧 */
+                int max_s = g_app.prog_total * ROW_STRIDE - XF_VIEW_H;
+                if (max_s < 0) max_s = 0;
+                xf_scroll = glide_step(&xf_glide, xf_scroll, max_s);
+                if (xf_scroll < 0) xf_scroll = 0;
+                if (xf_scroll > max_s) xf_scroll = max_s;
+            }
             prog_win_n = 0;
             prog_finalizing = false;
             msg = tr("Waiting for sender to start...");
@@ -261,15 +281,6 @@ void page_progress_render(void)
      * 到下一个开始之间 cur 会短暂为 -1，兜底会把这几十~几百毫秒的空档画成
      * "末行高亮"，观感上就是高亮反复跳到列表末尾再跳回当前文件。真正进行中才
      * 高亮 == 语义本来也如此（行高亮另受 prog_running 约束）。 */
-
-    /* 列表可视区滚动夹紧（惯性先推进） */
-    {
-        int max_s = g_app.prog_total * ROW_STRIDE - XF_VIEW_H;
-        if (max_s < 0) max_s = 0;
-        xf_scroll = glide_step(&xf_glide, xf_scroll, max_s);
-        if (xf_scroll < 0) xf_scroll = 0;
-        if (xf_scroll > max_s) xf_scroll = max_s;
-    }
 
     w_page_header(tr(g_app.prog_dir == 0 ? "Sending" : "Receiving"));
 
